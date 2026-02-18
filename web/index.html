@@ -711,18 +711,6 @@
             }
         });
 
-        // Custom renderer to allow iframes
-        const renderer = new marked.Renderer();
-        const originalParagraph = renderer.paragraph.bind(renderer);
-        renderer.paragraph = function(text) {
-            // Check if this is an iframe
-            if (text.trim().startsWith('<iframe')) {
-                return text;
-            }
-            return originalParagraph(text);
-        };
-        marked.use({ renderer });
-
         const chatContainer = document.getElementById('chat-container');
         const messageInput = document.getElementById('message-input');
         const sendBtn = document.getElementById('send-btn');
@@ -787,7 +775,7 @@
             } else if (role === 'user') {
                 div.innerHTML = escapeHtml(content).replace(/\n/g, '<br>');
             } else {
-                div.innerHTML = marked.parse(content);
+                div.innerHTML = renderMarkdown(content);
             }
 
             chatContainer.appendChild(div);
@@ -801,6 +789,27 @@
             return div.innerHTML;
         }
 
+        // Render markdown and allow iframes
+        function renderMarkdown(content) {
+            // First, extract and protect iframes
+            const iframePattern = /<iframe[^>]*>[\s\S]*?<\/iframe>/gi;
+            const iframes = [];
+            let protectedContent = content.replace(iframePattern, (match) => {
+                iframes.push(match);
+                return `__IFRAME_PLACEHOLDER_${iframes.length - 1}__`;
+            });
+
+            // Parse markdown
+            let html = marked.parse(protectedContent);
+
+            // Restore iframes
+            iframes.forEach((iframe, index) => {
+                html = html.replace(`__IFRAME_PLACEHOLDER_${index}__`, iframe);
+            });
+
+            return html;
+        }
+
         function createStreamingMessage() {
             const div = document.createElement('div');
             div.className = 'message assistant';
@@ -811,12 +820,12 @@
         }
 
         function updateStreamingMessage(div, content) {
-            div.innerHTML = marked.parse(content) + '<span class="streaming-cursor"></span>';
+            div.innerHTML = renderMarkdown(content) + '<span class="streaming-cursor"></span>';
             chatContainer.scrollTop = chatContainer.scrollHeight;
         }
 
         function finalizeStreamingMessage(div, content) {
-            div.innerHTML = marked.parse(content);
+            div.innerHTML = renderMarkdown(content);
             chatContainer.scrollTop = chatContainer.scrollHeight;
         }
 
