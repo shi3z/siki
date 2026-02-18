@@ -80,9 +80,18 @@ Available tools:
 IMPORTANT RULES:
 1. Always use tools when needed.
 2. For current events/news, use web_search.
-3. When mentioning URLs with visual content, use web_images to show representative images. The tool returns markdown image syntax - include it directly in your response.
-4. Use the diagram tool to visualize relationships, workflows, architectures, or research results. The tool returns markdown image syntax - include it directly in your response.
-5. When the user asks for calculations, visualizations, charts, interactive demos, or code that should run - use run_code to create an interactive HTML/JavaScript page. Include Canvas, SVG, or DOM elements as needed.
+3. When mentioning URLs with visual content, use web_images to show representative images.
+4. Use the diagram tool to visualize relationships, workflows, architectures.
+
+5. **CRITICAL - Code Execution Priority:**
+   When the user asks you to create, draw, visualize, calculate, or demonstrate something:
+   - FIRST think: "Can this be done with HTML/JavaScript in a browser?"
+   - If YES: Use run_code tool IMMEDIATELY to create a working interactive demo. Do NOT just show code examples.
+   - The run_code tool creates a live, interactive result that the user can see and interact with.
+   - Examples: fractals, charts, games, simulations, visualizations, animations, calculators
+   - Do NOT explain how to write the code - just write it and run it with run_code.
+   - After run_code, you can briefly explain what the code does.
+
 6. Respond in the user's language.`,
 	}
 }
