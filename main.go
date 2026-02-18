@@ -713,6 +713,22 @@ func initDiagramDir() error {
 }
 
 func (a *Agent) generateDiagram(dotCode, title string) (string, error) {
+	// Check if Graphviz is installed
+	dotPath, err := exec.LookPath("dot")
+	if err != nil {
+		// Graphviz not installed - return helpful message
+		return fmt.Sprintf(`Graphviz is not installed. To enable diagram generation:
+
+**macOS:** brew install graphviz
+**Linux:** sudo apt install graphviz
+**Windows:** Download from https://graphviz.org/download/
+
+After installing, restart Siki and try again.
+
+Here's the DOT code for reference:
+%s%s%s`, "```dot\n", dotCode, "\n```"), nil
+	}
+
 	if err := initDiagramDir(); err != nil {
 		return "", fmt.Errorf("failed to create diagram dir: %w", err)
 	}
@@ -735,7 +751,7 @@ func (a *Agent) generateDiagram(dotCode, title string) (string, error) {
 	tmpFile.Close()
 
 	// Run graphviz dot command
-	cmd := exec.Command("dot", "-Tsvg", "-o", outputPath, tmpFile.Name())
+	cmd := exec.Command(dotPath, "-Tsvg", "-o", outputPath, tmpFile.Name())
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("graphviz error: %s - %w", string(output), err)

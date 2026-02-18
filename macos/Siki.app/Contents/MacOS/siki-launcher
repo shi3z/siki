@@ -62,6 +62,31 @@ install_ollama() {
     return 0
 }
 
+# Function to check and install Graphviz
+check_graphviz() {
+    if command -v dot &> /dev/null; then
+        return 0
+    fi
+    return 1
+}
+
+install_graphviz() {
+    log "Installing Graphviz..."
+
+    if command -v brew &> /dev/null; then
+        osascript -e 'display notification "Installing Graphviz for diagram support..." with title "Siki Setup"'
+        brew install graphviz 2>> "$LOG_FILE"
+        if [ $? -eq 0 ]; then
+            osascript -e 'display notification "Graphviz installed!" with title "Siki Setup"'
+            return 0
+        fi
+    fi
+
+    # Graphviz install failed - not critical, just log it
+    log "Graphviz install failed (optional feature)"
+    return 1
+}
+
 # Function to start Ollama service
 start_ollama() {
     log "Starting Ollama service..."
@@ -150,6 +175,12 @@ fi
 
 # Ensure at least one model is available
 ensure_model
+
+# Install Graphviz if not present (optional, for diagram feature)
+if ! check_graphviz; then
+    log "Graphviz not found, attempting to install..."
+    install_graphviz
+fi
 
 # Find an available port
 PORT=3000
