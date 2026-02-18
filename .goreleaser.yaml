@@ -1,0 +1,54 @@
+version: 2
+
+project_name: siki
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: siki
+    main: .
+    binary: siki
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+
+archives:
+  - id: default
+    format: tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    format_overrides:
+      - goos: windows
+        format: zip
+
+brews:
+  - name: siki
+    repository:
+      owner: shi3z
+      name: homebrew-tap
+    homepage: "https://github.com/shi3z/siki"
+    description: "式神 (Shikigami) - Local Agentic AI Environment"
+    license: "MIT"
+    install: |
+      bin.install "siki"
+    test: |
+      system "#{bin}/siki", "--help"
+
+checksum:
+  name_template: "checksums.txt"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"

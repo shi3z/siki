@@ -1,0 +1,45 @@
+#!/bin/bash
+
+# 式神 Siki - Mac App Launcher
+# This script starts the siki web server and opens the browser
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+RESOURCES_DIR="$SCRIPT_DIR/../Resources"
+SIKI_BINARY="$RESOURCES_DIR/siki"
+
+# Default port
+PORT=3000
+
+# Find an available port if 3000 is in use
+while lsof -i:$PORT >/dev/null 2>&1; do
+    PORT=$((PORT + 1))
+    if [ $PORT -gt 3100 ]; then
+        osascript -e 'display alert "Siki Error" message "Could not find an available port (3000-3100)"'
+        exit 1
+    fi
+done
+
+# Check if siki binary exists
+if [ ! -f "$SIKI_BINARY" ]; then
+    osascript -e 'display alert "Siki Error" message "siki binary not found in Resources folder"'
+    exit 1
+fi
+
+# Start the web server in background
+"$SIKI_BINARY" --backend ollama --port $PORT web &
+SIKI_PID=$!
+
+# Wait a moment for server to start
+sleep 1
+
+# Check if server started successfully
+if ! kill -0 $SIKI_PID 2>/dev/null; then
+    osascript -e 'display alert "Siki Error" message "Failed to start siki server"'
+    exit 1
+fi
+
+# Open browser
+open "http://localhost:$PORT"
+
+# Keep the app running and wait for the server
+wait $SIKI_PID

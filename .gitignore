@@ -1,0 +1,25 @@
+# Binaries
+siki
+siki-*
+*.exe
+build/
+dist/
+
+# macOS
+.DS_Store
+macos/Siki.app/Contents/Resources/siki
+!macos/Siki.app/Contents/MacOS/siki-launcher
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Test files
+*.test
+coverage.out
+
+# Temporary files
+*.tmp
+*.log

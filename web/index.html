@@ -1,0 +1,803 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>siki - Shikigami Agentic AI</title>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        :root {
+            --bg-primary: #1a1a2e;
+            --bg-secondary: #16213e;
+            --bg-tertiary: #0f3460;
+            --text-primary: #eee;
+            --text-secondary: #aaa;
+            --accent: #e94560;
+            --accent-hover: #ff6b6b;
+            --user-bg: #0f3460;
+            --assistant-bg: #1a1a2e;
+            --tool-bg: #2d2d44;
+            --border: #333;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+
+        header {
+            background: var(--bg-secondary);
+            padding: 1rem 2rem;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        header h1 {
+            font-size: 1.5rem;
+            font-weight: 600;
+        }
+
+        header h1 span {
+            color: var(--accent);
+        }
+
+        .status {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            font-size: 0.875rem;
+            color: var(--text-secondary);
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #4ade80;
+        }
+
+        .status-dot.offline {
+            background: var(--accent);
+        }
+
+        .chat-container {
+            flex: 1;
+            overflow-y: auto;
+            padding: 1rem 2rem;
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
+        }
+
+        .message {
+            max-width: 80%;
+            padding: 1rem;
+            border-radius: 12px;
+            line-height: 1.6;
+        }
+
+        .message.user {
+            background: var(--user-bg);
+            align-self: flex-end;
+            border-bottom-right-radius: 4px;
+        }
+
+        .message.assistant {
+            background: var(--assistant-bg);
+            border: 1px solid var(--border);
+            align-self: flex-start;
+            border-bottom-left-radius: 4px;
+        }
+
+        .message.tool {
+            background: var(--tool-bg);
+            align-self: flex-start;
+            font-family: 'Monaco', 'Menlo', monospace;
+            font-size: 0.875rem;
+            border-left: 3px solid var(--accent);
+            max-width: 90%;
+        }
+
+        .message.tool .tool-name {
+            color: var(--accent);
+            font-weight: 600;
+            margin-bottom: 0.5rem;
+        }
+
+        .message.tool .tool-result {
+            white-space: pre-wrap;
+            word-break: break-all;
+            max-height: 300px;
+            overflow-y: auto;
+        }
+
+        /* Markdown styles */
+        .message h1, .message h2, .message h3, .message h4 {
+            margin: 0.5em 0;
+        }
+
+        .message h1 { font-size: 1.5em; }
+        .message h2 { font-size: 1.3em; }
+        .message h3 { font-size: 1.1em; }
+
+        .message p {
+            margin: 0.5em 0;
+        }
+
+        .message ul, .message ol {
+            margin: 0.5em 0;
+            padding-left: 1.5em;
+        }
+
+        .message li {
+            margin: 0.25em 0;
+        }
+
+        .message pre {
+            background: rgba(0,0,0,0.4);
+            padding: 0.75rem;
+            border-radius: 6px;
+            overflow-x: auto;
+            margin: 0.5rem 0;
+        }
+
+        .message code {
+            font-family: 'Monaco', 'Menlo', 'Consolas', monospace;
+            font-size: 0.9em;
+        }
+
+        .message p code {
+            background: rgba(0,0,0,0.3);
+            padding: 0.15em 0.4em;
+            border-radius: 3px;
+        }
+
+        .message a {
+            color: var(--accent);
+            text-decoration: none;
+        }
+
+        .message a:hover {
+            text-decoration: underline;
+        }
+
+        .message table {
+            border-collapse: collapse;
+            margin: 0.5em 0;
+        }
+
+        .message th, .message td {
+            border: 1px solid var(--border);
+            padding: 0.5em;
+        }
+
+        .message blockquote {
+            border-left: 3px solid var(--accent);
+            padding-left: 1em;
+            margin: 0.5em 0;
+            color: var(--text-secondary);
+        }
+
+        .message img {
+            max-width: 100%;
+            height: auto;
+            border-radius: 8px;
+            margin: 0.5em 0;
+            cursor: pointer;
+            transition: transform 0.2s;
+        }
+
+        .message img:hover {
+            transform: scale(1.02);
+        }
+
+        .image-modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0,0,0,0.9);
+            justify-content: center;
+            align-items: center;
+            z-index: 200;
+            cursor: pointer;
+        }
+
+        .image-modal.show {
+            display: flex;
+        }
+
+        .image-modal img {
+            max-width: 95%;
+            max-height: 95%;
+            object-fit: contain;
+        }
+
+        .input-container {
+            padding: 1rem 2rem;
+            background: var(--bg-secondary);
+            border-top: 1px solid var(--border);
+        }
+
+        .input-wrapper {
+            display: flex;
+            gap: 0.75rem;
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+
+        #message-input {
+            flex: 1;
+            padding: 0.875rem 1rem;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            font-size: 1rem;
+            resize: none;
+            min-height: 48px;
+            max-height: 200px;
+        }
+
+        #message-input:focus {
+            outline: none;
+            border-color: var(--accent);
+        }
+
+        #send-btn {
+            padding: 0 1.5rem;
+            background: var(--accent);
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+
+        #send-btn:hover {
+            background: var(--accent-hover);
+        }
+
+        #send-btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .typing-indicator {
+            display: none;
+            align-self: flex-start;
+            padding: 1rem;
+            background: var(--assistant-bg);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+        }
+
+        .typing-indicator.show {
+            display: flex;
+            gap: 4px;
+        }
+
+        .typing-indicator span {
+            width: 8px;
+            height: 8px;
+            background: var(--text-secondary);
+            border-radius: 50%;
+            animation: typing 1.4s infinite;
+        }
+
+        .typing-indicator span:nth-child(2) { animation-delay: 0.2s; }
+        .typing-indicator span:nth-child(3) { animation-delay: 0.4s; }
+
+        @keyframes typing {
+            0%, 60%, 100% { transform: translateY(0); }
+            30% { transform: translateY(-8px); }
+        }
+
+        .settings-btn {
+            background: transparent;
+            border: 1px solid var(--border);
+            color: var(--text-secondary);
+            padding: 0.5rem 1rem;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.875rem;
+        }
+
+        .settings-btn:hover {
+            border-color: var(--accent);
+            color: var(--accent);
+        }
+
+        .modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0,0,0,0.7);
+            justify-content: center;
+            align-items: center;
+            z-index: 100;
+        }
+
+        .modal.show {
+            display: flex;
+        }
+
+        .modal-content {
+            background: var(--bg-secondary);
+            padding: 2rem;
+            border-radius: 12px;
+            width: 90%;
+            max-width: 500px;
+        }
+
+        .modal-content h2 {
+            margin-bottom: 1.5rem;
+        }
+
+        .form-group {
+            margin-bottom: 1rem;
+        }
+
+        .form-group label {
+            display: block;
+            margin-bottom: 0.5rem;
+            color: var(--text-secondary);
+            font-size: 0.875rem;
+        }
+
+        .form-group input, .form-group select {
+            width: 100%;
+            padding: 0.75rem;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            font-size: 1rem;
+        }
+
+        .modal-actions {
+            display: flex;
+            gap: 1rem;
+            margin-top: 1.5rem;
+            justify-content: flex-end;
+        }
+
+        .btn-secondary {
+            padding: 0.75rem 1.5rem;
+            background: transparent;
+            border: 1px solid var(--border);
+            color: var(--text-primary);
+            border-radius: 6px;
+            cursor: pointer;
+        }
+
+        .btn-primary {
+            padding: 0.75rem 1.5rem;
+            background: var(--accent);
+            border: none;
+            color: white;
+            border-radius: 6px;
+            cursor: pointer;
+        }
+
+        .streaming-cursor {
+            display: inline-block;
+            width: 8px;
+            height: 1em;
+            background: var(--accent);
+            animation: blink 1s infinite;
+            vertical-align: text-bottom;
+            margin-left: 2px;
+        }
+
+        @keyframes blink {
+            0%, 50% { opacity: 1; }
+            51%, 100% { opacity: 0; }
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h1><span>siki</span> <span data-i18n="title">Shikigami</span></h1>
+        <div style="display: flex; gap: 1rem; align-items: center;">
+            <div class="status">
+                <div class="status-dot" id="status-dot"></div>
+                <span id="status-text" data-i18n="connecting">Connecting...</span>
+            </div>
+            <button class="settings-btn" onclick="showSettings()" data-i18n="settings">Settings</button>
+            <button class="settings-btn" onclick="clearChat()" data-i18n="clear">Clear</button>
+        </div>
+    </header>
+
+    <div class="chat-container" id="chat-container">
+        <div class="message assistant" id="welcome-message">
+            <p><span data-i18n="welcome">Welcome to</span> <strong>siki</strong> - <span data-i18n="welcome_sub">your local agentic AI assistant.</span></p>
+            <p><span data-i18n="can_help">I can help you with:</span></p>
+            <ul>
+                <li data-i18n="help_files">Reading and writing files</li>
+                <li data-i18n="help_commands">Executing commands</li>
+                <li data-i18n="help_web">Web search and fetching pages</li>
+                <li data-i18n="help_code">Searching through code</li>
+                <li data-i18n="help_more">And more...</li>
+            </ul>
+        </div>
+    </div>
+
+    <div class="typing-indicator" id="typing">
+        <span></span><span></span><span></span>
+    </div>
+
+    <div class="input-container">
+        <div class="input-wrapper">
+            <textarea id="message-input" data-i18n-placeholder="input_placeholder" placeholder="Type your message..." rows="1"></textarea>
+            <button id="send-btn" onclick="sendMessage()" data-i18n="send">Send</button>
+        </div>
+    </div>
+
+    <div class="image-modal" id="image-modal" onclick="hideImageModal()">
+        <img id="modal-image" src="" alt="Full size image">
+    </div>
+
+    <div class="modal" id="settings-modal">
+        <div class="modal-content">
+            <h2 data-i18n="settings">Settings</h2>
+            <div class="form-group">
+                <label data-i18n="model">Model</label>
+                <input type="text" id="setting-model" placeholder="gpt-oss:20b">
+            </div>
+            <div class="form-group">
+                <label data-i18n="backend">Backend</label>
+                <select id="setting-backend">
+                    <option value="ollama">Ollama</option>
+                    <option value="vllm">vLLM</option>
+                    <option value="mlx">MLX</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label data-i18n="api_endpoint">API Endpoint</label>
+                <input type="text" id="setting-endpoint" placeholder="http://localhost:11434/v1">
+            </div>
+            <div class="modal-actions">
+                <button class="btn-secondary" onclick="hideSettings()" data-i18n="cancel">Cancel</button>
+                <button class="btn-primary" onclick="saveSettings()" data-i18n="save">Save</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // ============================================
+        // Internationalization (i18n)
+        // ============================================
+        const i18n = {
+            en: {
+                title: 'Shikigami',
+                connecting: 'Connecting...',
+                settings: 'Settings',
+                clear: 'Clear',
+                welcome: 'Welcome to',
+                welcome_sub: 'your local agentic AI assistant.',
+                can_help: 'I can help you with:',
+                help_files: 'Reading and writing files',
+                help_commands: 'Executing commands',
+                help_web: 'Web search and fetching pages',
+                help_code: 'Searching through code',
+                help_more: 'And more...',
+                input_placeholder: 'Type your message...',
+                send: 'Send',
+                model: 'Model',
+                backend: 'Backend',
+                api_endpoint: 'API Endpoint',
+                cancel: 'Cancel',
+                save: 'Save',
+                chat_cleared: 'Chat cleared. How can I help you?'
+            },
+            ja: {
+                title: '式神',
+                connecting: '接続中...',
+                settings: '設定',
+                clear: 'クリア',
+                welcome: 'ようこそ',
+                welcome_sub: 'あなたに仕えるローカルAIエージェントです。',
+                can_help: 'できること:',
+                help_files: 'ファイルの読み書き',
+                help_commands: 'コマンドの実行',
+                help_web: 'Web検索とページ取得',
+                help_code: 'コード検索',
+                help_more: 'その他...',
+                input_placeholder: 'メッセージを入力...',
+                send: '送信',
+                model: 'モデル',
+                backend: 'バックエンド',
+                api_endpoint: 'APIエンドポイント',
+                cancel: 'キャンセル',
+                save: '保存',
+                chat_cleared: 'チャットをクリアしました。何かお手伝いしましょうか？'
+            }
+        };
+
+        // Detect browser language
+        const browserLang = navigator.language || navigator.userLanguage;
+        const lang = browserLang.startsWith('ja') ? 'ja' : 'en';
+        const t = i18n[lang];
+
+        // Apply translations
+        function applyTranslations() {
+            document.querySelectorAll('[data-i18n]').forEach(el => {
+                const key = el.getAttribute('data-i18n');
+                if (t[key]) {
+                    el.textContent = t[key];
+                }
+            });
+            document.querySelectorAll('[data-i18n-placeholder]').forEach(el => {
+                const key = el.getAttribute('data-i18n-placeholder');
+                if (t[key]) {
+                    el.placeholder = t[key];
+                }
+            });
+            // Update page title
+            document.title = `siki - ${t.title} Agentic AI`;
+        }
+
+        // Apply translations on load
+        applyTranslations();
+
+        // ============================================
+        // Configure marked
+        // ============================================
+        marked.setOptions({
+            breaks: true,
+            gfm: true,
+            highlight: function(code, lang) {
+                return code;
+            }
+        });
+
+        const chatContainer = document.getElementById('chat-container');
+        const messageInput = document.getElementById('message-input');
+        const sendBtn = document.getElementById('send-btn');
+        const typing = document.getElementById('typing');
+        const statusDot = document.getElementById('status-dot');
+        const statusText = document.getElementById('status-text');
+
+        let conversationId = Date.now().toString();
+
+        // Auto-resize textarea
+        messageInput.addEventListener('input', function() {
+            this.style.height = 'auto';
+            this.style.height = Math.min(this.scrollHeight, 200) + 'px';
+        });
+
+        // IME composition state
+        let isComposing = false;
+
+        messageInput.addEventListener('compositionstart', function() {
+            isComposing = true;
+        });
+
+        messageInput.addEventListener('compositionend', function() {
+            isComposing = false;
+        });
+
+        // Send on Enter (Shift+Enter for new line, ignore during IME)
+        messageInput.addEventListener('keydown', function(e) {
+            if (e.key === 'Enter' && !e.shiftKey && !isComposing && !e.isComposing) {
+                e.preventDefault();
+                sendMessage();
+            }
+        });
+
+        // Check server status
+        async function checkStatus() {
+            try {
+                const resp = await fetch('/api/status');
+                const data = await resp.json();
+                statusDot.classList.remove('offline');
+                statusText.textContent = `${data.model} (${data.backend})`;
+
+                // Load settings
+                document.getElementById('setting-model').value = data.model;
+                document.getElementById('setting-backend').value = data.backend;
+                document.getElementById('setting-endpoint').value = data.endpoint;
+            } catch (e) {
+                statusDot.classList.add('offline');
+                statusText.textContent = 'Offline';
+            }
+        }
+
+        checkStatus();
+        setInterval(checkStatus, 30000);
+
+        function addMessage(role, content, toolName = null) {
+            const div = document.createElement('div');
+            div.className = `message ${role}`;
+
+            if (toolName) {
+                div.innerHTML = `<div class="tool-name">[Tool: ${toolName}]</div><div class="tool-result">${escapeHtml(content)}</div>`;
+            } else if (role === 'user') {
+                div.innerHTML = escapeHtml(content).replace(/\n/g, '<br>');
+            } else {
+                div.innerHTML = marked.parse(content);
+            }
+
+            chatContainer.appendChild(div);
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+            return div;
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        function createStreamingMessage() {
+            const div = document.createElement('div');
+            div.className = 'message assistant';
+            div.innerHTML = '<span class="streaming-cursor"></span>';
+            chatContainer.appendChild(div);
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+            return div;
+        }
+
+        function updateStreamingMessage(div, content) {
+            div.innerHTML = marked.parse(content) + '<span class="streaming-cursor"></span>';
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+        }
+
+        function finalizeStreamingMessage(div, content) {
+            div.innerHTML = marked.parse(content);
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+        }
+
+        async function sendMessage() {
+            const message = messageInput.value.trim();
+            if (!message) return;
+
+            addMessage('user', message);
+            messageInput.value = '';
+            messageInput.style.height = 'auto';
+            sendBtn.disabled = true;
+
+            try {
+                const resp = await fetch('/api/chat/stream', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        message: message,
+                        conversation_id: conversationId
+                    })
+                });
+
+                const reader = resp.body.getReader();
+                const decoder = new TextDecoder();
+                let streamingDiv = null;
+                let fullContent = '';
+                let buffer = '';
+
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+
+                    buffer += decoder.decode(value, { stream: true });
+                    const lines = buffer.split('\n');
+                    buffer = lines.pop(); // Keep incomplete line in buffer
+
+                    for (const line of lines) {
+                        if (!line.startsWith('data: ')) continue;
+                        const data = line.slice(6);
+                        if (data === '[DONE]') continue;
+
+                        try {
+                            const event = JSON.parse(data);
+
+                            if (event.type === 'tool_call') {
+                                // Show tool call
+                                addMessage('tool', event.result || 'Executing...', event.name);
+                            } else if (event.type === 'content') {
+                                // Streaming content
+                                if (!streamingDiv) {
+                                    streamingDiv = createStreamingMessage();
+                                }
+                                fullContent += event.content;
+                                updateStreamingMessage(streamingDiv, fullContent);
+                            } else if (event.type === 'done') {
+                                // Finalize
+                                if (streamingDiv) {
+                                    finalizeStreamingMessage(streamingDiv, fullContent);
+                                }
+                            } else if (event.type === 'error') {
+                                addMessage('assistant', `Error: ${event.error}`);
+                            }
+                        } catch (e) {
+                            console.error('Parse error:', e, data);
+                        }
+                    }
+                }
+
+                // Handle any remaining content
+                if (streamingDiv && fullContent) {
+                    finalizeStreamingMessage(streamingDiv, fullContent);
+                }
+
+            } catch (e) {
+                addMessage('assistant', `Connection error: ${e.message}`);
+            }
+
+            sendBtn.disabled = false;
+            messageInput.focus();
+        }
+
+        function clearChat() {
+            chatContainer.innerHTML = '';
+            conversationId = Date.now().toString();
+            addMessage('assistant', t.chat_cleared);
+        }
+
+        function showSettings() {
+            document.getElementById('settings-modal').classList.add('show');
+        }
+
+        function hideSettings() {
+            document.getElementById('settings-modal').classList.remove('show');
+        }
+
+        function showImageModal(src) {
+            document.getElementById('modal-image').src = src;
+            document.getElementById('image-modal').classList.add('show');
+        }
+
+        function hideImageModal() {
+            document.getElementById('image-modal').classList.remove('show');
+        }
+
+        // Add click handler for images in chat
+        chatContainer.addEventListener('click', function(e) {
+            if (e.target.tagName === 'IMG' && e.target.src) {
+                showImageModal(e.target.src);
+            }
+        });
+
+        async function saveSettings() {
+            const settings = {
+                model: document.getElementById('setting-model').value,
+                backend: document.getElementById('setting-backend').value,
+                endpoint: document.getElementById('setting-endpoint').value
+            };
+
+            try {
+                await fetch('/api/settings', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(settings)
+                });
+                hideSettings();
+                checkStatus();
+            } catch (e) {
+                alert('Failed to save settings: ' + e.message);
+            }
+        }
+
+        // Focus input on load
+        messageInput.focus();
+    </script>
+</body>
+</html>
