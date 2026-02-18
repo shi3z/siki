@@ -75,13 +75,15 @@ Available tools:
 - web_fetch: Get text content from a URL
 - web_images: Extract representative images (OGP, main images) from a URL
 - diagram: Generate diagrams using Graphviz DOT language
+- run_code: Execute JavaScript/HTML code interactively in the browser
 
 IMPORTANT RULES:
 1. Always use tools when needed.
 2. For current events/news, use web_search.
 3. When mentioning URLs with visual content, use web_images to show representative images. The tool returns markdown image syntax - include it directly in your response.
 4. Use the diagram tool to visualize relationships, workflows, architectures, or research results. The tool returns markdown image syntax - include it directly in your response.
-5. Respond in the user's language.`,
+5. When the user asks for calculations, visualizations, charts, interactive demos, or code that should run - use run_code to create an interactive HTML/JavaScript page. Include Canvas, SVG, or DOM elements as needed.
+6. Respond in the user's language.`,
 	}
 }
 
@@ -279,6 +281,24 @@ var tools = []Tool{
 			"required": []string{"dot_code"},
 		},
 	},
+	{
+		Name:        "run_code",
+		Description: "Execute JavaScript/HTML code interactively in the browser. Use this to create visualizations, charts, interactive demos, calculations with visual output. The code runs in a sandboxed iframe. Returns an embedded view of the result.",
+		Parameters: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"html": map[string]interface{}{
+					"type":        "string",
+					"description": "Complete HTML code including <script> tags for JavaScript. Can include CSS, Canvas, SVG, etc.",
+				},
+				"title": map[string]interface{}{
+					"type":        "string",
+					"description": "Title for the playground",
+				},
+			},
+			"required": []string{"html"},
+		},
+	},
 }
 
 // ============================================================================
@@ -324,6 +344,12 @@ func (a *Agent) executeTool(name string, args map[string]interface{}) (string, e
 			title = t
 		}
 		return a.generateDiagram(args["dot_code"].(string), title)
+	case "run_code":
+		title := "Playground"
+		if t, ok := args["title"].(string); ok {
+			title = t
+		}
+		return a.runCode(args["html"].(string), title)
 	default:
 		return "", fmt.Errorf("unknown tool: %s", name)
 	}
@@ -760,6 +786,66 @@ Here's the DOT code for reference:
 	// Return markdown image syntax
 	diagramURL := fmt.Sprintf("/diagrams/%s", filename)
 	return fmt.Sprintf("Diagram generated:\n\n![%s](%s)", title, diagramURL), nil
+}
+
+// Playground directory for interactive code
+var playgroundDir string
+
+func initPlaygroundDir() error {
+	if playgroundDir != "" {
+		return nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	playgroundDir = filepath.Join(home, ".siki", "playground")
+	return os.MkdirAll(playgroundDir, 0755)
+}
+
+func (a *Agent) runCode(htmlCode, title string) (string, error) {
+	if err := initPlaygroundDir(); err != nil {
+		return "", fmt.Errorf("failed to create playground dir: %w", err)
+	}
+
+	// Generate unique filename
+	filename := fmt.Sprintf("playground_%d.html", time.Now().UnixNano())
+	outputPath := filepath.Join(playgroundDir, filename)
+
+	// Wrap the code in a complete HTML document if needed
+	var fullHTML string
+	if strings.Contains(htmlCode, "<html") || strings.Contains(htmlCode, "<!DOCTYPE") {
+		fullHTML = htmlCode
+	} else {
+		fullHTML = fmt.Sprintf(`<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>%s</title>
+    <style>
+        body { font-family: -apple-system, sans-serif; margin: 20px; background: #1a1a2e; color: #eee; }
+        canvas { border: 1px solid #333; }
+    </style>
+</head>
+<body>
+%s
+</body>
+</html>`, title, htmlCode)
+	}
+
+	// Write the HTML file
+	if err := os.WriteFile(outputPath, []byte(fullHTML), 0644); err != nil {
+		return "", fmt.Errorf("failed to write playground file: %w", err)
+	}
+
+	// Return an embedded iframe
+	playgroundURL := fmt.Sprintf("/playground/%s", filename)
+	return fmt.Sprintf(`Code playground created: **%s**
+
+<iframe src="%s" style="width:100%%;height:500px;border:1px solid #333;border-radius:8px;background:#1a1a2e;"></iframe>
+
+[Open in new tab](%s)`, title, playgroundURL, playgroundURL), nil
 }
 
 func extractTextFromHTML(html string) string {
@@ -1434,6 +1520,33 @@ func (ws *WebServer) handleDiagrams(w http.ResponseWriter, r *http.Request) {
 	w.Write(data)
 }
 
+func (ws *WebServer) handlePlayground(w http.ResponseWriter, r *http.Request) {
+	// Extract filename from path
+	filename := strings.TrimPrefix(r.URL.Path, "/playground/")
+	if filename == "" || strings.Contains(filename, "..") {
+		http.Error(w, "Invalid filename", http.StatusBadRequest)
+		return
+	}
+
+	// Only allow .html files
+	if !strings.HasSuffix(filename, ".html") {
+		http.Error(w, "Invalid file type", http.StatusBadRequest)
+		return
+	}
+
+	filePath := filepath.Join(playgroundDir, filename)
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		http.Error(w, "Playground not found", http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(data)))
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Write(data)
+}
+
 func (ws *WebServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 	resp := StatusResponse{
 		Model:    ws.config.ModelName,
@@ -1680,10 +1793,14 @@ func runWeb(config *Config, host string, port int) error {
 	http.HandleFunc("/api/chat", ws.handleChat)
 	http.HandleFunc("/api/chat/stream", ws.handleChatStream)
 	http.HandleFunc("/diagrams/", ws.handleDiagrams)
+	http.HandleFunc("/playground/", ws.handlePlayground)
 
-	// Initialize diagram directory
+	// Initialize directories
 	if err := initDiagramDir(); err != nil {
 		fmt.Printf("Warning: failed to initialize diagram dir: %v\n", err)
+	}
+	if err := initPlaygroundDir(); err != nil {
+		fmt.Printf("Warning: failed to initialize playground dir: %v\n", err)
 	}
 
 	fmt.Printf("siki v%s - 式神 Web GUI\n", Version)

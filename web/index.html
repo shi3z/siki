@@ -711,6 +711,18 @@
             }
         });
 
+        // Custom renderer to allow iframes
+        const renderer = new marked.Renderer();
+        const originalParagraph = renderer.paragraph.bind(renderer);
+        renderer.paragraph = function(text) {
+            // Check if this is an iframe
+            if (text.trim().startsWith('<iframe')) {
+                return text;
+            }
+            return originalParagraph(text);
+        };
+        marked.use({ renderer });
+
         const chatContainer = document.getElementById('chat-container');
         const messageInput = document.getElementById('message-input');
         const sendBtn = document.getElementById('send-btn');
