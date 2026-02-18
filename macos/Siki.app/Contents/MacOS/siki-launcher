@@ -2,15 +2,157 @@
 
 # 式神 Siki - Mac App Launcher
 # This script starts the siki web server and opens the browser
+# Automatically installs Ollama if not present
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 RESOURCES_DIR="$SCRIPT_DIR/../Resources"
 SIKI_BINARY="$RESOURCES_DIR/siki"
+LOG_FILE="/tmp/siki-launcher.log"
 
-# Default port
+log() {
+    echo "$(date): $1" >> "$LOG_FILE"
+}
+
+# Check if siki binary exists
+if [ ! -f "$SIKI_BINARY" ]; then
+    osascript -e 'display alert "Siki Error" message "siki binary not found in Resources folder"'
+    exit 1
+fi
+
+# Function to check if Ollama is installed
+check_ollama() {
+    if command -v ollama &> /dev/null; then
+        return 0
+    elif [ -d "/Applications/Ollama.app" ]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Function to install Ollama
+install_ollama() {
+    log "Installing Ollama..."
+
+    # Show progress dialog
+    osascript -e 'display notification "Installing Ollama..." with title "Siki Setup"'
+
+    # Download and install Ollama
+    OLLAMA_DMG="/tmp/Ollama.dmg"
+    curl -L -o "$OLLAMA_DMG" "https://ollama.com/download/Ollama-darwin.zip" 2>> "$LOG_FILE"
+
+    if [ $? -ne 0 ]; then
+        # Try alternative: use brew if available
+        if command -v brew &> /dev/null; then
+            log "Trying brew install..."
+            brew install ollama 2>> "$LOG_FILE"
+            return $?
+        fi
+        return 1
+    fi
+
+    # Unzip and install
+    unzip -o "$OLLAMA_DMG" -d /tmp/ 2>> "$LOG_FILE"
+    if [ -d "/tmp/Ollama.app" ]; then
+        cp -R /tmp/Ollama.app /Applications/ 2>> "$LOG_FILE"
+        rm -rf /tmp/Ollama.app
+    fi
+    rm -f "$OLLAMA_DMG"
+
+    return 0
+}
+
+# Function to start Ollama service
+start_ollama() {
+    log "Starting Ollama service..."
+
+    # Check if Ollama is already running
+    if curl -s http://localhost:11434/api/tags &> /dev/null; then
+        log "Ollama is already running"
+        return 0
+    fi
+
+    # Start Ollama.app if it exists
+    if [ -d "/Applications/Ollama.app" ]; then
+        open -a Ollama
+        # Wait for Ollama to start
+        for i in {1..30}; do
+            if curl -s http://localhost:11434/api/tags &> /dev/null; then
+                log "Ollama started successfully"
+                return 0
+            fi
+            sleep 1
+        done
+    fi
+
+    # Try ollama serve command
+    if command -v ollama &> /dev/null; then
+        ollama serve &> /dev/null &
+        sleep 3
+        if curl -s http://localhost:11434/api/tags &> /dev/null; then
+            log "Ollama serve started"
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+# Function to check and pull a model
+ensure_model() {
+    log "Checking for models..."
+
+    # Check if any model exists
+    MODELS=$(curl -s http://localhost:11434/api/tags 2>/dev/null | grep -o '"name":"[^"]*"' | head -1)
+
+    if [ -z "$MODELS" ]; then
+        log "No models found, pulling default model..."
+        osascript -e 'display notification "Downloading AI model (this may take a while)..." with title "Siki Setup"'
+
+        # Pull a small, fast model as default
+        if command -v ollama &> /dev/null; then
+            ollama pull llama3.2:3b 2>> "$LOG_FILE"
+        else
+            /Applications/Ollama.app/Contents/Resources/ollama pull llama3.2:3b 2>> "$LOG_FILE"
+        fi
+
+        osascript -e 'display notification "Model download complete!" with title "Siki Setup"'
+    fi
+}
+
+# Main setup flow
+log "=== Siki Launcher Started ==="
+
+# Check and install Ollama if needed
+if ! check_ollama; then
+    log "Ollama not found, prompting for install..."
+
+    INSTALL=$(osascript -e 'display dialog "Siki requires Ollama to run AI models locally.\n\nWould you like to install Ollama now?" buttons {"Cancel", "Install Ollama"} default button "Install Ollama" with title "Siki Setup"' 2>/dev/null)
+
+    if [[ "$INSTALL" == *"Install Ollama"* ]]; then
+        if ! install_ollama; then
+            osascript -e 'display alert "Installation Failed" message "Could not install Ollama. Please install it manually from https://ollama.com"'
+            open "https://ollama.com/download"
+            exit 1
+        fi
+        osascript -e 'display notification "Ollama installed successfully!" with title "Siki Setup"'
+    else
+        osascript -e 'display alert "Ollama Required" message "Siki requires Ollama to run. Please install it from https://ollama.com"'
+        exit 1
+    fi
+fi
+
+# Start Ollama service
+if ! start_ollama; then
+    osascript -e 'display alert "Ollama Error" message "Could not start Ollama service. Please try starting Ollama manually."'
+    exit 1
+fi
+
+# Ensure at least one model is available
+ensure_model
+
+# Find an available port
 PORT=3000
-
-# Find an available port if 3000 is in use
 while lsof -i:$PORT >/dev/null 2>&1; do
     PORT=$((PORT + 1))
     if [ $PORT -gt 3100 ]; then
@@ -19,27 +161,25 @@ while lsof -i:$PORT >/dev/null 2>&1; do
     fi
 done
 
-# Check if siki binary exists
-if [ ! -f "$SIKI_BINARY" ]; then
-    osascript -e 'display alert "Siki Error" message "siki binary not found in Resources folder"'
-    exit 1
-fi
+log "Starting Siki on port $PORT"
 
 # Start the web server in background
 "$SIKI_BINARY" --backend ollama --port $PORT web &
 SIKI_PID=$!
 
 # Wait a moment for server to start
-sleep 1
+sleep 2
 
 # Check if server started successfully
 if ! kill -0 $SIKI_PID 2>/dev/null; then
-    osascript -e 'display alert "Siki Error" message "Failed to start siki server"'
+    osascript -e 'display alert "Siki Error" message "Failed to start siki server. Check /tmp/siki-launcher.log for details."'
     exit 1
 fi
 
 # Open browser
 open "http://localhost:$PORT"
+
+log "Siki started successfully on port $PORT"
 
 # Keep the app running and wait for the server
 wait $SIKI_PID
