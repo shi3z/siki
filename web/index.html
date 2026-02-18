@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="ja">
+<html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -461,6 +461,18 @@
         <div class="modal-content">
             <h2 data-i18n="settings">Settings</h2>
             <div class="form-group">
+                <label data-i18n="language">Language</label>
+                <select id="setting-language">
+                    <option value="en">English</option>
+                    <option value="ja">日本語</option>
+                    <option value="zh">中文</option>
+                    <option value="ko">한국어</option>
+                    <option value="es">Español</option>
+                    <option value="fr">Français</option>
+                    <option value="de">Deutsch</option>
+                </select>
+            </div>
+            <div class="form-group">
                 <label data-i18n="model">Model</label>
                 <input type="text" id="setting-model" placeholder="gpt-oss:20b">
             </div>
@@ -506,6 +518,7 @@
                 model: 'Model',
                 backend: 'Backend',
                 api_endpoint: 'API Endpoint',
+                language: 'Language',
                 cancel: 'Cancel',
                 save: 'Save',
                 chat_cleared: 'Chat cleared. How can I help you?'
@@ -528,16 +541,143 @@
                 model: 'モデル',
                 backend: 'バックエンド',
                 api_endpoint: 'APIエンドポイント',
+                language: '言語',
                 cancel: 'キャンセル',
                 save: '保存',
                 chat_cleared: 'チャットをクリアしました。何かお手伝いしましょうか？'
+            },
+            zh: {
+                title: '式神',
+                connecting: '连接中...',
+                settings: '设置',
+                clear: '清除',
+                welcome: '欢迎使用',
+                welcome_sub: '您的本地AI代理助手。',
+                can_help: '我可以帮助您:',
+                help_files: '读写文件',
+                help_commands: '执行命令',
+                help_web: '网络搜索和页面获取',
+                help_code: '代码搜索',
+                help_more: '更多...',
+                input_placeholder: '输入消息...',
+                send: '发送',
+                model: '模型',
+                backend: '后端',
+                api_endpoint: 'API端点',
+                language: '语言',
+                cancel: '取消',
+                save: '保存',
+                chat_cleared: '聊天已清除。有什么可以帮助您？'
+            },
+            ko: {
+                title: '시키가미',
+                connecting: '연결 중...',
+                settings: '설정',
+                clear: '지우기',
+                welcome: '환영합니다',
+                welcome_sub: '로컬 AI 에이전트 어시스턴트입니다.',
+                can_help: '도움을 드릴 수 있는 것:',
+                help_files: '파일 읽기 및 쓰기',
+                help_commands: '명령어 실행',
+                help_web: '웹 검색 및 페이지 가져오기',
+                help_code: '코드 검색',
+                help_more: '그 외...',
+                input_placeholder: '메시지를 입력하세요...',
+                send: '전송',
+                model: '모델',
+                backend: '백엔드',
+                api_endpoint: 'API 엔드포인트',
+                language: '언어',
+                cancel: '취소',
+                save: '저장',
+                chat_cleared: '채팅이 지워졌습니다. 무엇을 도와드릴까요?'
+            },
+            es: {
+                title: 'Shikigami',
+                connecting: 'Conectando...',
+                settings: 'Configuración',
+                clear: 'Limpiar',
+                welcome: 'Bienvenido a',
+                welcome_sub: 'tu asistente de IA local.',
+                can_help: 'Puedo ayudarte con:',
+                help_files: 'Leer y escribir archivos',
+                help_commands: 'Ejecutar comandos',
+                help_web: 'Búsqueda web y obtención de páginas',
+                help_code: 'Búsqueda de código',
+                help_more: 'Y más...',
+                input_placeholder: 'Escribe tu mensaje...',
+                send: 'Enviar',
+                model: 'Modelo',
+                backend: 'Backend',
+                api_endpoint: 'Endpoint de API',
+                language: 'Idioma',
+                cancel: 'Cancelar',
+                save: 'Guardar',
+                chat_cleared: 'Chat limpiado. ¿En qué puedo ayudarte?'
+            },
+            fr: {
+                title: 'Shikigami',
+                connecting: 'Connexion...',
+                settings: 'Paramètres',
+                clear: 'Effacer',
+                welcome: 'Bienvenue sur',
+                welcome_sub: 'votre assistant IA local.',
+                can_help: 'Je peux vous aider avec:',
+                help_files: 'Lecture et écriture de fichiers',
+                help_commands: 'Exécution de commandes',
+                help_web: 'Recherche web et récupération de pages',
+                help_code: 'Recherche de code',
+                help_more: 'Et plus...',
+                input_placeholder: 'Tapez votre message...',
+                send: 'Envoyer',
+                model: 'Modèle',
+                backend: 'Backend',
+                api_endpoint: 'Point de terminaison API',
+                language: 'Langue',
+                cancel: 'Annuler',
+                save: 'Enregistrer',
+                chat_cleared: 'Chat effacé. Comment puis-je vous aider?'
+            },
+            de: {
+                title: 'Shikigami',
+                connecting: 'Verbinden...',
+                settings: 'Einstellungen',
+                clear: 'Löschen',
+                welcome: 'Willkommen bei',
+                welcome_sub: 'Ihrem lokalen KI-Assistenten.',
+                can_help: 'Ich kann Ihnen helfen mit:',
+                help_files: 'Dateien lesen und schreiben',
+                help_commands: 'Befehle ausführen',
+                help_web: 'Websuche und Seitenabruf',
+                help_code: 'Code-Suche',
+                help_more: 'Und mehr...',
+                input_placeholder: 'Nachricht eingeben...',
+                send: 'Senden',
+                model: 'Modell',
+                backend: 'Backend',
+                api_endpoint: 'API-Endpunkt',
+                language: 'Sprache',
+                cancel: 'Abbrechen',
+                save: 'Speichern',
+                chat_cleared: 'Chat gelöscht. Wie kann ich Ihnen helfen?'
             }
         };
 
-        // Detect browser language
-        const browserLang = navigator.language || navigator.userLanguage;
-        const lang = browserLang.startsWith('ja') ? 'ja' : 'en';
-        const t = i18n[lang];
+        // Language names for selector
+        const languageNames = {
+            en: 'English',
+            ja: '日本語',
+            zh: '中文',
+            ko: '한국어',
+            es: 'Español',
+            fr: 'Français',
+            de: 'Deutsch'
+        };
+
+        // Get saved language or default to English
+        let lang = localStorage.getItem('siki-language') || 'en';
+        if (!i18n[lang]) lang = 'en';
+        let t = i18n[lang];
 
         // Apply translations
         function applyTranslations() {
@@ -753,6 +893,8 @@
         }
 
         function showSettings() {
+            // Set current language in selector
+            document.getElementById('setting-language').value = lang;
             document.getElementById('settings-modal').classList.add('show');
         }
 
@@ -776,7 +918,20 @@
             }
         });
 
+        function changeLanguage(newLang) {
+            if (i18n[newLang]) {
+                lang = newLang;
+                t = i18n[lang];
+                localStorage.setItem('siki-language', lang);
+                applyTranslations();
+            }
+        }
+
         async function saveSettings() {
+            // Save language
+            const newLang = document.getElementById('setting-language').value;
+            changeLanguage(newLang);
+
             const settings = {
                 model: document.getElementById('setting-model').value,
                 backend: document.getElementById('setting-backend').value,
