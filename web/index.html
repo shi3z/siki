@@ -771,7 +771,8 @@
             div.className = `message ${role}`;
 
             if (toolName) {
-                div.innerHTML = `<div class="tool-name">[Tool: ${toolName}]</div><div class="tool-result">${escapeHtml(content)}</div>`;
+                // Use renderMarkdown to allow iframes in tool results
+                div.innerHTML = `<div class="tool-name">[Tool: ${toolName}]</div><div class="tool-result">${renderMarkdown(content)}</div>`;
             } else if (role === 'user') {
                 div.innerHTML = escapeHtml(content).replace(/\n/g, '<br>');
             } else {
