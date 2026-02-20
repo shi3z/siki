@@ -101,6 +101,25 @@
             border-bottom-left-radius: 4px;
         }
 
+        .message.thinking {
+            background: rgba(233, 69, 96, 0.08);
+            border: 1px solid rgba(233, 69, 96, 0.25);
+            align-self: flex-start;
+            border-bottom-left-radius: 4px;
+            font-size: 0.9rem;
+            color: var(--text-secondary);
+        }
+
+        .message.thinking::before {
+            content: '💭 Thinking...';
+            display: block;
+            font-size: 0.75rem;
+            color: var(--accent);
+            margin-bottom: 0.5rem;
+            font-weight: 600;
+            opacity: 0.8;
+        }
+
         .message.tool {
             background: var(--tool-bg);
             align-self: flex-start;
@@ -121,6 +140,79 @@
             word-break: break-all;
             max-height: 300px;
             overflow-y: auto;
+        }
+
+        .message.tool.diagram-result .tool-result {
+            max-height: none;
+            overflow: visible;
+            white-space: normal;
+            text-align: center;
+        }
+
+        .message.tool.diagram-result .tool-result img {
+            max-width: 100%;
+            max-height: 70vh;
+            height: auto;
+            background: #fff;
+            border-radius: 8px;
+            padding: 1rem;
+        }
+
+        .popout-btn {
+            display: inline-block;
+            margin-top: 0.5rem;
+            padding: 0.3rem 0.8rem;
+            background: var(--bg-tertiary);
+            color: var(--text-secondary);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.75rem;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        }
+
+        .popout-btn:hover {
+            color: var(--accent);
+            border-color: var(--accent);
+        }
+
+        .link-preview {
+            display: inline-block;
+            margin: 0.5rem 0;
+            border-radius: 8px;
+            overflow: hidden;
+        }
+
+        .link-preview img {
+            max-width: 100%;
+            max-height: 300px;
+            height: auto;
+            display: block;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: opacity 0.2s;
+        }
+
+        .link-preview img:hover {
+            opacity: 0.85;
+        }
+
+        .youtube-embed {
+            position: relative;
+            width: 100%;
+            padding-bottom: 56.25%;
+            margin: 0.5rem 0;
+            border-radius: 8px;
+            overflow: hidden;
+        }
+
+        .youtube-embed iframe {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            border-radius: 8px;
         }
 
         /* Markdown styles */
@@ -771,8 +863,38 @@
             div.className = `message ${role}`;
 
             if (toolName) {
-                // Use renderMarkdown to allow iframes in tool results
-                div.innerHTML = `<div class="tool-name">[Tool: ${toolName}]</div><div class="tool-result">${renderMarkdown(content)}</div>`;
+                const rendered = renderMarkdown(content);
+                div.innerHTML = `<div class="tool-name">[Tool: ${toolName}]</div><div class="tool-result">${rendered}</div>`;
+
+                // Special handling for diagram results
+                if (toolName === 'diagram') {
+                    div.classList.add('diagram-result');
+                    // Extract image URL and add popout button
+                    const imgMatch = content.match(/!\[.*?\]\((\/diagrams\/[^)]+)\)/);
+                    if (imgMatch) {
+                        const popBtn = document.createElement('button');
+                        popBtn.className = 'popout-btn';
+                        popBtn.textContent = '↗ Pop out';
+                        popBtn.onclick = function() {
+                            window.open(imgMatch[1], '_blank', 'width=1000,height=800');
+                        };
+                        div.querySelector('.tool-result').appendChild(popBtn);
+                    }
+                }
+
+                // Special handling for run_code results
+                if (toolName === 'run_code') {
+                    const iframeMatch = content.match(/src="(\/playground\/[^"]+)"/);
+                    if (iframeMatch) {
+                        const popBtn = document.createElement('button');
+                        popBtn.className = 'popout-btn';
+                        popBtn.textContent = '↗ Pop out';
+                        popBtn.onclick = function() {
+                            window.open(iframeMatch[1], '_blank', 'width=1000,height=800');
+                        };
+                        div.querySelector('.tool-result').appendChild(popBtn);
+                    }
+                }
             } else if (role === 'user') {
                 div.innerHTML = escapeHtml(content).replace(/\n/g, '<br>');
             } else {
@@ -781,6 +903,12 @@
 
             chatContainer.appendChild(div);
             chatContainer.scrollTop = chatContainer.scrollHeight;
+
+            // Fetch link previews for assistant messages
+            if (role === 'assistant' && !toolName) {
+                fetchLinkPreviews(div);
+            }
+
             return div;
         }
 
@@ -797,7 +925,7 @@
             const iframes = [];
             let protectedContent = content.replace(iframePattern, (match) => {
                 iframes.push(match);
-                return `__IFRAME_PLACEHOLDER_${iframes.length - 1}__`;
+                return `SIKIFRAME${iframes.length - 1}ENDFRAME`;
             });
 
             // Parse markdown
@@ -805,8 +933,17 @@
 
             // Restore iframes
             iframes.forEach((iframe, index) => {
-                html = html.replace(`__IFRAME_PLACEHOLDER_${index}__`, iframe);
+                html = html.replace(`SIKIFRAME${index}ENDFRAME`, iframe);
             });
+
+            // Open all links in new tab
+            html = html.replace(/<a /g, '<a target="_blank" rel="noopener" ');
+
+            // Embed YouTube links
+            html = html.replace(
+                /<a[^>]*href="(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/watch\?v=|youtu\.be\/)([\w-]+)[^"]*"[^>]*>[^<]*<\/a>/gi,
+                '<div class="youtube-embed"><iframe src="https://www.youtube.com/embed/$1" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe></div>'
+            );
 
             return html;
         }
@@ -828,6 +965,43 @@
         function finalizeStreamingMessage(div, content) {
             div.innerHTML = renderMarkdown(content);
             chatContainer.scrollTop = chatContainer.scrollHeight;
+            fetchLinkPreviews(div);
+        }
+
+        // Fetch representative images for URLs in a message element
+        function fetchLinkPreviews(el) {
+            const links = el.querySelectorAll('a[href^="http"]');
+            const seen = new Set();
+            links.forEach(link => {
+                const href = link.getAttribute('href');
+                // Skip YouTube (already embedded), images, diagrams, playground
+                if (!href || seen.has(href)) return;
+                if (/youtube\.com|youtu\.be/i.test(href)) return;
+                if (/\.(png|jpg|jpeg|gif|svg|webp)$/i.test(href)) return;
+                if (/^\/diagrams\/|^\/playground\//.test(href)) return;
+                seen.add(href);
+
+                // Fetch images async, only insert if image found
+                fetch(`/api/images?url=${encodeURIComponent(href)}`)
+                    .then(r => r.json())
+                    .then(data => {
+                        if (data.images && data.images.length > 0) {
+                            const preview = document.createElement('a');
+                            preview.className = 'link-preview';
+                            preview.href = href;
+                            preview.target = '_blank';
+                            preview.rel = 'noopener';
+                            const img = document.createElement('img');
+                            img.src = data.images[0];
+                            img.alt = 'Preview';
+                            img.onerror = () => preview.remove();
+                            preview.appendChild(img);
+                            link.parentNode.insertBefore(preview, link.nextSibling);
+                            chatContainer.scrollTop = chatContainer.scrollHeight;
+                        }
+                    })
+                    .catch(() => {});
+            });
         }
 
         async function sendMessage() {
@@ -854,6 +1028,7 @@
                 let streamingDiv = null;
                 let fullContent = '';
                 let buffer = '';
+                let hasToolCalls = false;
 
                 while (true) {
                     const { done, value } = await reader.read();
@@ -872,6 +1047,15 @@
                             const event = JSON.parse(data);
 
                             if (event.type === 'tool_call') {
+                                // If there was streaming content before tool calls, finalize as "thinking"
+                                if (streamingDiv && fullContent) {
+                                    finalizeStreamingMessage(streamingDiv, fullContent);
+                                    streamingDiv.classList.remove('assistant');
+                                    streamingDiv.classList.add('thinking');
+                                    streamingDiv = null;
+                                    fullContent = '';
+                                }
+                                hasToolCalls = true;
                                 // Show tool call
                                 addMessage('tool', event.result || 'Executing...', event.name);
                             } else if (event.type === 'content') {

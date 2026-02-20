@@ -120,7 +120,8 @@ const ctx = canvas.getContext('2d');
 ## Other Rules
 - For news/current events: use web_search
 - For relationships/architecture: use diagram
-- Respond in user's language`,
+- Respond in user's language
+- IMPORTANT: Always include at least one relevant URL in your response. Use web_search to find URLs if needed.`,
 	}
 }
 
@@ -348,6 +349,10 @@ type Agent struct {
 }
 
 func (a *Agent) executeTool(name string, args map[string]interface{}) (string, error) {
+	// Sanitize tool name: strip model artifacts like <|channel|>commentary
+	if idx := strings.Index(name, "<"); idx != -1 {
+		name = strings.TrimSpace(name[:idx])
+	}
 	switch name {
 	case "read_file":
 		return a.readFile(args["path"].(string))
@@ -1497,6 +1502,12 @@ func NewWebServer(config *Config) *WebServer {
 	}
 }
 
+func buildSystemPrompt(config *Config) string {
+	now := time.Now()
+	dateStr := fmt.Sprintf("今日は%d年%d月%d日です。", now.Year(), int(now.Month()), now.Day())
+	return dateStr + "\n\n" + config.SystemPrompt
+}
+
 func (ws *WebServer) getOrCreateAgent(convID string) *Agent {
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
@@ -1508,7 +1519,7 @@ func (ws *WebServer) getOrCreateAgent(convID string) *Agent {
 	agent := &Agent{
 		config: ws.config,
 		messages: []Message{
-			{Role: "system", Content: ws.config.SystemPrompt},
+			{Role: "system", Content: buildSystemPrompt(ws.config)},
 		},
 	}
 	ws.conversations[convID] = agent
@@ -1578,6 +1589,40 @@ func (ws *WebServer) handlePlayground(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(data)))
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Write(data)
+}
+
+func (ws *WebServer) handleImages(w http.ResponseWriter, r *http.Request) {
+	targetURL := r.URL.Query().Get("url")
+	if targetURL == "" {
+		http.Error(w, "url parameter required", http.StatusBadRequest)
+		return
+	}
+
+	agent := &Agent{config: ws.config}
+	result, err := agent.webImages(targetURL)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"images": []string{},
+			"error":  err.Error(),
+		})
+		return
+	}
+
+	// Parse image URLs from the result
+	var images []string
+	imgRe := regexp.MustCompile(`!\[.*?\]\(([^)]+)\)`)
+	matches := imgRe.FindAllStringSubmatch(result, -1)
+	for _, m := range matches {
+		if len(m) > 1 {
+			images = append(images, m[1])
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"images": images,
+	})
 }
 
 func (ws *WebServer) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -1825,6 +1870,7 @@ func runWeb(config *Config, host string, port int) error {
 	http.HandleFunc("/api/settings", ws.handleSettings)
 	http.HandleFunc("/api/chat", ws.handleChat)
 	http.HandleFunc("/api/chat/stream", ws.handleChatStream)
+	http.HandleFunc("/api/images", ws.handleImages)
 	http.HandleFunc("/diagrams/", ws.handleDiagrams)
 	http.HandleFunc("/playground/", ws.handlePlayground)
 
@@ -1897,7 +1943,7 @@ func runChat(config *Config) error {
 	agent := &Agent{
 		config: config,
 		messages: []Message{
-			{Role: "system", Content: config.SystemPrompt},
+			{Role: "system", Content: buildSystemPrompt(config)},
 		},
 	}
 
@@ -1940,7 +1986,7 @@ func runChat(config *Config) error {
 			return nil
 		case "clear":
 			agent.messages = []Message{
-				{Role: "system", Content: config.SystemPrompt},
+				{Role: "system", Content: buildSystemPrompt(config)},
 			}
 			fmt.Println("Conversation cleared.")
 			continue
