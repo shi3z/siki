@@ -76,6 +76,8 @@ func defaultConfig() *Config {
 - web_images: Extract images from a URL
 - diagram: Generate Graphviz diagrams
 - run_code: **Execute HTML/JavaScript in browser iframe**
+- blog_person_search: **ブログの最新記事を巡回し、言及されている人物名を抽出する**。人物の関係性や著名人について聞かれたらこのツールを使う
+- search_conversation: **過去の会話履歴からキーワード検索**する。以前の会話内容を参照したいときに使う
 
 ## run_code Tool Specification
 When user asks to draw, visualize, calculate, simulate, or create anything visual:
@@ -121,7 +123,9 @@ const ctx = canvas.getContext('2d');
 - For news/current events: use web_search
 - For relationships/architecture: use diagram
 - Respond in user's language
-- IMPORTANT: Always include at least one relevant URL in your response. Use web_search to find URLs if needed.`,
+- IMPORTANT: Always include at least one relevant URL in your response. Use web_search to find URLs if needed.
+- For questions about people related to a person/blogger: use blog_person_search to read their blog articles and extract person names. Do NOT just do a web_search - actually read the articles.
+- To recall earlier conversation: use search_conversation`,
 	}
 }
 
@@ -320,6 +324,38 @@ var tools = []Tool{
 		},
 	},
 	{
+		Name:        "search_conversation",
+		Description: "Search through the current conversation history for messages containing a keyword. Use this to recall what was discussed earlier in the conversation.",
+		Parameters: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"query": map[string]interface{}{
+					"type":        "string",
+					"description": "Keyword or phrase to search for in conversation history",
+				},
+			},
+			"required": []string{"query"},
+		},
+	},
+	{
+		Name:        "blog_person_search",
+		Description: "Search a blog/website for person names mentioned in recent articles. Fetches the latest articles from a blog URL, reads each article, and uses AI to extract person names. Use this when asked about people related to a blogger, author, or website. Returns a list of person names with context about how they are mentioned.",
+		Parameters: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"url": map[string]interface{}{
+					"type":        "string",
+					"description": "Blog or website top page URL (e.g., https://note.com/shi3zblog)",
+				},
+				"max_articles": map[string]interface{}{
+					"type":        "number",
+					"description": "Maximum number of articles to read (default: 5, max: 10)",
+				},
+			},
+			"required": []string{"url"},
+		},
+	},
+	{
 		Name:        "run_code",
 		Description: "Execute JavaScript/HTML code interactively in the browser. Use this to create visualizations, charts, interactive demos, calculations with visual output. The code runs in a sandboxed iframe. Returns an embedded view of the result.",
 		Parameters: map[string]interface{}{
@@ -386,6 +422,20 @@ func (a *Agent) executeTool(name string, args map[string]interface{}) (string, e
 			title = t
 		}
 		return a.generateDiagram(args["dot_code"].(string), title)
+	case "search_conversation":
+		return a.searchConversation(args["query"].(string)), nil
+	case "blog_person_search":
+		maxArticles := 5
+		if n, ok := args["max_articles"].(float64); ok {
+			maxArticles = int(n)
+		}
+		if maxArticles > 10 {
+			maxArticles = 10
+		}
+		if maxArticles < 1 {
+			maxArticles = 5
+		}
+		return a.blogPersonSearch(args["url"].(string), maxArticles)
 	case "run_code":
 		title := "Playground"
 		if t, ok := args["title"].(string); ok {
@@ -623,6 +673,279 @@ func (a *Agent) webFetch(url string) (string, error) {
 	}
 
 	return fmt.Sprintf("Content from %s:\n\n%s", url, text), nil
+}
+
+func (a *Agent) blogPersonSearch(blogURL string, maxArticles int) (string, error) {
+	client := &http.Client{Timeout: 30 * time.Second}
+
+	// Step 1: Get article URLs
+	var articleURLs []string
+
+	parsedURL, _ := url.Parse(blogURL)
+
+	if strings.Contains(parsedURL.Host, "note.com") {
+		// note.com: use API
+		username := strings.Trim(parsedURL.Path, "/")
+		apiURL := fmt.Sprintf("https://note.com/api/v2/creators/%s/contents?kind=note&page=1&per_page=%d", username, maxArticles)
+		fmt.Printf("[siki] Fetching note.com API: %s\n", apiURL)
+
+		req, err := http.NewRequest("GET", apiURL, nil)
+		if err != nil {
+			return "", err
+		}
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+
+		resp, err := client.Do(req)
+		if err != nil {
+			return "", fmt.Errorf("failed to fetch note.com API: %w", err)
+		}
+		defer resp.Body.Close()
+
+		var noteResp struct {
+			Data struct {
+				Contents []struct {
+					Key     string `json:"key"`
+					Name    string `json:"name"`
+					Body    string `json:"body"`
+					User    struct {
+						Urlname string `json:"urlname"`
+					} `json:"user"`
+				} `json:"contents"`
+			} `json:"data"`
+		}
+
+		if err := json.NewDecoder(resp.Body).Decode(&noteResp); err != nil {
+			return "", fmt.Errorf("failed to parse note.com API response: %w", err)
+		}
+
+		// note.com API includes body text directly - use it!
+		var articleSummaries []string
+		for i, content := range noteResp.Data.Contents {
+			articleURL := fmt.Sprintf("https://note.com/%s/n/%s", content.User.Urlname, content.Key)
+			fmt.Printf("[siki] Processing article %d/%d: %s (%s)\n", i+1, len(noteResp.Data.Contents), content.Name, articleURL)
+
+			articleText := content.Body
+			if articleText == "" {
+				// If body is empty (paid article?), try fetching the page
+				articleText = a.fetchArticleText(client, articleURL)
+			}
+			if len(articleText) > 8000 {
+				articleText = articleText[:8000]
+			}
+			if articleText == "" {
+				continue
+			}
+
+			persons := a.extractPersonNames(articleURL, content.Name+"\n\n"+articleText)
+			if persons != "" && persons != "人物名なし" {
+				articleSummaries = append(articleSummaries, fmt.Sprintf("### 記事 %d: %s\n%s\n%s", i+1, content.Name, articleURL, persons))
+			}
+		}
+
+		if len(articleSummaries) == 0 {
+			return fmt.Sprintf("%d件の記事を分析しましたが、人物名は抽出できませんでした。", len(noteResp.Data.Contents)), nil
+		}
+
+		return fmt.Sprintf("## %s から抽出した人物名一覧\n\n（%d件の記事を分析）\n\n%s",
+			blogURL, len(noteResp.Data.Contents), strings.Join(articleSummaries, "\n\n")), nil
+
+	} else {
+		// General blog: try HTML parsing
+		req, err := http.NewRequest("GET", blogURL, nil)
+		if err != nil {
+			return "", err
+		}
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+
+		resp, err := client.Do(req)
+		if err != nil {
+			return "", fmt.Errorf("failed to fetch blog page: %w", err)
+		}
+		defer resp.Body.Close()
+
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return "", err
+		}
+
+		articleURLs = extractArticleLinks(string(body), blogURL)
+		if len(articleURLs) == 0 {
+			return "No articles found on the page.", nil
+		}
+		if len(articleURLs) > maxArticles {
+			articleURLs = articleURLs[:maxArticles]
+		}
+	}
+
+	// Process general blog articles
+	var articleSummaries []string
+	for i, articleURL := range articleURLs {
+		fmt.Printf("[siki] Reading article %d/%d: %s\n", i+1, len(articleURLs), articleURL)
+
+		articleText := a.fetchArticleText(client, articleURL)
+		if len(articleText) > 8000 {
+			articleText = articleText[:8000]
+		}
+		if articleText == "" {
+			continue
+		}
+
+		persons := a.extractPersonNames(articleURL, articleText)
+		if persons != "" && persons != "人物名なし" {
+			articleSummaries = append(articleSummaries, fmt.Sprintf("### 記事 %d: %s\n%s", i+1, articleURL, persons))
+		}
+	}
+
+	if len(articleSummaries) == 0 {
+		return fmt.Sprintf("Read %d articles from %s but could not extract any person names.", len(articleURLs), blogURL), nil
+	}
+
+	return fmt.Sprintf("## %s から抽出した人物名一覧\n\n（%d件の記事を分析）\n\n%s",
+		blogURL, len(articleURLs), strings.Join(articleSummaries, "\n\n")), nil
+}
+
+func (a *Agent) fetchArticleText(client *http.Client, articleURL string) string {
+	req, err := http.NewRequest("GET", articleURL, nil)
+	if err != nil {
+		return ""
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return ""
+	}
+	return extractTextFromHTML(string(body))
+}
+
+func extractArticleLinks(html string, baseURL string) []string {
+	var urls []string
+	seen := make(map[string]bool)
+
+	base, _ := url.Parse(baseURL)
+
+	re := regexp.MustCompile(`href=["']([^"']+)["']`)
+	matches := re.FindAllStringSubmatch(html, -1)
+
+	for _, m := range matches {
+		if len(m) < 2 {
+			continue
+		}
+		link := m[1]
+
+		parsed, err := url.Parse(link)
+		if err != nil {
+			continue
+		}
+		resolved := base.ResolveReference(parsed)
+		fullURL := resolved.String()
+
+		if !isArticleURL(fullURL, baseURL) {
+			continue
+		}
+
+		if !seen[fullURL] {
+			seen[fullURL] = true
+			urls = append(urls, fullURL)
+		}
+	}
+
+	return urls
+}
+
+func isArticleURL(articleURL string, baseURL string) bool {
+	baseP, _ := url.Parse(baseURL)
+	artP, _ := url.Parse(articleURL)
+
+	if baseP.Host != artP.Host {
+		return false
+	}
+
+	path := artP.Path
+
+	if strings.Contains(baseURL, "note.com") {
+		return regexp.MustCompile(`/[^/]+/n/[a-zA-Z0-9]+`).MatchString(path)
+	}
+
+	segments := strings.Split(strings.Trim(path, "/"), "/")
+	if len(segments) < 2 {
+		return false
+	}
+	skipPrefixes := []string{"tag", "category", "page", "about", "contact", "search", "login", "signup"}
+	for _, skip := range skipPrefixes {
+		if strings.EqualFold(segments[0], skip) {
+			return false
+		}
+	}
+	return true
+}
+
+func (a *Agent) extractPersonNames(articleURL string, articleText string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	extractMessages := []Message{
+		{Role: "system", Content: `あなはテキストから人物名（個人名）を抽出する専門家です。
+以下の記事テキストから、言及されている実在の人物の名前を全て抽出してください。
+
+ルール:
+- 実在の個人名のみ（企業名・団体名は除外）
+- 著者自身は除外
+- 名前と、どのような文脈で言及されているかを簡潔に記載
+- 人物が見つからない場合は「人物名なし」と回答
+
+フォーマット:
+- **人物名**: 文脈の説明（1行で）`},
+		{Role: "user", Content: fmt.Sprintf("記事URL: %s\n\n記事テキスト:\n%s", articleURL, articleText)},
+	}
+
+	req := ChatRequest{
+		Model:       a.config.ModelName,
+		Messages:    extractMessages,
+		MaxTokens:   1000,
+		Temperature: 0.1,
+		Stream:      false,
+	}
+
+	body, err := json.Marshal(req)
+	if err != nil {
+		return ""
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, "POST",
+		a.config.APIEndpoint+"/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		return ""
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 60 * time.Second}
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return ""
+	}
+
+	var chatResp ChatResponse
+	if err := json.NewDecoder(resp.Body).Decode(&chatResp); err != nil {
+		return ""
+	}
+
+	if len(chatResp.Choices) == 0 {
+		return ""
+	}
+
+	return strings.TrimSpace(chatResp.Choices[0].Message.Content)
 }
 
 func (a *Agent) webImages(targetURL string) (string, error) {
@@ -1012,7 +1335,273 @@ func (a *Agent) chat(ctx context.Context) (*Message, error) {
 	return a.chatStream(ctx, nil)
 }
 
+// validateResponse checks if the response is relevant to the user's question
+func (a *Agent) validateResponse(ctx context.Context, userMessage string, response string) (bool, string) {
+	validateMessages := []Message{
+		{Role: "system", Content: `You are a response quality checker. Given a user's question and an AI's response, determine if the response is relevant and appropriate.
+Reply with ONLY "OK" if the response is relevant and addresses the question.
+Reply with "NG: <reason>" if the response is irrelevant, off-topic, or ignores the conversation context.
+Be lenient - only flag clearly irrelevant or nonsensical responses.`},
+		{Role: "user", Content: fmt.Sprintf("User's question: %s\n\nAI's response: %s", userMessage, response)},
+	}
+
+	req := ChatRequest{
+		Model:       a.config.ModelName,
+		Messages:    validateMessages,
+		MaxTokens:   100,
+		Temperature: 0.1,
+		Stream:      false,
+	}
+
+	body, err := json.Marshal(req)
+	if err != nil {
+		return true, "" // assume OK on error
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, "POST",
+		a.config.APIEndpoint+"/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		return true, ""
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		return true, ""
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return true, ""
+	}
+
+	var chatResp ChatResponse
+	if err := json.NewDecoder(resp.Body).Decode(&chatResp); err != nil {
+		return true, ""
+	}
+
+	if len(chatResp.Choices) == 0 {
+		return true, ""
+	}
+
+	result := strings.TrimSpace(chatResp.Choices[0].Message.Content)
+	if strings.HasPrefix(result, "OK") {
+		return true, ""
+	}
+	reason := strings.TrimPrefix(result, "NG: ")
+	reason = strings.TrimPrefix(reason, "NG:")
+	return false, strings.TrimSpace(reason)
+}
+
+// compressConversation summarizes older messages to reduce context size
+func (a *Agent) compressConversation(ctx context.Context) {
+	// Keep system message + last 6 messages, compress everything in between
+	if len(a.messages) <= 8 {
+		return
+	}
+
+	// Messages to compress: from index 1 (after system) to len-6
+	compressEnd := len(a.messages) - 6
+	if compressEnd <= 1 {
+		return
+	}
+
+	var historyText strings.Builder
+	for i := 1; i < compressEnd; i++ {
+		msg := a.messages[i]
+		if msg.Role == "tool" {
+			continue // skip tool results for compression
+		}
+		historyText.WriteString(fmt.Sprintf("[%s]: %s\n", msg.Role, msg.Content))
+	}
+
+	if historyText.Len() == 0 {
+		return
+	}
+
+	// Truncate history text if too long
+	history := historyText.String()
+	if len(history) > 10000 {
+		history = history[:10000]
+	}
+
+	compressMessages := []Message{
+		{Role: "system", Content: "会話履歴を簡潔に要約してください。重要な事実、ユーザーの質問の要点、AIの回答の要点を保持してください。200文字以内で要約してください。"},
+		{Role: "user", Content: history},
+	}
+
+	req := ChatRequest{
+		Model:       a.config.ModelName,
+		Messages:    compressMessages,
+		MaxTokens:   300,
+		Temperature: 0.1,
+		Stream:      false,
+	}
+
+	body, _ := json.Marshal(req)
+	httpReq, err := http.NewRequestWithContext(ctx, "POST",
+		a.config.APIEndpoint+"/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		return
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+
+	var chatResp ChatResponse
+	if err := json.NewDecoder(resp.Body).Decode(&chatResp); err != nil || len(chatResp.Choices) == 0 {
+		return
+	}
+
+	summary := chatResp.Choices[0].Message.Content
+	fmt.Printf("[siki] Compressed %d messages into summary\n", compressEnd-1)
+
+	// Rebuild messages: system + summary + recent messages
+	newMessages := []Message{a.messages[0]}
+	newMessages = append(newMessages, Message{
+		Role:    "assistant",
+		Content: fmt.Sprintf("[以前の会話の要約]\n%s", summary),
+	})
+	newMessages = append(newMessages, a.messages[compressEnd:]...)
+	a.messages = newMessages
+}
+
+// forceCompressConversation aggressively compresses conversation regardless of message count
+// Used when context deadline is exceeded to reduce context size
+func (a *Agent) forceCompressConversation(ctx context.Context) {
+	if len(a.messages) <= 2 {
+		return // Only system + 1 message, nothing to compress
+	}
+
+	// Keep system message + last 2 messages, compress everything else
+	keepLast := 2
+	if len(a.messages)-1 < keepLast {
+		keepLast = len(a.messages) - 1
+	}
+	compressEnd := len(a.messages) - keepLast
+	if compressEnd <= 1 {
+		return
+	}
+
+	var historyText strings.Builder
+	for i := 1; i < compressEnd; i++ {
+		msg := a.messages[i]
+		if msg.Role == "tool" {
+			continue
+		}
+		historyText.WriteString(fmt.Sprintf("[%s]: %s\n", msg.Role, msg.Content))
+	}
+
+	if historyText.Len() == 0 {
+		return
+	}
+
+	// Truncate history text if too long (more aggressive limit)
+	history := historyText.String()
+	if len(history) > 6000 {
+		history = history[:6000]
+	}
+
+	compressMessages := []Message{
+		{Role: "system", Content: "会話履歴を簡潔に要約してください。重要な事実、ユーザーの質問の要点、AIの回答の要点を保持してください。150文字以内で要約してください。"},
+		{Role: "user", Content: history},
+	}
+
+	req := ChatRequest{
+		Model:       a.config.ModelName,
+		Messages:    compressMessages,
+		MaxTokens:   200,
+		Temperature: 0.1,
+		Stream:      false,
+	}
+
+	body, _ := json.Marshal(req)
+	httpReq, err := http.NewRequestWithContext(ctx, "POST",
+		a.config.APIEndpoint+"/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		// Fallback: just truncate messages without summarizing
+		a.messages = append([]Message{a.messages[0]}, a.messages[compressEnd:]...)
+		return
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 60 * time.Second}
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		// Fallback: just truncate messages without summarizing
+		a.messages = append([]Message{a.messages[0]}, a.messages[compressEnd:]...)
+		fmt.Printf("[siki] Force compress failed (LLM error), truncated %d messages\n", compressEnd-1)
+		return
+	}
+	defer resp.Body.Close()
+
+	var chatResp ChatResponse
+	if err := json.NewDecoder(resp.Body).Decode(&chatResp); err != nil || len(chatResp.Choices) == 0 {
+		// Fallback: just truncate
+		a.messages = append([]Message{a.messages[0]}, a.messages[compressEnd:]...)
+		fmt.Printf("[siki] Force compress failed (decode error), truncated %d messages\n", compressEnd-1)
+		return
+	}
+
+	summary := chatResp.Choices[0].Message.Content
+	fmt.Printf("[siki] Force compressed %d messages into summary\n", compressEnd-1)
+
+	// Rebuild messages: system + summary + last few messages
+	newMessages := []Message{a.messages[0]}
+	newMessages = append(newMessages, Message{
+		Role:    "assistant",
+		Content: fmt.Sprintf("[以前の会話の要約]\n%s", summary),
+	})
+	newMessages = append(newMessages, a.messages[compressEnd:]...)
+	a.messages = newMessages
+}
+
+// searchConversation searches through conversation history for relevant messages
+func (a *Agent) searchConversation(query string) string {
+	var results []string
+	queryLower := strings.ToLower(query)
+
+	for i, msg := range a.messages {
+		if msg.Role == "system" || msg.Role == "tool" {
+			continue
+		}
+		contentLower := strings.ToLower(msg.Content)
+		if strings.Contains(contentLower, queryLower) {
+			snippet := msg.Content
+			if len(snippet) > 200 {
+				// Find the match position and show surrounding context
+				idx := strings.Index(contentLower, queryLower)
+				start := idx - 80
+				if start < 0 {
+					start = 0
+				}
+				end := idx + len(query) + 80
+				if end > len(snippet) {
+					end = len(snippet)
+				}
+				snippet = "..." + snippet[start:end] + "..."
+			}
+			results = append(results, fmt.Sprintf("- [メッセージ%d/%s]: %s", i, msg.Role, snippet))
+		}
+	}
+
+	if len(results) == 0 {
+		return fmt.Sprintf("会話履歴に「%s」に関する言及は見つかりませんでした。", query)
+	}
+
+	return fmt.Sprintf("会話履歴で「%s」に関する言及:\n\n%s", query, strings.Join(results, "\n"))
+}
+
 func (a *Agent) chatStream(ctx context.Context, onContent func(string)) (*Message, error) {
+	// Auto-compress conversation if it's getting long
+	a.compressConversation(ctx)
+
 	// Convert tools to OpenAI format
 	var toolDefs []map[string]interface{}
 	for _, tool := range tools {
@@ -1797,64 +2386,114 @@ func (ws *WebServer) handleChatStream(w http.ResponseWriter, r *http.Request) {
 		Content: req.Message,
 	})
 
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-	defer cancel()
+	const maxRetries = 2
 
-	// Agent loop
-	for turn := 0; turn < ws.config.MaxTurns; turn++ {
-		// Try streaming first
-		response, err := agent.chatStream(ctx, func(content string) {
-			sendEvent(StreamEvent{Type: "content", Content: content})
-		})
+	for retry := 0; retry <= maxRetries; retry++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+		var fullResponse string
+		var hitTimeout bool
 
-		if err != nil {
-			sendEvent(StreamEvent{Type: "error", Error: err.Error()})
-			return
-		}
+		// Agent loop
+		for turn := 0; turn < ws.config.MaxTurns; turn++ {
+			// Try streaming first
+			response, err := agent.chatStream(ctx, func(content string) {
+				sendEvent(StreamEvent{Type: "content", Content: content})
+			})
 
-		agent.messages = append(agent.messages, *response)
-
-		if len(response.ToolCalls) == 0 {
-			// If no streaming happened, send the full content
-			if response.Content != "" {
-				sendEvent(StreamEvent{Type: "done"})
+			if err != nil {
+				// Check if it's a timeout/context error
+				if strings.Contains(err.Error(), "deadline exceeded") || strings.Contains(err.Error(), "context canceled") {
+					hitTimeout = true
+					break
+				}
+				sendEvent(StreamEvent{Type: "error", Error: err.Error()})
+				cancel()
+				return
 			}
-			break
-		}
 
-		// Execute tool calls
-		for _, tc := range response.ToolCalls {
-			var args map[string]interface{}
-			if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
-				result := fmt.Sprintf("Error parsing arguments: %v", err)
-				sendEvent(StreamEvent{Type: "tool_call", Name: tc.Function.Name, Result: result})
+			agent.messages = append(agent.messages, *response)
+
+			if len(response.ToolCalls) == 0 {
+				fullResponse = response.Content
+				break
+			}
+
+			// Execute tool calls
+			for _, tc := range response.ToolCalls {
+				var args map[string]interface{}
+				if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
+					result := fmt.Sprintf("Error parsing arguments: %v", err)
+					sendEvent(StreamEvent{Type: "tool_call", Name: tc.Function.Name, Result: result})
+					agent.messages = append(agent.messages, Message{
+						Role:       "tool",
+						Content:    result,
+						ToolCallID: tc.ID,
+					})
+					continue
+				}
+
+				result, err := agent.executeTool(tc.Function.Name, args)
+				if err != nil {
+					result = fmt.Sprintf("Error: %v", err)
+				}
+
+				// Truncate very long results for display
+				displayResult := result
+				if len(displayResult) > 2000 {
+					displayResult = displayResult[:2000] + "\n... (truncated)"
+				}
+
+				sendEvent(StreamEvent{Type: "tool_call", Name: tc.Function.Name, Result: displayResult})
+
 				agent.messages = append(agent.messages, Message{
 					Role:       "tool",
 					Content:    result,
 					ToolCallID: tc.ID,
 				})
+			}
+		}
+		cancel()
+
+		// Handle timeout: compress conversation and retry
+		if hitTimeout {
+			fmt.Printf("[siki] Context deadline exceeded, compressing conversation (attempt %d)\n", retry+1)
+			sendEvent(StreamEvent{Type: "content", Content: "\n\n*会話履歴を要約しています...*\n\n"})
+
+			// Force compress with a fresh context
+			compressCtx, compressCancel := context.WithTimeout(context.Background(), 60*time.Second)
+			agent.forceCompressConversation(compressCtx)
+			compressCancel()
+
+			if retry < maxRetries {
+				sendEvent(StreamEvent{Type: "content", Content: "*要約完了。回答を再生成しています...*\n\n"})
+				continue
+			} else {
+				// Show what we have as summary
+				sendEvent(StreamEvent{Type: "content", Content: "*会話が長くなりすぎたため要約しました。もう一度質問してください。*"})
+				break
+			}
+		}
+
+		// Validate the response
+		if fullResponse != "" && retry < maxRetries {
+			valCtx, valCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			ok, reason := agent.validateResponse(valCtx, req.Message, fullResponse)
+			valCancel()
+			if !ok {
+				fmt.Printf("[siki] Response validation failed (attempt %d): %s\n", retry+1, reason)
+				// Remove the bad response from messages
+				agent.messages = agent.messages[:len(agent.messages)-1]
+				// Add a retry prompt
+				agent.messages = append(agent.messages, Message{
+					Role:    "user",
+					Content: fmt.Sprintf("申し訳ありませんが、先ほどの回答は質問に対して適切ではありませんでした（理由: %s）。元の質問「%s」に対して、会話の文脈を踏まえてもう一度回答してください。", reason, req.Message),
+				})
+				// Send apology notification to client
+				sendEvent(StreamEvent{Type: "content", Content: "\n\n---\n*回答を再生成しています...*\n\n"})
 				continue
 			}
-
-			result, err := agent.executeTool(tc.Function.Name, args)
-			if err != nil {
-				result = fmt.Sprintf("Error: %v", err)
-			}
-
-			// Truncate very long results for display
-			displayResult := result
-			if len(displayResult) > 2000 {
-				displayResult = displayResult[:2000] + "\n... (truncated)"
-			}
-
-			sendEvent(StreamEvent{Type: "tool_call", Name: tc.Function.Name, Result: displayResult})
-
-			agent.messages = append(agent.messages, Message{
-				Role:       "tool",
-				Content:    result,
-				ToolCallID: tc.ID,
-			})
 		}
+		break
 	}
 
 	sendEvent(StreamEvent{Type: "done"})

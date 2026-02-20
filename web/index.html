@@ -895,6 +895,26 @@
                         div.querySelector('.tool-result').appendChild(popBtn);
                     }
                 }
+
+                // Add general pop-out button for all tool results
+                {
+                    const popBtn = document.createElement('button');
+                    popBtn.className = 'popout-btn';
+                    popBtn.textContent = '↗ 拡大表示';
+                    popBtn.onclick = function() {
+                        const toolResult = div.querySelector('.tool-result');
+                        const w = window.open('', '_blank', 'width=1000,height=800');
+                        w.document.write(`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>[Tool: ${toolName}]</title><style>
+                            body { background: #1a1a2e; color: #eee; font-family: 'Monaco','Menlo',monospace; font-size: 14px; padding: 2rem; margin: 0; line-height: 1.6; }
+                            pre { white-space: pre-wrap; word-break: break-all; }
+                            img { max-width: 100%; }
+                            a { color: #e94560; }
+                            h1 { color: #e94560; font-size: 1rem; margin-bottom: 1rem; border-bottom: 1px solid #333; padding-bottom: 0.5rem; }
+                        </style></head><body><h1>[Tool: ${toolName}]</h1>${toolResult.innerHTML}</body></html>`);
+                        w.document.close();
+                    };
+                    div.appendChild(popBtn);
+                }
             } else if (role === 'user') {
                 div.innerHTML = escapeHtml(content).replace(/\n/g, '<br>');
             } else {
