@@ -2725,6 +2725,89 @@ func (a *Agent) searchConversation(query string) string {
 	return fmt.Sprintf("会話ログで「%s」に関する言及（%d件中%d件マッチ）:\n\n%s", query, len(thread.Messages), len(results), strings.Join(results, "\n"))
 }
 
+// searchThreadLogForContext searches the thread log from newest to oldest,
+// extracting messages relevant to the query. Returns context text for LLM re-prompting.
+func (a *Agent) searchThreadLogForContext(query string) string {
+	thread, err := loadThread(a.threadID)
+	if err != nil || len(thread.Messages) == 0 {
+		return ""
+	}
+
+	// Extract keywords from query (split by spaces, filter short words)
+	keywords := extractKeywords(query)
+	if len(keywords) == 0 {
+		return ""
+	}
+
+	// Search from newest to oldest
+	var hits []string
+	totalChars := 0
+	const maxChars = 4000
+
+	for i := len(thread.Messages) - 1; i >= 0; i-- {
+		m := thread.Messages[i]
+		if m.Summarized || m.Role == "system" {
+			continue
+		}
+		if m.Role == "assistant" && strings.HasPrefix(m.Content, "[tool_calls:") {
+			continue
+		}
+		contentLower := strings.ToLower(m.Content)
+		matched := false
+		for _, kw := range keywords {
+			if strings.Contains(contentLower, kw) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			continue
+		}
+
+		snippet := m.Content
+		if len(snippet) > 500 {
+			snippet = snippet[:500] + "..."
+		}
+		ts := time.Unix(m.Timestamp, 0).Format("01/02 15:04")
+		hit := fmt.Sprintf("[%s %s]: %s", ts, m.Role, snippet)
+		totalChars += len(hit)
+		if totalChars > maxChars {
+			break
+		}
+		hits = append(hits, hit)
+	}
+
+	if len(hits) == 0 {
+		return ""
+	}
+
+	// Reverse to chronological order
+	for i, j := 0, len(hits)-1; i < j; i, j = i+1, j-1 {
+		hits[i], hits[j] = hits[j], hits[i]
+	}
+
+	return strings.Join(hits, "\n")
+}
+
+// extractKeywords splits text into meaningful search keywords
+func extractKeywords(text string) []string {
+	words := strings.Fields(strings.ToLower(text))
+	var keywords []string
+	seen := make(map[string]bool)
+	for _, w := range words {
+		// Skip very short words and common particles
+		if len(w) < 2 {
+			continue
+		}
+		if seen[w] {
+			continue
+		}
+		seen[w] = true
+		keywords = append(keywords, w)
+	}
+	return keywords
+}
+
 // searchConversationInMemory is a fallback that searches in-memory agent messages
 func (a *Agent) searchConversationInMemory(query string) string {
 	var results []string
@@ -4194,15 +4277,23 @@ func (ws *WebServer) handleChatStream(w http.ResponseWriter, r *http.Request) {
 				// Remove the bad response from agent memory (for retry)
 				agent.messages = agent.messages[:len(agent.messages)-1]
 				// But keep it in newMessages (it was actually generated)
-				// Add a retry prompt
-				retryMsg := Message{
-					Role:    "user",
-					Content: fmt.Sprintf("申し訳ありませんが、先ほどの回答は質問に対して適切ではありませんでした（理由: %s）。元の質問「%s」に対して、会話の文脈を踏まえてもう一度回答してください。", reason, req.Message),
+
+				// Search past conversation logs for context relevant to the question
+				sendEvent(StreamEvent{Type: "content", Content: "\n\n---\n*過去の会話ログを検索しています...*\n\n"})
+				logContext := agent.searchThreadLogForContext(req.Message)
+
+				var retryContent string
+				if logContext != "" {
+					fmt.Printf("[siki] Found relevant context from thread log (%d chars)\n", len(logContext))
+					retryContent = fmt.Sprintf("先ほどの回答は質問の意図を正しく把握できていませんでした（理由: %s）。\n\n以下は過去の会話ログから検索した関連コンテキストです:\n%s\n\n上記のコンテキストを踏まえて、元の質問「%s」にもう一度回答してください。", reason, logContext, req.Message)
+				} else {
+					retryContent = fmt.Sprintf("先ほどの回答は質問の意図を正しく把握できていませんでした（理由: %s）。元の質問「%s」に対して、会話の文脈を踏まえてもう一度回答してください。", reason, req.Message)
 				}
+
+				retryMsg := Message{Role: "user", Content: retryContent}
 				agent.messages = append(agent.messages, retryMsg)
 				newMessages = append(newMessages, retryMsg)
-				// Send apology notification to client
-				sendEvent(StreamEvent{Type: "content", Content: "\n\n---\n*回答を再生成しています...*\n\n"})
+				sendEvent(StreamEvent{Type: "content", Content: "*回答を再生成しています...*\n\n"})
 				continue
 			}
 		}
