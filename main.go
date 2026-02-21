@@ -184,13 +184,27 @@ const ctx = canvas.getContext('2d');
 - "ゲームを作って" → run_code with interactive game
 - "グラフを描いて" → run_code with chart
 
+## Resolving Ambiguous / Subject-less Instructions
+Japanese users frequently omit the subject (主語) from follow-up messages.
+When a user's instruction lacks an explicit subject or object:
+1. **First, check your own immediately preceding response** — the subject is very likely something you just mentioned or produced (e.g., "もっと詳しく" → elaborate on what you just said; "日本語にして" → translate what you just output).
+2. **If not found there, check the user's previous message** — the topic they introduced earlier is probably still the subject (e.g., User: "Rustについて教えて" → You answer → User: "他の言語と比較して" → compare Rust).
+3. **If still unclear, look further back** using recall_context or search_conversation to find the ongoing topic.
+4. **Never ask "何についてですか？" when the context makes the subject obvious.** Resolve it yourself from the conversation flow and proceed.
+
+Examples:
+- You output code → User: "テストして" → run/test the code you just wrote
+- You explain X → User: "要約して" → summarize your explanation of X
+- User asks about topic A → You answer → User: "もっと" → give more detail on A
+- User uploads a file → User: "これを処理して" → process that file
+
 ## Other Rules
 - For news/current events: use web_search
 - For relationships/architecture: use diagram
 - Respond in user's language
 - IMPORTANT: Always include at least one relevant URL in your response. Use web_search to find URLs if needed.
 - For questions about people related to a person/blogger: use blog_person_search to read their blog articles and extract person names. Do NOT just do a web_search - actually read the articles.
-- To recall earlier conversation: use search_conversation`,
+- To recall earlier conversation: use search_conversation or recall_context`,
 	}
 }
 
