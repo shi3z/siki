@@ -577,6 +577,61 @@
             color: var(--accent);
         }
 
+        #upload-btn {
+            background: transparent;
+            border: 1px solid var(--border);
+            color: var(--text-secondary);
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 1.2rem;
+            padding: 0 0.75rem;
+            transition: border-color 0.2s, color 0.2s;
+        }
+
+        #upload-btn:hover {
+            border-color: var(--accent);
+            color: var(--accent);
+        }
+
+        #upload-progress {
+            display: none;
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            padding: 0.25rem 2rem;
+            background: var(--bg-secondary);
+        }
+
+        .summarized-marker {
+            opacity: 0.6;
+            border-left: 3px solid #f0ad4e;
+            font-size: 0.85rem;
+        }
+
+        .summarized-marker summary {
+            cursor: pointer;
+            color: #f0ad4e;
+            font-size: 0.8rem;
+        }
+
+        .docker-status {
+            display: flex;
+            align-items: center;
+            gap: 0.35rem;
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+        }
+
+        .docker-status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #666;
+        }
+
+        .docker-status-dot.not-installed { background: #666; }
+        .docker-status-dot.no-image { background: #f0ad4e; }
+        .docker-status-dot.ready { background: #5cb85c; }
+
         #image-preview-container {
             display: none;
             padding: 0.5rem 2rem;
@@ -968,6 +1023,10 @@
                 <div class="status-dot" id="status-dot"></div>
                 <span id="status-text" data-i18n="connecting">Connecting...</span>
             </div>
+            <div class="docker-status" id="docker-status" title="Docker GPU Container">
+                <div class="docker-status-dot" id="docker-status-dot"></div>
+                <span id="docker-status-text">Docker</span>
+            </div>
             <button class="settings-btn" onclick="showSettings()" data-i18n="settings">Settings</button>
             <button class="settings-btn" onclick="clearChat()" data-i18n="clear">Clear</button>
             <button id="plugin-toggle-btn" onclick="togglePluginPane()">Plugins</button>
@@ -1005,10 +1064,13 @@
     </div>
 
     <div id="image-preview-container"></div>
+    <div id="upload-progress"></div>
     <div class="input-container">
         <div class="input-wrapper">
             <button id="image-btn" onclick="document.getElementById('image-input').click()" title="Upload image">&#128247;</button>
             <input type="file" id="image-input" accept="image/*" multiple style="display:none" onchange="handleImageSelect(event)">
+            <button id="upload-btn" onclick="document.getElementById('file-upload-input').click()" title="Upload files to Docker workspace">&#128194;</button>
+            <input type="file" id="file-upload-input" multiple style="display:none" onchange="handleFileUpload(event)">
             <textarea id="message-input" data-i18n-placeholder="input_placeholder" placeholder="Type your message..." rows="1"></textarea>
             <button id="send-btn" onclick="sendMessage()" data-i18n="send">Send</button>
         </div>
@@ -1561,6 +1623,21 @@
                         api_key: ''
                     }];
                 }
+                // Update Docker status
+                const dockerDot = document.getElementById('docker-status-dot');
+                const dockerText = document.getElementById('docker-status-text');
+                if (data.docker_available) {
+                    if (data.docker_image_ready) {
+                        dockerDot.className = 'docker-status-dot ready';
+                        dockerText.textContent = 'Docker: Ready';
+                    } else {
+                        dockerDot.className = 'docker-status-dot no-image';
+                        dockerText.textContent = 'Docker: No Image';
+                    }
+                } else {
+                    dockerDot.className = 'docker-status-dot not-installed';
+                    dockerText.textContent = 'Docker: N/A';
+                }
             } catch (e) {
                 statusDot.classList.add('offline');
                 statusText.textContent = 'Offline';
@@ -1569,6 +1646,42 @@
 
         checkStatus();
         setInterval(checkStatus, 30000);
+
+        // File upload to Docker workspace
+        async function handleFileUpload(event) {
+            const files = event.target.files;
+            if (!files || files.length === 0) return;
+
+            const progressEl = document.getElementById('upload-progress');
+            progressEl.style.display = 'block';
+            progressEl.textContent = `Uploading ${files.length} file(s)...`;
+
+            const formData = new FormData();
+            for (const file of files) {
+                formData.append('files', file);
+            }
+
+            try {
+                const resp = await fetch('/api/upload', {
+                    method: 'POST',
+                    body: formData
+                });
+                const data = await resp.json();
+                progressEl.textContent = data.message || 'Upload complete';
+                setTimeout(() => { progressEl.style.display = 'none'; }, 3000);
+
+                // Notify chat about uploaded files
+                const fileList = data.files ? data.files.join(', ') : '';
+                if (fileList) {
+                    addMessage('system', `Files uploaded to /workspace: ${fileList}`);
+                }
+            } catch (e) {
+                progressEl.textContent = 'Upload failed: ' + e.message;
+                setTimeout(() => { progressEl.style.display = 'none'; }, 5000);
+            }
+
+            event.target.value = '';
+        }
 
         function addMessage(role, content, toolName = null) {
             const div = document.createElement('div');
@@ -1845,8 +1958,12 @@
                 if (thread.messages && thread.messages.length > 0) {
                     for (const m of thread.messages) {
                         if (m.role === 'system') continue;
-                        if (m.role === 'tool' && m.tool_name) {
-                            addMessage('tool', m.content, m.tool_name);
+                        // Skip empty and internal tool_calls markers
+                        if (!m.content) continue;
+                        if (m.role === 'assistant' && m.content.startsWith('[tool_calls:')) continue;
+
+                        if (m.role === 'tool') {
+                            addMessage('tool', m.content, m.tool_name || 'tool');
                         } else if (m.role === 'user') {
                             const userDiv = addMessage('user', m.content);
                             if (m.images && m.images.length > 0) {
@@ -1858,7 +1975,15 @@
                                 userDiv.innerHTML += imgHtml;
                             }
                         } else if (m.role === 'assistant') {
-                            addMessage('assistant', m.content);
+                            if (m.summarized) {
+                                // Show summarization marker as a collapsible note
+                                const div = document.createElement('div');
+                                div.className = 'message assistant summarized-marker';
+                                div.innerHTML = '<details><summary>--- AI要約 (この時点でLLMコンテキストが要約されました) ---</summary>' + renderMarkdown(m.content) + '</details>';
+                                chatContainer.appendChild(div);
+                            } else {
+                                addMessage('assistant', m.content);
+                            }
                         }
                     }
                 } else {

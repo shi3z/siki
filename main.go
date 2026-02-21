@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"net/url"
@@ -126,8 +127,9 @@ func defaultConfig() *Config {
 - run_code: **Execute HTML/JavaScript in browser iframe**
 - blog_person_search: **ブログの最新記事を巡回し、言及されている人物名を抽出する**。人物の関係性や著名人について聞かれたらこのツールを使う
 - search_conversation: **過去の会話履歴からキーワード検索**する。以前の会話内容を参照したいときに使う
-- recall_context: **現在のスレッドの過去の会話を検索**する。要約されて見えなくなった詳細を思い出すときに使う
+- recall_context: **現在のスレッドの完全な会話ログを検索**する。過去の会話内容を詳しく思い出すときに使う（ログは完全に保存されており、要約されていない）
 - search_threads: **全スレッドを横断検索**する。他のスレッドの会話内容を探すときに使う
+- docker_exec: **GPU対応Dockerコンテナ内でコマンドを実行**する。ffmpeg, Python3, PyTorch, whisperがプリインストール済み。/workspaceにアップロードしたファイルがある。動画→音声抽出→文字起こしなどGPU処理に使う
 - create_plugin: **プラグインを作成/更新**する。新しいツールやUI拡張を動的に追加できる
 - test_plugin: **プラグインをテスト**する。テストケースを渡して全パスしたらTESTED状態にする
 - list_plugins: インストール済みプラグイン一覧を表示
@@ -429,7 +431,7 @@ var tools = []Tool{
 	},
 	{
 		Name:        "recall_context",
-		Description: "Search the current conversation thread's full history for specific content. Use this when you need to recall details from earlier in the conversation that may have been summarized.",
+		Description: "Search the current thread's COMPLETE conversation log for specific content. The log contains every message ever exchanged (never truncated). Use this to recall any detail from the conversation history.",
 		Parameters: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
@@ -489,6 +491,24 @@ var tools = []Tool{
 				},
 			},
 			"required": []string{"html"},
+		},
+	},
+	{
+		Name:        "docker_exec",
+		Description: "Execute a command inside a GPU-enabled Docker container (siki-worker). The container has CUDA, ffmpeg, Python3, PyTorch, and openai-whisper pre-installed. Files uploaded via /api/upload are available in /workspace. Use this for GPU-intensive tasks like transcription, audio/video processing, and ML inference.",
+		Parameters: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"command": map[string]interface{}{
+					"type":        "string",
+					"description": "Shell command to execute inside the container",
+				},
+				"timeout": map[string]interface{}{
+					"type":        "number",
+					"description": "Timeout in seconds (default: 300, max: 3600)",
+				},
+			},
+			"required": []string{"command"},
 		},
 	},
 }
@@ -710,6 +730,12 @@ func (a *Agent) executeTool(name string, args map[string]interface{}) (string, e
 			title = t
 		}
 		return a.runCode(args["html"].(string), title)
+	case "docker_exec":
+		timeout := 300
+		if t, ok := args["timeout"].(float64); ok {
+			timeout = int(t)
+		}
+		return dockerExec(args["command"].(string), timeout)
 	case "create_plugin":
 		return a.createPlugin(args)
 	case "list_plugins":
@@ -1792,6 +1818,143 @@ var pluginMu sync.RWMutex
 // Thread system
 var threadDir string
 
+// ============================================================================
+// Docker GPU Container Management
+// ============================================================================
+
+var (
+	dockerContainerName = "siki-worker"
+	dockerImageName     = "siki-worker:latest"
+	dockerMu            sync.Mutex
+	dockerWorkspaceDir  string
+)
+
+const dockerfileContent = `FROM nvidia/cuda:12.6.0-cudnn-runtime-ubuntu22.04
+ENV DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg python3 python3-pip python3-venv sox libsndfile1 git curl \
+    && rm -rf /var/lib/apt/lists/*
+RUN python3 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+RUN pip install --no-cache-dir torch torchaudio --extra-index-url https://download.pytorch.org/whl/cu126
+RUN pip install --no-cache-dir openai-whisper
+RUN mkdir -p /workspace
+WORKDIR /workspace
+CMD ["sleep", "infinity"]
+`
+
+func initDockerWorkspace() error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	dockerWorkspaceDir = filepath.Join(home, ".siki", "workspace")
+	return os.MkdirAll(dockerWorkspaceDir, 0755)
+}
+
+func isDockerAvailable() bool {
+	_, err := exec.LookPath("docker")
+	return err == nil
+}
+
+func isDockerImageAvailable() bool {
+	cmd := exec.Command("docker", "image", "inspect", dockerImageName)
+	return cmd.Run() == nil
+}
+
+func buildDockerImage() error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	dockerDir := filepath.Join(home, ".siki", "docker")
+	if err := os.MkdirAll(dockerDir, 0755); err != nil {
+		return err
+	}
+	dockerfilePath := filepath.Join(dockerDir, "Dockerfile")
+	if err := os.WriteFile(dockerfilePath, []byte(dockerfileContent), 0644); err != nil {
+		return err
+	}
+	fmt.Println("[siki] Building Docker image siki-worker (this may take a while)...")
+	cmd := exec.Command("docker", "build", "-t", dockerImageName, "-f", dockerfilePath, dockerDir)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+func ensureDockerContainer() error {
+	dockerMu.Lock()
+	defer dockerMu.Unlock()
+
+	if !isDockerAvailable() {
+		return fmt.Errorf("docker is not installed")
+	}
+
+	if !isDockerImageAvailable() {
+		if err := buildDockerImage(); err != nil {
+			return fmt.Errorf("failed to build Docker image: %w", err)
+		}
+	}
+
+	if err := initDockerWorkspace(); err != nil {
+		return fmt.Errorf("failed to init workspace: %w", err)
+	}
+
+	// Check if container is already running
+	cmd := exec.Command("docker", "inspect", "-f", "{{.State.Running}}", dockerContainerName)
+	out, err := cmd.Output()
+	if err == nil && strings.TrimSpace(string(out)) == "true" {
+		return nil // already running
+	}
+
+	// Remove old stopped container if exists
+	exec.Command("docker", "rm", "-f", dockerContainerName).Run()
+
+	// Start new container with GPU access
+	fmt.Println("[siki] Starting Docker container siki-worker with GPU access...")
+	startCmd := exec.Command("docker", "run", "-d",
+		"--name", dockerContainerName,
+		"--gpus", "all",
+		"-v", dockerWorkspaceDir+":/workspace",
+		dockerImageName,
+	)
+	startCmd.Stdout = os.Stdout
+	startCmd.Stderr = os.Stderr
+	return startCmd.Run()
+}
+
+func dockerExec(command string, timeoutSec int) (string, error) {
+	if err := ensureDockerContainer(); err != nil {
+		return "", err
+	}
+
+	if timeoutSec <= 0 {
+		timeoutSec = 300
+	}
+	if timeoutSec > 3600 {
+		timeoutSec = 3600
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSec)*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "docker", "exec", dockerContainerName, "sh", "-c", command)
+	output, err := cmd.CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		return string(output), fmt.Errorf("command timed out after %d seconds", timeoutSec)
+	}
+	if err != nil {
+		return string(output) + "\nError: " + err.Error(), nil
+	}
+	return string(output), nil
+}
+
+func stopDockerContainer() {
+	fmt.Println("[siki] Stopping Docker container siki-worker...")
+	exec.Command("docker", "stop", dockerContainerName).Run()
+	exec.Command("docker", "rm", dockerContainerName).Run()
+}
+
 type Thread struct {
 	ID        string          `json:"id"`
 	Title     string          `json:"title"`
@@ -1807,6 +1970,7 @@ type ThreadMessage struct {
 	Images     []string `json:"images,omitempty"`
 	ToolCallID string   `json:"tool_call_id,omitempty"`
 	ToolName   string   `json:"tool_name,omitempty"`
+	Summarized bool     `json:"summarized,omitempty"`
 	Timestamp  int64    `json:"timestamp"`
 }
 
@@ -1924,6 +2088,17 @@ func saveMessagesToThread(threadID string, newMsgs []Message, userMessage string
 	}
 
 	thread.UpdatedAt = time.Now()
+
+	// Build mapping from ToolCallID → ToolName from assistant messages
+	toolNameMap := make(map[string]string)
+	for _, m := range newMsgs {
+		if m.Role == "assistant" && len(m.ToolCalls) > 0 {
+			for _, tc := range m.ToolCalls {
+				toolNameMap[tc.ID] = tc.Function.Name
+			}
+		}
+	}
+
 	for _, m := range newMsgs {
 		if m.Role == "system" {
 			continue
@@ -1934,6 +2109,23 @@ func saveMessagesToThread(threadID string, newMsgs []Message, userMessage string
 			Images:     m.Images,
 			ToolCallID: m.ToolCallID,
 			Timestamp:  time.Now().Unix(),
+		}
+		// Mark summarization markers with Summarized flag
+		if m.Role == "assistant" && (strings.HasPrefix(m.Content, "[以前の会話の要約]") || strings.HasPrefix(m.Content, "[Previous conversation summary]")) {
+			tm.Summarized = true
+		}
+		// For tool results, look up the tool name from the preceding assistant tool_calls
+		if m.Role == "tool" && m.ToolCallID != "" {
+			tm.ToolName = toolNameMap[m.ToolCallID]
+		}
+		// For assistant messages that only have tool_calls and no text content,
+		// store a summary of which tools were called
+		if m.Role == "assistant" && m.Content == "" && len(m.ToolCalls) > 0 {
+			var names []string
+			for _, tc := range m.ToolCalls {
+				names = append(names, tc.Function.Name)
+			}
+			tm.Content = "[tool_calls: " + strings.Join(names, ", ") + "]"
 		}
 		thread.Messages = append(thread.Messages, tm)
 	}
@@ -2481,8 +2673,60 @@ func (a *Agent) forceCompressConversation(ctx context.Context) {
 	a.messages = newMessages
 }
 
-// searchConversation searches through conversation history for relevant messages
+// searchConversation searches through the complete thread log for relevant messages
 func (a *Agent) searchConversation(query string) string {
+	// Search the complete thread log file, not the in-memory LLM context
+	thread, err := loadThread(a.threadID)
+	if err != nil {
+		// Fallback: search in-memory messages
+		return a.searchConversationInMemory(query)
+	}
+
+	var results []string
+	queryLower := strings.ToLower(query)
+
+	for i, m := range thread.Messages {
+		if m.Role == "system" {
+			continue
+		}
+		if m.Summarized {
+			continue
+		}
+		if m.Role == "assistant" && strings.HasPrefix(m.Content, "[tool_calls:") {
+			continue
+		}
+		contentLower := strings.ToLower(m.Content)
+		if strings.Contains(contentLower, queryLower) {
+			snippet := m.Content
+			if len(snippet) > 300 {
+				idx := strings.Index(contentLower, queryLower)
+				start := idx - 100
+				if start < 0 {
+					start = 0
+				}
+				end := idx + len(query) + 100
+				if end > len(snippet) {
+					end = len(snippet)
+				}
+				snippet = "..." + snippet[start:end] + "..."
+			}
+			ts := time.Unix(m.Timestamp, 0).Format("2006-01-02 15:04")
+			results = append(results, fmt.Sprintf("- [#%d %s %s]: %s", i+1, ts, m.Role, snippet))
+		}
+	}
+
+	if len(results) == 0 {
+		return fmt.Sprintf("会話ログに「%s」に関する言及は見つかりませんでした（%d件のメッセージを検索）。", query, len(thread.Messages))
+	}
+	if len(results) > 20 {
+		results = results[len(results)-20:]
+	}
+
+	return fmt.Sprintf("会話ログで「%s」に関する言及（%d件中%d件マッチ）:\n\n%s", query, len(thread.Messages), len(results), strings.Join(results, "\n"))
+}
+
+// searchConversationInMemory is a fallback that searches in-memory agent messages
+func (a *Agent) searchConversationInMemory(query string) string {
 	var results []string
 	queryLower := strings.ToLower(query)
 
@@ -2494,7 +2738,6 @@ func (a *Agent) searchConversation(query string) string {
 		if strings.Contains(contentLower, queryLower) {
 			snippet := msg.Content
 			if len(snippet) > 200 {
-				// Find the match position and show surrounding context
 				idx := strings.Index(contentLower, queryLower)
 				start := idx - 80
 				if start < 0 {
@@ -2513,7 +2756,6 @@ func (a *Agent) searchConversation(query string) string {
 	if len(results) == 0 {
 		return fmt.Sprintf("会話履歴に「%s」に関する言及は見つかりませんでした。", query)
 	}
-
 	return fmt.Sprintf("会話履歴で「%s」に関する言及:\n\n%s", query, strings.Join(results, "\n"))
 }
 
@@ -2522,21 +2764,32 @@ func (a *Agent) recallContext(query string) (string, error) {
 	if err != nil {
 		return "No conversation history found.", nil
 	}
-	// Search through all messages
+	// Search through ALL messages in the complete thread log
 	queryLower := strings.ToLower(query)
 	var matches []string
-	for _, m := range thread.Messages {
+	totalMessages := len(thread.Messages)
+	for i, m := range thread.Messages {
+		// Skip internal markers
+		if m.Summarized {
+			continue
+		}
+		if m.Role == "assistant" && strings.HasPrefix(m.Content, "[tool_calls:") {
+			continue
+		}
 		if strings.Contains(strings.ToLower(m.Content), queryLower) {
-			matches = append(matches, fmt.Sprintf("[%s] %s: %s", time.Unix(m.Timestamp, 0).Format("15:04"), m.Role, truncateString(m.Content, 300)))
+			ts := time.Unix(m.Timestamp, 0).Format("2006-01-02 15:04")
+			content := truncateString(m.Content, 500)
+			matches = append(matches, fmt.Sprintf("[#%d %s %s]: %s", i+1, ts, m.Role, content))
 		}
 	}
 	if len(matches) == 0 {
-		return fmt.Sprintf("No matches found for '%s' in current thread.", query), nil
+		return fmt.Sprintf("No matches found for '%s' in current thread (%d messages searched).", query, totalMessages), nil
 	}
-	if len(matches) > 10 {
-		matches = matches[len(matches)-10:]
+	// Return up to 20 matches (most recent)
+	if len(matches) > 20 {
+		matches = matches[len(matches)-20:]
 	}
-	return fmt.Sprintf("Found %d matches:\n\n%s", len(matches), strings.Join(matches, "\n\n")), nil
+	return fmt.Sprintf("Found %d matches in thread (%d total messages):\n\n%s", len(matches), totalMessages, strings.Join(matches, "\n\n")), nil
 }
 
 func (a *Agent) searchAllThreads(query string) (string, error) {
@@ -3045,12 +3298,14 @@ type ChatAPIResponse struct {
 }
 
 type StatusResponse struct {
-	Model     string     `json:"model"`
-	Backend   string     `json:"backend"`
-	Endpoint  string     `json:"endpoint"`
-	Version   string     `json:"version"`
-	HasAPIKey bool       `json:"has_api_key"`
-	Providers []Provider `json:"providers"`
+	Model            string     `json:"model"`
+	Backend          string     `json:"backend"`
+	Endpoint         string     `json:"endpoint"`
+	Version          string     `json:"version"`
+	HasAPIKey        bool       `json:"has_api_key"`
+	Providers        []Provider `json:"providers"`
+	DockerAvailable  bool       `json:"docker_available"`
+	DockerImageReady bool       `json:"docker_image_ready"`
 }
 
 type SettingsRequest struct {
@@ -3140,21 +3395,61 @@ func (ws *WebServer) getOrCreateAgent(convID string) *Agent {
 		},
 	}
 
-	// Load thread and build orchestrator context
+	// Build LLM context from thread log (log file itself is never modified)
 	thread, err := loadThread(convID)
 	if err == nil && len(thread.Messages) > 0 {
-		// Add summary if available
-		if thread.Summary != "" {
-			agent.messages = append(agent.messages, Message{
-				Role:    "assistant",
-				Content: fmt.Sprintf("[Previous conversation summary]\n%s", thread.Summary),
-			})
+		const recentCount = 10
+		// Filter out internal markers for LLM context
+		var contextMsgs []ThreadMessage
+		for _, tm := range thread.Messages {
+			if tm.Summarized {
+				continue
+			}
+			if tm.Role == "assistant" && strings.HasPrefix(tm.Content, "[tool_calls:") {
+				continue
+			}
+			contextMsgs = append(contextMsgs, tm)
 		}
-		// Add last N messages for immediate context
-		recentMessages := getRecentThreadMessages(thread, 10)
-		for _, tm := range recentMessages {
-			msg := Message{Role: tm.Role, Content: tm.Content, Images: tm.Images, ToolCallID: tm.ToolCallID}
-			agent.messages = append(agent.messages, msg)
+
+		if len(contextMsgs) <= recentCount {
+			// Few enough messages — load all directly
+			for _, tm := range contextMsgs {
+				agent.messages = append(agent.messages, Message{
+					Role: tm.Role, Content: tm.Content,
+					Images: tm.Images, ToolCallID: tm.ToolCallID,
+				})
+			}
+		} else {
+			// Many messages — build plain-text digest of older messages for LLM context
+			// (this digest is ephemeral; it is NOT saved to the thread log)
+			olderMsgs := contextMsgs[:len(contextMsgs)-recentCount]
+			var digest strings.Builder
+			for _, tm := range olderMsgs {
+				if tm.Role == "tool" {
+					continue // skip tool results in digest for brevity
+				}
+				line := truncateString(tm.Content, 200)
+				digest.WriteString(fmt.Sprintf("[%s]: %s\n", tm.Role, line))
+			}
+			digestText := digest.String()
+			if len(digestText) > 6000 {
+				digestText = digestText[:6000] + "\n...(older messages omitted)"
+			}
+			if digestText != "" {
+				agent.messages = append(agent.messages, Message{
+					Role:    "assistant",
+					Content: fmt.Sprintf("[過去の会話ログ (%d件) — 詳細は recall_context ツールで検索可能]\n%s", len(olderMsgs), digestText),
+				})
+			}
+
+			// Load recent messages directly
+			recentMsgs := contextMsgs[len(contextMsgs)-recentCount:]
+			for _, tm := range recentMsgs {
+				agent.messages = append(agent.messages, Message{
+					Role: tm.Role, Content: tm.Content,
+					Images: tm.Images, ToolCallID: tm.ToolCallID,
+				})
+			}
 		}
 	}
 
@@ -3571,12 +3866,14 @@ func (ws *WebServer) handleThreads(w http.ResponseWriter, r *http.Request) {
 func (ws *WebServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 	pp := ws.config.primaryProvider()
 	resp := StatusResponse{
-		Model:     pp.Model,
-		Backend:   pp.Backend,
-		Endpoint:  pp.Endpoint,
-		Version:   Version,
-		HasAPIKey: pp.APIKey != "",
-		Providers: ws.config.Providers,
+		Model:            pp.Model,
+		Backend:          pp.Backend,
+		Endpoint:         pp.Endpoint,
+		Version:          Version,
+		HasAPIKey:        pp.APIKey != "",
+		Providers:        ws.config.Providers,
+		DockerAvailable:  isDockerAvailable(),
+		DockerImageReady: isDockerAvailable() && isDockerImageAvailable(),
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
@@ -3653,15 +3950,16 @@ func (ws *WebServer) handleChat(w http.ResponseWriter, r *http.Request) {
 
 	agent := ws.getOrCreateAgent(req.ConversationID)
 
-	// Track starting index for new messages to save to thread
-	msgStartIdx := len(agent.messages)
+	// Collect new messages independently from agent.messages
+	var newMessages []Message
 
-	// Add user message
-	agent.messages = append(agent.messages, Message{
+	userMsg := Message{
 		Role:    "user",
 		Content: req.Message,
 		Images:  req.Images,
-	})
+	}
+	agent.messages = append(agent.messages, userMsg)
+	newMessages = append(newMessages, userMsg)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
@@ -3679,6 +3977,7 @@ func (ws *WebServer) handleChat(w http.ResponseWriter, r *http.Request) {
 		}
 
 		agent.messages = append(agent.messages, *response)
+		newMessages = append(newMessages, *response)
 
 		if len(response.ToolCalls) == 0 {
 			apiResp.Response = response.Content
@@ -3689,11 +3988,13 @@ func (ws *WebServer) handleChat(w http.ResponseWriter, r *http.Request) {
 		for _, tc := range response.ToolCalls {
 			var args map[string]interface{}
 			if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
-				agent.messages = append(agent.messages, Message{
+				toolMsg := Message{
 					Role:       "tool",
 					Content:    fmt.Sprintf("Error parsing arguments: %v", err),
 					ToolCallID: tc.ID,
-				})
+				}
+				agent.messages = append(agent.messages, toolMsg)
+				newMessages = append(newMessages, toolMsg)
 				apiResp.ToolCalls = append(apiResp.ToolCalls, ToolCallResult{
 					Name:   tc.Function.Name,
 					Result: fmt.Sprintf("Error: %v", err),
@@ -3717,17 +4018,19 @@ func (ws *WebServer) handleChat(w http.ResponseWriter, r *http.Request) {
 				Result: displayResult,
 			})
 
-			agent.messages = append(agent.messages, Message{
+			toolMsg := Message{
 				Role:       "tool",
 				Content:    result,
 				ToolCallID: tc.ID,
-			})
+			}
+			agent.messages = append(agent.messages, toolMsg)
+			newMessages = append(newMessages, toolMsg)
 		}
 	}
 
-	// Save new messages to thread
-	if msgStartIdx < len(agent.messages) {
-		saveMessagesToThread(req.ConversationID, agent.messages[msgStartIdx:], req.Message)
+	// Save new messages to thread (unaffected by compression)
+	if len(newMessages) > 0 {
+		saveMessagesToThread(req.ConversationID, newMessages, req.Message)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -3776,15 +4079,17 @@ func (ws *WebServer) handleChatStream(w http.ResponseWriter, r *http.Request) {
 
 	agent := ws.getOrCreateAgent(req.ConversationID)
 
-	// Track starting index for new messages to save to thread
-	msgStartIdx := len(agent.messages)
+	// Collect new messages independently from agent.messages
+	// so that conversation compression doesn't affect what gets saved to thread
+	var newMessages []Message
 
-	// Add user message
-	agent.messages = append(agent.messages, Message{
+	userMsg := Message{
 		Role:    "user",
 		Content: req.Message,
 		Images:  req.Images,
-	})
+	}
+	agent.messages = append(agent.messages, userMsg)
+	newMessages = append(newMessages, userMsg)
 
 	const maxRetries = 2
 
@@ -3812,6 +4117,7 @@ func (ws *WebServer) handleChatStream(w http.ResponseWriter, r *http.Request) {
 			}
 
 			agent.messages = append(agent.messages, *response)
+			newMessages = append(newMessages, *response)
 
 			if len(response.ToolCalls) == 0 {
 				fullResponse = response.Content
@@ -3824,11 +4130,13 @@ func (ws *WebServer) handleChatStream(w http.ResponseWriter, r *http.Request) {
 				if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
 					result := fmt.Sprintf("Error parsing arguments: %v", err)
 					sendEvent(StreamEvent{Type: "tool_call", Name: tc.Function.Name, Result: result})
-					agent.messages = append(agent.messages, Message{
+					toolMsg := Message{
 						Role:       "tool",
 						Content:    result,
 						ToolCallID: tc.ID,
-					})
+					}
+					agent.messages = append(agent.messages, toolMsg)
+					newMessages = append(newMessages, toolMsg)
 					continue
 				}
 
@@ -3845,11 +4153,13 @@ func (ws *WebServer) handleChatStream(w http.ResponseWriter, r *http.Request) {
 
 				sendEvent(StreamEvent{Type: "tool_call", Name: tc.Function.Name, Result: displayResult})
 
-				agent.messages = append(agent.messages, Message{
+				toolMsg := Message{
 					Role:       "tool",
 					Content:    result,
 					ToolCallID: tc.ID,
-				})
+				}
+				agent.messages = append(agent.messages, toolMsg)
+				newMessages = append(newMessages, toolMsg)
 			}
 		}
 		cancel()
@@ -3881,13 +4191,16 @@ func (ws *WebServer) handleChatStream(w http.ResponseWriter, r *http.Request) {
 			valCancel()
 			if !ok {
 				fmt.Printf("[siki] Response validation failed (attempt %d): %s\n", retry+1, reason)
-				// Remove the bad response from messages
+				// Remove the bad response from agent memory (for retry)
 				agent.messages = agent.messages[:len(agent.messages)-1]
+				// But keep it in newMessages (it was actually generated)
 				// Add a retry prompt
-				agent.messages = append(agent.messages, Message{
+				retryMsg := Message{
 					Role:    "user",
 					Content: fmt.Sprintf("申し訳ありませんが、先ほどの回答は質問に対して適切ではありませんでした（理由: %s）。元の質問「%s」に対して、会話の文脈を踏まえてもう一度回答してください。", reason, req.Message),
-				})
+				}
+				agent.messages = append(agent.messages, retryMsg)
+				newMessages = append(newMessages, retryMsg)
 				// Send apology notification to client
 				sendEvent(StreamEvent{Type: "content", Content: "\n\n---\n*回答を再生成しています...*\n\n"})
 				continue
@@ -3896,14 +4209,127 @@ func (ws *WebServer) handleChatStream(w http.ResponseWriter, r *http.Request) {
 		break
 	}
 
-	// Save new messages to thread
-	if msgStartIdx < len(agent.messages) {
-		saveMessagesToThread(req.ConversationID, agent.messages[msgStartIdx:], req.Message)
+	// Save new messages to thread (unaffected by compression)
+	if len(newMessages) > 0 {
+		saveMessagesToThread(req.ConversationID, newMessages, req.Message)
 	}
 
 	sendEvent(StreamEvent{Type: "done"})
 	fmt.Fprintf(w, "data: [DONE]\n\n")
 	flusher.Flush()
+}
+
+// ============================================================================
+// Docker HTTP Handlers
+// ============================================================================
+
+func (ws *WebServer) handleDockerExec(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Command string `json:"command"`
+		Timeout int    `json:"timeout"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+	if req.Command == "" {
+		http.Error(w, "command is required", http.StatusBadRequest)
+		return
+	}
+
+	output, err := dockerExec(req.Command, req.Timeout)
+	w.Header().Set("Content-Type", "application/json")
+	if err != nil {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"output": output,
+			"error":  err.Error(),
+		})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"output": output,
+	})
+}
+
+func (ws *WebServer) handleDockerStatus(w http.ResponseWriter, r *http.Request) {
+	available := isDockerAvailable()
+	imageReady := available && isDockerImageAvailable()
+
+	containerRunning := false
+	if available {
+		cmd := exec.Command("docker", "inspect", "-f", "{{.State.Running}}", dockerContainerName)
+		out, err := cmd.Output()
+		containerRunning = err == nil && strings.TrimSpace(string(out)) == "true"
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"docker_available":  available,
+		"image_ready":       imageReady,
+		"container_running": containerRunning,
+	})
+}
+
+func (ws *WebServer) handleUpload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if err := initDockerWorkspace(); err != nil {
+		http.Error(w, "Failed to init workspace: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Parse multipart form (max 2GB)
+	if err := r.ParseMultipartForm(2 << 30); err != nil {
+		http.Error(w, "Failed to parse upload: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	var uploaded []string
+	for _, fileHeaders := range r.MultipartForm.File {
+		for _, fh := range fileHeaders {
+			if err := saveUploadedFile(fh, dockerWorkspaceDir); err != nil {
+				http.Error(w, "Failed to save file: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+			uploaded = append(uploaded, fh.Filename)
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"files":     uploaded,
+		"workspace": "/workspace",
+		"message":   fmt.Sprintf("%d file(s) uploaded to /workspace", len(uploaded)),
+	})
+}
+
+func saveUploadedFile(fh *multipart.FileHeader, destDir string) error {
+	src, err := fh.Open()
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+
+	// Sanitize filename: only keep the base name
+	filename := filepath.Base(fh.Filename)
+	destPath := filepath.Join(destDir, filename)
+
+	dst, err := os.Create(destPath)
+	if err != nil {
+		return err
+	}
+	defer dst.Close()
+
+	_, err = io.Copy(dst, src)
+	return err
 }
 
 func runWeb(config *Config, host string, port int) error {
@@ -3921,6 +4347,9 @@ func runWeb(config *Config, host string, port int) error {
 	http.HandleFunc("/api/plugins", ws.handlePlugins)
 	http.HandleFunc("/api/threads/", ws.handleThreads)
 	http.HandleFunc("/api/threads", ws.handleThreads)
+	http.HandleFunc("/api/docker/exec", ws.handleDockerExec)
+	http.HandleFunc("/api/docker/status", ws.handleDockerStatus)
+	http.HandleFunc("/api/upload", ws.handleUpload)
 
 	// Initialize directories
 	if err := initThreadDir(); err != nil {
@@ -3934,6 +4363,9 @@ func runWeb(config *Config, host string, port int) error {
 	}
 	if err := loadPlugins(); err != nil {
 		fmt.Printf("Warning: failed to load plugins: %v\n", err)
+	}
+	if err := initDockerWorkspace(); err != nil {
+		fmt.Printf("Warning: failed to initialize docker workspace: %v\n", err)
 	}
 
 	fmt.Printf("siki v%s - 式神 Web GUI\n", Version)
@@ -3971,7 +4403,18 @@ func runWeb(config *Config, host string, port int) error {
 		}()
 	}
 
-	return http.ListenAndServe(addr, nil)
+	// Graceful shutdown with Docker cleanup
+	server := &http.Server{Addr: addr}
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		fmt.Println("\nShutting down...")
+		stopDockerContainer()
+		server.Close()
+	}()
+
+	return server.ListenAndServe()
 }
 
 func getLocalIP() string {
@@ -4021,6 +4464,7 @@ func runChat(config *Config) error {
 	go func() {
 		<-sigCh
 		fmt.Println("\nGoodbye!")
+		stopDockerContainer()
 		cancel()
 		os.Exit(0)
 	}()
