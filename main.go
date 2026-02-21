@@ -41,14 +41,62 @@ const (
 // Configuration
 // ============================================================================
 
+type Provider struct {
+	Name     string `json:"name"`
+	Backend  string `json:"backend"`  // ollama, vllm, mlx, openai, anthropic, gemini
+	Endpoint string `json:"endpoint"`
+	Model    string `json:"model"`
+	APIKey   string `json:"api_key"`
+}
+
 type Config struct {
-	ModelPath    string `json:"model_path"`
-	ModelName    string `json:"model_name"`
-	Backend      string `json:"backend"` // vllm, mlx, ollama
-	APIEndpoint  string `json:"api_endpoint"`
-	Workspace    string `json:"workspace"`
-	MaxTurns     int    `json:"max_turns"`
-	SystemPrompt string `json:"system_prompt"`
+	ModelPath    string     `json:"model_path"`
+	ModelName    string     `json:"model_name"`
+	Backend      string     `json:"backend"`
+	APIEndpoint  string     `json:"api_endpoint"`
+	APIKey       string     `json:"api_key"`
+	Providers    []Provider `json:"providers"`
+	Workspace    string     `json:"workspace"`
+	MaxTurns     int        `json:"max_turns"`
+	SystemPrompt string     `json:"system_prompt"`
+}
+
+// primaryProvider returns the first provider, or builds one from legacy config fields
+func (c *Config) primaryProvider() Provider {
+	if len(c.Providers) > 0 {
+		return c.Providers[0]
+	}
+	return Provider{
+		Name:     "default",
+		Backend:  c.Backend,
+		Endpoint: c.APIEndpoint,
+		Model:    c.ModelName,
+		APIKey:   c.APIKey,
+	}
+}
+
+// findProvider returns a provider by name (case-insensitive)
+func (c *Config) findProvider(name string) *Provider {
+	nameLower := strings.ToLower(name)
+	for i := range c.Providers {
+		if strings.ToLower(c.Providers[i].Name) == nameLower {
+			return &c.Providers[i]
+		}
+	}
+	return nil
+}
+
+func setProviderHeaders(req *http.Request, p Provider) {
+	req.Header.Set("Content-Type", "application/json")
+	if p.APIKey != "" {
+		switch p.Backend {
+		case "anthropic":
+			req.Header.Set("x-api-key", p.APIKey)
+			req.Header.Set("anthropic-version", "2023-06-01")
+		default:
+			req.Header.Set("Authorization", "Bearer "+p.APIKey)
+		}
+	}
 }
 
 func defaultConfig() *Config {
@@ -78,6 +126,21 @@ func defaultConfig() *Config {
 - run_code: **Execute HTML/JavaScript in browser iframe**
 - blog_person_search: **ブログの最新記事を巡回し、言及されている人物名を抽出する**。人物の関係性や著名人について聞かれたらこのツールを使う
 - search_conversation: **過去の会話履歴からキーワード検索**する。以前の会話内容を参照したいときに使う
+- recall_context: **現在のスレッドの過去の会話を検索**する。要約されて見えなくなった詳細を思い出すときに使う
+- search_threads: **全スレッドを横断検索**する。他のスレッドの会話内容を探すときに使う
+- create_plugin: **プラグインを作成/更新**する。新しいツールやUI拡張を動的に追加できる
+- test_plugin: **プラグインをテスト**する。テストケースを渡して全パスしたらTESTED状態にする
+- list_plugins: インストール済みプラグイン一覧を表示
+- delete_plugin: プラグインを削除
+
+## Plugin System
+You can create plugins to extend your own capabilities:
+- **Tool plugins**: Server-side Node.js code. The code receives a ` + "`params`" + ` object and outputs results via console.log(). Can use require() for Node.js built-in modules.
+- **UI plugins**: Client-side JS/CSS rendered in a dedicated Plugin pane (right sidebar). The JS receives a ` + "`pane`" + ` argument (DOM element) - render all UI into this element only. Do NOT modify the main page DOM.
+  - Example ui_js: ` + "`pane.innerHTML = '<h3>My Plugin</h3><p>Hello!</p>';`" + `
+- Plugin tools become available as ` + "`plugin_<name>`" + ` immediately after creation.
+- Use create_plugin when the user needs functionality you don't have built-in.
+- **IMPORTANT: After creating a plugin with a tool, you MUST immediately use test_plugin to run test cases.** Design at least 2-3 meaningful test cases covering normal and edge cases. A plugin is NOT ready until it passes all tests and is marked TESTED. If tests fail, fix the plugin with create_plugin and re-test.
 
 ## run_code Tool Specification
 When user asks to draw, visualize, calculate, simulate, or create anything visual:
@@ -164,6 +227,33 @@ type ToolCall struct {
 type ToolCallFunc struct {
 	Name      string `json:"name"`
 	Arguments string `json:"arguments"`
+}
+
+// Plugin represents a user-created plugin with optional tool and UI components
+type Plugin struct {
+	Name        string      `json:"name"`
+	Description string      `json:"description"`
+	Version     string      `json:"version"`
+	Enabled     *bool       `json:"enabled,omitempty"`
+	Tested      bool        `json:"tested"`
+	TestResult  string      `json:"test_result,omitempty"`
+	Tool        *PluginTool `json:"tool,omitempty"`
+	UI          *PluginUI   `json:"ui,omitempty"`
+}
+
+func (p Plugin) IsEnabled() bool {
+	return p.Enabled == nil || *p.Enabled
+}
+
+type PluginTool struct {
+	Description string                 `json:"description"`
+	Parameters  map[string]interface{} `json:"parameters"`
+	Code        string                 `json:"code"`
+}
+
+type PluginUI struct {
+	JS  string `json:"js"`
+	CSS string `json:"css"`
 }
 
 var tools = []Tool{
@@ -338,6 +428,34 @@ var tools = []Tool{
 		},
 	},
 	{
+		Name:        "recall_context",
+		Description: "Search the current conversation thread's full history for specific content. Use this when you need to recall details from earlier in the conversation that may have been summarized.",
+		Parameters: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"query": map[string]interface{}{
+					"type":        "string",
+					"description": "Search query to find in conversation history",
+				},
+			},
+			"required": []string{"query"},
+		},
+	},
+	{
+		Name:        "search_threads",
+		Description: "Search across ALL conversation threads for specific content. Use this to find information from other conversation threads.",
+		Parameters: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"query": map[string]interface{}{
+					"type":        "string",
+					"description": "Search query to find across all threads",
+				},
+			},
+			"required": []string{"query"},
+		},
+	},
+	{
 		Name:        "blog_person_search",
 		Description: "Search a blog/website for person names mentioned in recent articles. Fetches the latest articles from a blog URL, reads each article, and uses AI to extract person names. Use this when asked about people related to a blogger, author, or website. Returns a list of person names with context about how they are mentioned.",
 		Parameters: map[string]interface{}{
@@ -375,6 +493,130 @@ var tools = []Tool{
 	},
 }
 
+var pluginManagementTools = []Tool{
+	{
+		Name:        "create_plugin",
+		Description: "Create or update a plugin. Plugins can add new tools (server-side Node.js) and/or UI modifications (client-side JS/CSS). Tool code receives a `params` object and outputs results via console.log().",
+		Parameters: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"name": map[string]interface{}{
+					"type":        "string",
+					"description": "Plugin name (lowercase, underscores allowed, no spaces)",
+				},
+				"description": map[string]interface{}{
+					"type":        "string",
+					"description": "What this plugin does",
+				},
+				"tool_description": map[string]interface{}{
+					"type":        "string",
+					"description": "Description of the tool for AI (omit if plugin has no tool component)",
+				},
+				"tool_parameters": map[string]interface{}{
+					"type":        "string",
+					"description": "JSON string of the OpenAI-format parameters schema (omit if plugin has no tool)",
+				},
+				"tool_code": map[string]interface{}{
+					"type":        "string",
+					"description": "Node.js code for the tool. The `params` object is available as a global. Output result via console.log(). Can use require() for built-in modules.",
+				},
+				"ui_js": map[string]interface{}{
+					"type":        "string",
+					"description": "Client-side JavaScript for the plugin pane. Receives 'pane' (DOM element) as argument. Render all UI into pane only. Example: pane.innerHTML = '<p>Hello</p>';",
+				},
+				"ui_css": map[string]interface{}{
+					"type":        "string",
+					"description": "CSS scoped to the plugin's pane section (omit if no UI)",
+				},
+			},
+			"required": []string{"name", "description"},
+		},
+	},
+	{
+		Name:        "list_plugins",
+		Description: "List all installed plugins with their descriptions and capabilities.",
+		Parameters: map[string]interface{}{
+			"type":       "object",
+			"properties": map[string]interface{}{},
+		},
+	},
+	{
+		Name:        "delete_plugin",
+		Description: "Delete a plugin by name.",
+		Parameters: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"name": map[string]interface{}{
+					"type":        "string",
+					"description": "Name of the plugin to delete",
+				},
+			},
+			"required": []string{"name"},
+		},
+	},
+	{
+		Name:        "test_plugin",
+		Description: "Run test cases against a plugin tool. Provide the plugin name and a JSON array of test cases. Each test case has 'input' (params object) and 'expected' (substring expected in output). All tests must pass to mark the plugin as tested.",
+		Parameters: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"name": map[string]interface{}{
+					"type":        "string",
+					"description": "Name of the plugin to test",
+				},
+				"test_cases": map[string]interface{}{
+					"type":        "string",
+					"description": `JSON array of test cases. Each: {"input": {<params>}, "expected": "<substring in output>"} Example: [{"input":{"x":2,"y":3},"expected":"5"}]`,
+				},
+			},
+			"required": []string{"name", "test_cases"},
+		},
+	},
+	{
+		Name:        "query_model",
+		Description: "Send a query to a specific configured AI provider/model. Use this to get a second opinion, compare answers, or leverage a model's specific strengths. Use list_plugins to see available providers first.",
+		Parameters: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"provider": map[string]interface{}{
+					"type":        "string",
+					"description": "Name of the provider to query (as configured in settings)",
+				},
+				"message": map[string]interface{}{
+					"type":        "string",
+					"description": "The message/question to send to the model",
+				},
+				"system": map[string]interface{}{
+					"type":        "string",
+					"description": "Optional system prompt for this query",
+				},
+			},
+			"required": []string{"provider", "message"},
+		},
+	},
+}
+
+// getAllTools returns built-in tools + plugin tools + plugin management tools
+func getAllTools() []Tool {
+	all := make([]Tool, len(tools))
+	copy(all, tools)
+
+	pluginMu.RLock()
+	for _, p := range loadedPlugins {
+		if p.IsEnabled() && p.Tool != nil {
+			all = append(all, Tool{
+				Name:        "plugin_" + p.Name,
+				Description: p.Tool.Description + " [plugin]",
+				Parameters:  p.Tool.Parameters,
+			})
+		}
+	}
+	pluginMu.RUnlock()
+
+	all = append(all, pluginManagementTools...)
+	return all
+}
+
 // ============================================================================
 // Tool Execution
 // ============================================================================
@@ -382,6 +624,28 @@ var tools = []Tool{
 type Agent struct {
 	config   *Config
 	messages []Message
+	threadID string
+}
+
+func defaultEndpointForBackend(backend string) string {
+	switch backend {
+	case "ollama":
+		return "http://localhost:11434/v1"
+	case "vllm", "mlx":
+		return "http://localhost:8000/v1"
+	case "openai":
+		return "https://api.openai.com/v1"
+	case "anthropic":
+		return "https://api.anthropic.com/v1"
+	case "gemini":
+		return "https://generativelanguage.googleapis.com/v1beta/openai"
+	default:
+		return "http://localhost:11434/v1"
+	}
+}
+
+func (a *Agent) setAuthHeaders(req *http.Request) {
+	setProviderHeaders(req, a.config.primaryProvider())
 }
 
 func (a *Agent) executeTool(name string, args map[string]interface{}) (string, error) {
@@ -424,6 +688,10 @@ func (a *Agent) executeTool(name string, args map[string]interface{}) (string, e
 		return a.generateDiagram(args["dot_code"].(string), title)
 	case "search_conversation":
 		return a.searchConversation(args["query"].(string)), nil
+	case "recall_context":
+		return a.recallContext(args["query"].(string))
+	case "search_threads":
+		return a.searchAllThreads(args["query"].(string))
 	case "blog_person_search":
 		maxArticles := 5
 		if n, ok := args["max_articles"].(float64); ok {
@@ -442,9 +710,369 @@ func (a *Agent) executeTool(name string, args map[string]interface{}) (string, e
 			title = t
 		}
 		return a.runCode(args["html"].(string), title)
+	case "create_plugin":
+		return a.createPlugin(args)
+	case "list_plugins":
+		return a.listPlugins()
+	case "delete_plugin":
+		return a.deletePlugin(args["name"].(string))
+	case "test_plugin":
+		return a.testPlugin(args["name"].(string), args["test_cases"].(string))
+	case "query_model":
+		systemPrompt, _ := args["system"].(string)
+		return a.queryModel(args["provider"].(string), args["message"].(string), systemPrompt)
 	default:
+		// Check if this is a plugin tool
+		if strings.HasPrefix(name, "plugin_") {
+			pluginName := strings.TrimPrefix(name, "plugin_")
+			return executePluginTool(pluginName, args)
+		}
 		return "", fmt.Errorf("unknown tool: %s", name)
 	}
+}
+
+// ============================================================================
+// Plugin Tool Implementations
+// ============================================================================
+
+func (a *Agent) createPlugin(args map[string]interface{}) (string, error) {
+	name, _ := args["name"].(string)
+	description, _ := args["description"].(string)
+
+	if name == "" {
+		return "", fmt.Errorf("plugin name is required")
+	}
+	for _, r := range name {
+		if !((r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_') {
+			return "", fmt.Errorf("plugin name must be lowercase alphanumeric with underscores only")
+		}
+	}
+
+	p := Plugin{
+		Name:        name,
+		Description: description,
+		Version:     "1.0",
+		Tested:      false,
+	}
+
+	if toolCode, ok := args["tool_code"].(string); ok && toolCode != "" {
+		toolDesc, _ := args["tool_description"].(string)
+		if toolDesc == "" {
+			toolDesc = description
+		}
+
+		var params map[string]interface{}
+		if paramStr, ok := args["tool_parameters"].(string); ok && paramStr != "" {
+			if err := json.Unmarshal([]byte(paramStr), &params); err != nil {
+				return "", fmt.Errorf("invalid tool_parameters JSON: %v", err)
+			}
+		} else {
+			params = map[string]interface{}{
+				"type":       "object",
+				"properties": map[string]interface{}{},
+			}
+		}
+
+		p.Tool = &PluginTool{
+			Description: toolDesc,
+			Parameters:  params,
+			Code:        toolCode,
+		}
+	}
+
+	uiJS, _ := args["ui_js"].(string)
+	uiCSS, _ := args["ui_css"].(string)
+	if uiJS != "" || uiCSS != "" {
+		p.UI = &PluginUI{JS: uiJS, CSS: uiCSS}
+	}
+
+	if err := savePlugin(p); err != nil {
+		return "", fmt.Errorf("failed to save plugin: %v", err)
+	}
+
+	if err := loadPlugins(); err != nil {
+		return "", fmt.Errorf("plugin saved but failed to reload: %v", err)
+	}
+
+	result := fmt.Sprintf("Plugin '%s' created successfully. [UNTESTED]", name)
+	if p.Tool != nil {
+		result += fmt.Sprintf(" Tool 'plugin_%s' is now available.", name)
+		result += " You MUST now use test_plugin to run test cases before considering this plugin ready."
+	}
+	if p.UI != nil {
+		result += " UI components will load on next page refresh."
+	}
+	return result, nil
+}
+
+func (a *Agent) listPlugins() (string, error) {
+	var sb strings.Builder
+
+	// List configured providers
+	if len(a.config.Providers) > 0 {
+		sb.WriteString(fmt.Sprintf("## Configured Providers (%d):\n", len(a.config.Providers)))
+		for i, p := range a.config.Providers {
+			primary := ""
+			if i == 0 {
+				primary = " [PRIMARY]"
+			}
+			sb.WriteString(fmt.Sprintf("\n- **%s**%s: %s / %s", p.Name, primary, p.Backend, p.Model))
+		}
+		sb.WriteString("\n\nUse query_model to send a query to any provider.\n")
+	} else {
+		sb.WriteString("## Providers: only default (use Settings to add more)\n")
+	}
+
+	// List plugins
+	pluginMu.RLock()
+	defer pluginMu.RUnlock()
+
+	if len(loadedPlugins) == 0 {
+		sb.WriteString("\n## Plugins: none installed")
+	} else {
+		sb.WriteString(fmt.Sprintf("\n## Installed Plugins (%d):\n", len(loadedPlugins)))
+		for _, p := range loadedPlugins {
+			status := "ON"
+			if !p.IsEnabled() {
+				status = "OFF"
+			}
+			testStatus := "UNTESTED"
+			if p.Tested {
+				testStatus = "TESTED"
+			}
+			sb.WriteString(fmt.Sprintf("\n- %s (v%s) [%s][%s]: %s", p.Name, p.Version, status, testStatus, p.Description))
+			if p.Tool != nil {
+				sb.WriteString(fmt.Sprintf("\n  Tool: plugin_%s - %s", p.Name, p.Tool.Description))
+			}
+			if p.UI != nil {
+				has := []string{}
+				if p.UI.JS != "" {
+					has = append(has, "JS")
+				}
+				if p.UI.CSS != "" {
+					has = append(has, "CSS")
+				}
+				sb.WriteString(fmt.Sprintf("\n  UI: %s", strings.Join(has, ", ")))
+			}
+		}
+	}
+	return sb.String(), nil
+}
+
+func (a *Agent) deletePlugin(name string) (string, error) {
+	if err := deletePluginFile(name); err != nil {
+		return "", fmt.Errorf("failed to delete plugin '%s': %v", name, err)
+	}
+	if err := loadPlugins(); err != nil {
+		return "", fmt.Errorf("plugin deleted but failed to reload: %v", err)
+	}
+	return fmt.Sprintf("Plugin '%s' deleted successfully.", name), nil
+}
+
+func (a *Agent) testPlugin(name, testCasesJSON string) (string, error) {
+	// Parse test cases
+	type TestCase struct {
+		Input    map[string]interface{} `json:"input"`
+		Expected string                 `json:"expected"`
+	}
+	var testCases []TestCase
+	if err := json.Unmarshal([]byte(testCasesJSON), &testCases); err != nil {
+		return "", fmt.Errorf("invalid test_cases JSON: %v", err)
+	}
+	if len(testCases) == 0 {
+		return "", fmt.Errorf("at least one test case is required")
+	}
+
+	// Check plugin exists and has a tool
+	pluginMu.RLock()
+	var plugin *Plugin
+	for i := range loadedPlugins {
+		if loadedPlugins[i].Name == name {
+			plugin = &loadedPlugins[i]
+			break
+		}
+	}
+	pluginMu.RUnlock()
+
+	if plugin == nil {
+		return "", fmt.Errorf("plugin '%s' not found", name)
+	}
+	if plugin.Tool == nil {
+		return "", fmt.Errorf("plugin '%s' has no tool component to test", name)
+	}
+
+	// Run each test case
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("## Test Results for plugin '%s'\n\n", name))
+	passed := 0
+	failed := 0
+
+	for i, tc := range testCases {
+		output, err := executePluginTool(name, tc.Input)
+		inputJSON, _ := json.Marshal(tc.Input)
+
+		if err != nil {
+			failed++
+			sb.WriteString(fmt.Sprintf("### Test %d: FAIL\n", i+1))
+			sb.WriteString(fmt.Sprintf("- Input: `%s`\n", string(inputJSON)))
+			sb.WriteString(fmt.Sprintf("- Error: %v\n\n", err))
+			continue
+		}
+
+		if tc.Expected != "" && !strings.Contains(output, tc.Expected) {
+			failed++
+			sb.WriteString(fmt.Sprintf("### Test %d: FAIL\n", i+1))
+			sb.WriteString(fmt.Sprintf("- Input: `%s`\n", string(inputJSON)))
+			sb.WriteString(fmt.Sprintf("- Expected to contain: `%s`\n", tc.Expected))
+			sb.WriteString(fmt.Sprintf("- Actual output: `%s`\n\n", output))
+		} else {
+			passed++
+			sb.WriteString(fmt.Sprintf("### Test %d: PASS\n", i+1))
+			sb.WriteString(fmt.Sprintf("- Input: `%s`\n", string(inputJSON)))
+			sb.WriteString(fmt.Sprintf("- Output: `%s`\n\n", output))
+		}
+	}
+
+	allPassed := failed == 0
+	sb.WriteString(fmt.Sprintf("---\n**Result: %d/%d passed**", passed, len(testCases)))
+
+	if allPassed {
+		// Mark plugin as tested
+		pluginMu.Lock()
+		for i := range loadedPlugins {
+			if loadedPlugins[i].Name == name {
+				loadedPlugins[i].Tested = true
+				loadedPlugins[i].TestResult = fmt.Sprintf("%d/%d passed", passed, len(testCases))
+				if err := savePlugin(loadedPlugins[i]); err != nil {
+					pluginMu.Unlock()
+					return sb.String() + "\n\nWarning: failed to save test status: " + err.Error(), nil
+				}
+				break
+			}
+		}
+		pluginMu.Unlock()
+		sb.WriteString(" - Plugin marked as TESTED")
+	} else {
+		sb.WriteString(fmt.Sprintf(" (%d failed) - Plugin remains UNTESTED. Fix the issues and re-test.", failed))
+	}
+
+	return sb.String(), nil
+}
+
+func (a *Agent) queryModel(providerName, message, systemPrompt string) (string, error) {
+	p := a.config.findProvider(providerName)
+	if p == nil {
+		// List available providers for the AI
+		var names []string
+		for _, prov := range a.config.Providers {
+			names = append(names, prov.Name)
+		}
+		return "", fmt.Errorf("provider '%s' not found. Available: %s", providerName, strings.Join(names, ", "))
+	}
+
+	messages := []Message{}
+	if systemPrompt != "" {
+		messages = append(messages, Message{Role: "system", Content: systemPrompt})
+	}
+	messages = append(messages, Message{Role: "user", Content: message})
+
+	req := ChatRequest{
+		Model:       p.Model,
+		Messages:    messages,
+		MaxTokens:   4096,
+		Temperature: 0.7,
+		Stream:      false,
+	}
+
+	body, err := json.Marshal(req)
+	if err != nil {
+		return "", err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	httpReq, err := http.NewRequestWithContext(ctx, "POST",
+		p.Endpoint+"/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	setProviderHeaders(httpReq, *p)
+
+	client := &http.Client{Timeout: 120 * time.Second}
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		return "", fmt.Errorf("query to %s failed: %v", providerName, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("query to %s returned %d: %s", providerName, resp.StatusCode, string(respBody))
+	}
+
+	var chatResp ChatResponse
+	if err := json.NewDecoder(resp.Body).Decode(&chatResp); err != nil {
+		return "", fmt.Errorf("failed to decode response from %s: %v", providerName, err)
+	}
+
+	if len(chatResp.Choices) == 0 {
+		return "", fmt.Errorf("no response from %s", providerName)
+	}
+
+	result := chatResp.Choices[0].Message.Content
+	return fmt.Sprintf("[%s/%s の回答]\n%s", providerName, p.Model, result), nil
+}
+
+func executePluginTool(pluginName string, args map[string]interface{}) (string, error) {
+	pluginMu.RLock()
+	var plugin *Plugin
+	for i := range loadedPlugins {
+		if loadedPlugins[i].Name == pluginName {
+			plugin = &loadedPlugins[i]
+			break
+		}
+	}
+	pluginMu.RUnlock()
+
+	if plugin == nil {
+		return "", fmt.Errorf("plugin '%s' not found", pluginName)
+	}
+	if plugin.Tool == nil {
+		return "", fmt.Errorf("plugin '%s' has no tool component", pluginName)
+	}
+
+	paramsJSON, err := json.Marshal(args)
+	if err != nil {
+		return "", fmt.Errorf("failed to serialize params: %v", err)
+	}
+
+	wrapper := fmt.Sprintf("const params = %s;\n%s", string(paramsJSON), plugin.Tool.Code)
+
+	tmpFile, err := os.CreateTemp("", "siki-plugin-*.js")
+	if err != nil {
+		return "", fmt.Errorf("failed to create temp file: %v", err)
+	}
+	defer os.Remove(tmpFile.Name())
+
+	if _, err := tmpFile.WriteString(wrapper); err != nil {
+		tmpFile.Close()
+		return "", fmt.Errorf("failed to write temp file: %v", err)
+	}
+	tmpFile.Close()
+
+	nodePath := "/home/username/.nvm/versions/node/v24.13.0/bin/node"
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, nodePath, tmpFile.Name())
+	fmt.Printf("[siki] Executing plugin '%s'\n", pluginName)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Sprintf("Plugin execution error: %v\nOutput: %s", err, string(output)), nil
+	}
+
+	return strings.TrimSpace(string(output)), nil
 }
 
 func (a *Agent) readFile(path string) (string, error) {
@@ -906,7 +1534,7 @@ func (a *Agent) extractPersonNames(articleURL string, articleText string) string
 	}
 
 	req := ChatRequest{
-		Model:       a.config.ModelName,
+		Model:       a.config.primaryProvider().Model,
 		Messages:    extractMessages,
 		MaxTokens:   1000,
 		Temperature: 0.1,
@@ -919,11 +1547,11 @@ func (a *Agent) extractPersonNames(articleURL string, articleText string) string
 	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, "POST",
-		a.config.APIEndpoint+"/chat/completions", bytes.NewReader(body))
+		a.config.primaryProvider().Endpoint+"/chat/completions", bytes.NewReader(body))
 	if err != nil {
 		return ""
 	}
-	httpReq.Header.Set("Content-Type", "application/json")
+	a.setAuthHeaders(httpReq)
 
 	client := &http.Client{Timeout: 60 * time.Second}
 	resp, err := client.Do(httpReq)
@@ -1156,6 +1784,164 @@ Here's the DOT code for reference:
 // Playground directory for interactive code
 var playgroundDir string
 
+// Plugin system
+var pluginDir string
+var loadedPlugins []Plugin
+var pluginMu sync.RWMutex
+
+// Thread system
+var threadDir string
+
+type Thread struct {
+	ID        string          `json:"id"`
+	Title     string          `json:"title"`
+	CreatedAt time.Time       `json:"created_at"`
+	UpdatedAt time.Time       `json:"updated_at"`
+	Messages  []ThreadMessage `json:"messages"`
+	Summary   string          `json:"summary,omitempty"`
+}
+
+type ThreadMessage struct {
+	Role       string   `json:"role"`
+	Content    string   `json:"content"`
+	Images     []string `json:"images,omitempty"`
+	ToolCallID string   `json:"tool_call_id,omitempty"`
+	ToolName   string   `json:"tool_name,omitempty"`
+	Timestamp  int64    `json:"timestamp"`
+}
+
+type ThreadListItem struct {
+	ID           string    `json:"id"`
+	Title        string    `json:"title"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+	MessageCount int       `json:"message_count"`
+	Summary      string    `json:"summary,omitempty"`
+}
+
+func initThreadDir() error {
+	if threadDir != "" {
+		return nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	threadDir = filepath.Join(home, ".siki", "threads")
+	return os.MkdirAll(threadDir, 0755)
+}
+
+func saveThread(t *Thread) error {
+	if err := initThreadDir(); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(t, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(threadDir, t.ID+".json"), data, 0644)
+}
+
+func loadThread(id string) (*Thread, error) {
+	if err := initThreadDir(); err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(filepath.Join(threadDir, id+".json"))
+	if err != nil {
+		return nil, err
+	}
+	var t Thread
+	if err := json.Unmarshal(data, &t); err != nil {
+		return nil, err
+	}
+	return &t, nil
+}
+
+func listThreads() ([]ThreadListItem, error) {
+	if err := initThreadDir(); err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(threadDir)
+	if err != nil {
+		return nil, err
+	}
+	var items []ThreadListItem
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		id := strings.TrimSuffix(entry.Name(), ".json")
+		t, err := loadThread(id)
+		if err != nil {
+			continue
+		}
+		items = append(items, ThreadListItem{
+			ID:           t.ID,
+			Title:        t.Title,
+			CreatedAt:    t.CreatedAt,
+			UpdatedAt:    t.UpdatedAt,
+			MessageCount: len(t.Messages),
+			Summary:      t.Summary,
+		})
+	}
+	return items, nil
+}
+
+func deleteThread(id string) error {
+	if err := initThreadDir(); err != nil {
+		return err
+	}
+	return os.Remove(filepath.Join(threadDir, id+".json"))
+}
+
+func getRecentThreadMessages(thread *Thread, n int) []ThreadMessage {
+	if len(thread.Messages) <= n {
+		return thread.Messages
+	}
+	return thread.Messages[len(thread.Messages)-n:]
+}
+
+func truncateString(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
+}
+
+func saveMessagesToThread(threadID string, newMsgs []Message, userMessage string) {
+	thread, err := loadThread(threadID)
+	if err != nil {
+		// Create new thread
+		title := userMessage
+		if len(title) > 50 {
+			title = title[:50] + "..."
+		}
+		thread = &Thread{
+			ID:        threadID,
+			Title:     title,
+			CreatedAt: time.Now(),
+		}
+	}
+
+	thread.UpdatedAt = time.Now()
+	for _, m := range newMsgs {
+		if m.Role == "system" {
+			continue
+		}
+		tm := ThreadMessage{
+			Role:       m.Role,
+			Content:    m.Content,
+			Images:     m.Images,
+			ToolCallID: m.ToolCallID,
+			Timestamp:  time.Now().Unix(),
+		}
+		thread.Messages = append(thread.Messages, tm)
+	}
+	if err := saveThread(thread); err != nil {
+		fmt.Printf("[siki] Warning: failed to save thread %s: %v\n", threadID, err)
+	}
+}
+
 func initPlaygroundDir() error {
 	if playgroundDir != "" {
 		return nil
@@ -1166,6 +1952,64 @@ func initPlaygroundDir() error {
 	}
 	playgroundDir = filepath.Join(home, ".siki", "playground")
 	return os.MkdirAll(playgroundDir, 0755)
+}
+
+func initPluginDir() error {
+	if pluginDir != "" {
+		return nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	pluginDir = filepath.Join(home, ".siki", "plugins")
+	return os.MkdirAll(pluginDir, 0755)
+}
+
+func loadPlugins() error {
+	if err := initPluginDir(); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(pluginDir)
+	if err != nil {
+		return err
+	}
+	pluginMu.Lock()
+	defer pluginMu.Unlock()
+	loadedPlugins = nil
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(pluginDir, entry.Name()))
+		if err != nil {
+			fmt.Printf("[siki] Warning: failed to read plugin %s: %v\n", entry.Name(), err)
+			continue
+		}
+		var p Plugin
+		if err := json.Unmarshal(data, &p); err != nil {
+			fmt.Printf("[siki] Warning: failed to parse plugin %s: %v\n", entry.Name(), err)
+			continue
+		}
+		loadedPlugins = append(loadedPlugins, p)
+	}
+	fmt.Printf("[siki] Loaded %d plugins\n", len(loadedPlugins))
+	return nil
+}
+
+func savePlugin(p Plugin) error {
+	if err := initPluginDir(); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(p, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(pluginDir, p.Name+".json"), data, 0644)
+}
+
+func deletePluginFile(name string) error {
+	return os.Remove(filepath.Join(pluginDir, name+".json"))
 }
 
 func (a *Agent) runCode(htmlCode, title string) (string, error) {
@@ -1285,10 +2129,85 @@ func (a *Agent) resolvePath(path string) string {
 // ============================================================================
 
 type Message struct {
-	Role       string     `json:"role"`
-	Content    string     `json:"content,omitempty"`
-	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
-	ToolCallID string     `json:"tool_call_id,omitempty"`
+	Role       string     `json:"-"`
+	Content    string     `json:"-"`
+	Images     []string   `json:"-"` // base64 data URIs for vision
+	ToolCalls  []ToolCall `json:"-"`
+	ToolCallID string     `json:"-"`
+}
+
+func (m Message) MarshalJSON() ([]byte, error) {
+	type basicMsg struct {
+		Role       string     `json:"role"`
+		Content    interface{} `json:"content,omitempty"`
+		ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
+		ToolCallID string     `json:"tool_call_id,omitempty"`
+	}
+
+	if len(m.Images) == 0 {
+		return json.Marshal(basicMsg{
+			Role:       m.Role,
+			Content:    m.Content,
+			ToolCalls:  m.ToolCalls,
+			ToolCallID: m.ToolCallID,
+		})
+	}
+
+	// Multimodal: content is array of parts
+	parts := []interface{}{}
+	if m.Content != "" {
+		parts = append(parts, map[string]string{"type": "text", "text": m.Content})
+	}
+	for _, img := range m.Images {
+		parts = append(parts, map[string]interface{}{
+			"type":      "image_url",
+			"image_url": map[string]string{"url": img},
+		})
+	}
+
+	return json.Marshal(basicMsg{
+		Role:       m.Role,
+		Content:    parts,
+		ToolCalls:  m.ToolCalls,
+		ToolCallID: m.ToolCallID,
+	})
+}
+
+func (m *Message) UnmarshalJSON(data []byte) error {
+	type alias struct {
+		Role       string          `json:"role"`
+		Content    json.RawMessage `json:"content,omitempty"`
+		ToolCalls  []ToolCall      `json:"tool_calls,omitempty"`
+		ToolCallID string          `json:"tool_call_id,omitempty"`
+	}
+	var a alias
+	if err := json.Unmarshal(data, &a); err != nil {
+		return err
+	}
+	m.Role = a.Role
+	m.ToolCalls = a.ToolCalls
+	m.ToolCallID = a.ToolCallID
+
+	// Content can be string or array; we only need string for responses
+	if len(a.Content) > 0 {
+		var s string
+		if err := json.Unmarshal(a.Content, &s); err == nil {
+			m.Content = s
+		} else {
+			// It's an array (from our own multimodal messages), extract text parts
+			var parts []map[string]interface{}
+			if err := json.Unmarshal(a.Content, &parts); err == nil {
+				for _, p := range parts {
+					if p["type"] == "text" {
+						if t, ok := p["text"].(string); ok {
+							m.Content += t
+						}
+					}
+				}
+			}
+		}
+	}
+	return nil
 }
 
 type ChatRequest struct {
@@ -1322,10 +2241,10 @@ func (a *Agent) checkServerHealth() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	req, _ := http.NewRequestWithContext(ctx, "GET", a.config.APIEndpoint+"/models", nil)
+	req, _ := http.NewRequestWithContext(ctx, "GET", a.config.primaryProvider().Endpoint+"/models", nil)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("server not available at %s", a.config.APIEndpoint)
+		return fmt.Errorf("server not available at %s", a.config.primaryProvider().Endpoint)
 	}
 	resp.Body.Close()
 	return nil
@@ -1346,7 +2265,7 @@ Be lenient - only flag clearly irrelevant or nonsensical responses.`},
 	}
 
 	req := ChatRequest{
-		Model:       a.config.ModelName,
+		Model:       a.config.primaryProvider().Model,
 		Messages:    validateMessages,
 		MaxTokens:   100,
 		Temperature: 0.1,
@@ -1359,11 +2278,11 @@ Be lenient - only flag clearly irrelevant or nonsensical responses.`},
 	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, "POST",
-		a.config.APIEndpoint+"/chat/completions", bytes.NewReader(body))
+		a.config.primaryProvider().Endpoint+"/chat/completions", bytes.NewReader(body))
 	if err != nil {
 		return true, ""
 	}
-	httpReq.Header.Set("Content-Type", "application/json")
+	a.setAuthHeaders(httpReq)
 
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(httpReq)
@@ -1432,7 +2351,7 @@ func (a *Agent) compressConversation(ctx context.Context) {
 	}
 
 	req := ChatRequest{
-		Model:       a.config.ModelName,
+		Model:       a.config.primaryProvider().Model,
 		Messages:    compressMessages,
 		MaxTokens:   300,
 		Temperature: 0.1,
@@ -1441,11 +2360,11 @@ func (a *Agent) compressConversation(ctx context.Context) {
 
 	body, _ := json.Marshal(req)
 	httpReq, err := http.NewRequestWithContext(ctx, "POST",
-		a.config.APIEndpoint+"/chat/completions", bytes.NewReader(body))
+		a.config.primaryProvider().Endpoint+"/chat/completions", bytes.NewReader(body))
 	if err != nil {
 		return
 	}
-	httpReq.Header.Set("Content-Type", "application/json")
+	a.setAuthHeaders(httpReq)
 
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(httpReq)
@@ -1514,7 +2433,7 @@ func (a *Agent) forceCompressConversation(ctx context.Context) {
 	}
 
 	req := ChatRequest{
-		Model:       a.config.ModelName,
+		Model:       a.config.primaryProvider().Model,
 		Messages:    compressMessages,
 		MaxTokens:   200,
 		Temperature: 0.1,
@@ -1523,13 +2442,13 @@ func (a *Agent) forceCompressConversation(ctx context.Context) {
 
 	body, _ := json.Marshal(req)
 	httpReq, err := http.NewRequestWithContext(ctx, "POST",
-		a.config.APIEndpoint+"/chat/completions", bytes.NewReader(body))
+		a.config.primaryProvider().Endpoint+"/chat/completions", bytes.NewReader(body))
 	if err != nil {
 		// Fallback: just truncate messages without summarizing
 		a.messages = append([]Message{a.messages[0]}, a.messages[compressEnd:]...)
 		return
 	}
-	httpReq.Header.Set("Content-Type", "application/json")
+	a.setAuthHeaders(httpReq)
 
 	client := &http.Client{Timeout: 60 * time.Second}
 	resp, err := client.Do(httpReq)
@@ -1598,13 +2517,65 @@ func (a *Agent) searchConversation(query string) string {
 	return fmt.Sprintf("会話履歴で「%s」に関する言及:\n\n%s", query, strings.Join(results, "\n"))
 }
 
+func (a *Agent) recallContext(query string) (string, error) {
+	thread, err := loadThread(a.threadID)
+	if err != nil {
+		return "No conversation history found.", nil
+	}
+	// Search through all messages
+	queryLower := strings.ToLower(query)
+	var matches []string
+	for _, m := range thread.Messages {
+		if strings.Contains(strings.ToLower(m.Content), queryLower) {
+			matches = append(matches, fmt.Sprintf("[%s] %s: %s", time.Unix(m.Timestamp, 0).Format("15:04"), m.Role, truncateString(m.Content, 300)))
+		}
+	}
+	if len(matches) == 0 {
+		return fmt.Sprintf("No matches found for '%s' in current thread.", query), nil
+	}
+	if len(matches) > 10 {
+		matches = matches[len(matches)-10:]
+	}
+	return fmt.Sprintf("Found %d matches:\n\n%s", len(matches), strings.Join(matches, "\n\n")), nil
+}
+
+func (a *Agent) searchAllThreads(query string) (string, error) {
+	items, err := listThreads()
+	if err != nil {
+		return "", err
+	}
+	queryLower := strings.ToLower(query)
+	var results []string
+	for _, item := range items {
+		thread, err := loadThread(item.ID)
+		if err != nil {
+			continue
+		}
+		matchCount := 0
+		var lastMatch string
+		for _, m := range thread.Messages {
+			if strings.Contains(strings.ToLower(m.Content), queryLower) {
+				matchCount++
+				lastMatch = truncateString(m.Content, 200)
+			}
+		}
+		if matchCount > 0 {
+			results = append(results, fmt.Sprintf("**Thread: %s** (%s) - %d matches\nLast match: %s", item.Title, item.ID, matchCount, lastMatch))
+		}
+	}
+	if len(results) == 0 {
+		return fmt.Sprintf("No matches found for '%s' across any thread.", query), nil
+	}
+	return fmt.Sprintf("Found matches in %d threads:\n\n%s", len(results), strings.Join(results, "\n\n---\n")), nil
+}
+
 func (a *Agent) chatStream(ctx context.Context, onContent func(string)) (*Message, error) {
 	// Auto-compress conversation if it's getting long
 	a.compressConversation(ctx)
 
 	// Convert tools to OpenAI format
 	var toolDefs []map[string]interface{}
-	for _, tool := range tools {
+	for _, tool := range getAllTools() {
 		toolDefs = append(toolDefs, map[string]interface{}{
 			"type": "function",
 			"function": map[string]interface{}{
@@ -1616,7 +2587,7 @@ func (a *Agent) chatStream(ctx context.Context, onContent func(string)) (*Messag
 	}
 
 	req := ChatRequest{
-		Model:       a.config.ModelName,
+		Model:       a.config.primaryProvider().Model,
 		Messages:    a.messages,
 		Tools:       toolDefs,
 		ToolChoice:  "auto",
@@ -1631,11 +2602,11 @@ func (a *Agent) chatStream(ctx context.Context, onContent func(string)) (*Messag
 	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, "POST",
-		a.config.APIEndpoint+"/chat/completions", bytes.NewReader(body))
+		a.config.primaryProvider().Endpoint+"/chat/completions", bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
-	httpReq.Header.Set("Content-Type", "application/json")
+	a.setAuthHeaders(httpReq)
 
 	client := &http.Client{Timeout: 120 * time.Second}
 	resp, err := client.Do(httpReq)
@@ -1979,9 +2950,10 @@ Commands:
   quickstart            Download recommended model and start chatting
 
 Options:
-  --backend <vllm|mlx|ollama>  Set LLM backend
+  --backend <backend>          Set LLM backend (ollama, vllm, mlx, openai, anthropic, gemini)
   --model <name>               Set model name
   --endpoint <url>             Set API endpoint
+  --api-key <key>              Set API key for cloud backends
   --workspace <path>           Set workspace directory
   --host <ip>                  Set web server host (default: 127.0.0.1, use 0.0.0.0 for network)
   --port <port>                Set web server port (default: 3000)
@@ -2056,8 +3028,9 @@ type WebServer struct {
 }
 
 type ChatAPIRequest struct {
-	Message        string `json:"message"`
-	ConversationID string `json:"conversation_id"`
+	Message        string   `json:"message"`
+	ConversationID string   `json:"conversation_id"`
+	Images         []string `json:"images,omitempty"`
 }
 
 type ToolCallResult struct {
@@ -2072,16 +3045,23 @@ type ChatAPIResponse struct {
 }
 
 type StatusResponse struct {
-	Model    string `json:"model"`
-	Backend  string `json:"backend"`
-	Endpoint string `json:"endpoint"`
-	Version  string `json:"version"`
+	Model     string     `json:"model"`
+	Backend   string     `json:"backend"`
+	Endpoint  string     `json:"endpoint"`
+	Version   string     `json:"version"`
+	HasAPIKey bool       `json:"has_api_key"`
+	Providers []Provider `json:"providers"`
 }
 
 type SettingsRequest struct {
+	// Action: "set_providers" to replace entire providers list
+	Action    string     `json:"action"`
+	Providers []Provider `json:"providers,omitempty"`
+	// Legacy single-provider fields (backward compat)
 	Model    string `json:"model"`
 	Backend  string `json:"backend"`
 	Endpoint string `json:"endpoint"`
+	APIKey   string `json:"api_key"`
 }
 
 func NewWebServer(config *Config) *WebServer {
@@ -2094,7 +3074,54 @@ func NewWebServer(config *Config) *WebServer {
 func buildSystemPrompt(config *Config) string {
 	now := time.Now()
 	dateStr := fmt.Sprintf("今日は%d年%d月%d日です。", now.Year(), int(now.Month()), now.Day())
-	return dateStr + "\n\n" + config.SystemPrompt
+
+	var sb strings.Builder
+	sb.WriteString(dateStr)
+	sb.WriteString("\n\n")
+	sb.WriteString(config.SystemPrompt)
+
+	// Inject installed plugins into system prompt
+	pluginMu.RLock()
+	if len(loadedPlugins) > 0 {
+		sb.WriteString("\n\n## Installed Plugins\n")
+		sb.WriteString("Before responding, check if any installed plugin can handle the user's request. If a matching enabled plugin exists, use it.\n\n")
+		for _, p := range loadedPlugins {
+			status := "ON"
+			if !p.IsEnabled() {
+				status = "OFF"
+			}
+			testBadge := "UNTESTED"
+			if p.Tested {
+				testBadge = "TESTED"
+			}
+			sb.WriteString(fmt.Sprintf("- **%s** [%s][%s] (v%s): %s", p.Name, status, testBadge, p.Version, p.Description))
+			if p.Tool != nil {
+				sb.WriteString(fmt.Sprintf(" → tool: `plugin_%s` - %s", p.Name, p.Tool.Description))
+			}
+			if p.UI != nil {
+				sb.WriteString(" (has UI)")
+			}
+			sb.WriteString("\n")
+		}
+		sb.WriteString("\nOFF状態のプラグインは使用不可。ユーザーが必要なら設定からONにするよう案内すること。\n")
+		sb.WriteString("UNTESTED状態のプラグインは信頼性が未検証。\n")
+	}
+	pluginMu.RUnlock()
+
+	// Inject configured providers
+	if len(config.Providers) > 1 {
+		sb.WriteString("\n\n## Configured Providers\n")
+		sb.WriteString("Use `query_model` tool to query other providers.\n\n")
+		for i, p := range config.Providers {
+			primary := ""
+			if i == 0 {
+				primary = " [PRIMARY]"
+			}
+			sb.WriteString(fmt.Sprintf("- **%s**%s: %s / %s\n", p.Name, primary, p.Backend, p.Model))
+		}
+	}
+
+	return sb.String()
 }
 
 func (ws *WebServer) getOrCreateAgent(convID string) *Agent {
@@ -2106,11 +3133,31 @@ func (ws *WebServer) getOrCreateAgent(convID string) *Agent {
 	}
 
 	agent := &Agent{
-		config: ws.config,
+		config:   ws.config,
+		threadID: convID,
 		messages: []Message{
 			{Role: "system", Content: buildSystemPrompt(ws.config)},
 		},
 	}
+
+	// Load thread and build orchestrator context
+	thread, err := loadThread(convID)
+	if err == nil && len(thread.Messages) > 0 {
+		// Add summary if available
+		if thread.Summary != "" {
+			agent.messages = append(agent.messages, Message{
+				Role:    "assistant",
+				Content: fmt.Sprintf("[Previous conversation summary]\n%s", thread.Summary),
+			})
+		}
+		// Add last N messages for immediate context
+		recentMessages := getRecentThreadMessages(thread, 10)
+		for _, tm := range recentMessages {
+			msg := Message{Role: tm.Role, Content: tm.Content, Images: tm.Images, ToolCallID: tm.ToolCallID}
+			agent.messages = append(agent.messages, msg)
+		}
+	}
+
 	ws.conversations[convID] = agent
 	return agent
 }
@@ -2180,6 +3227,106 @@ func (ws *WebServer) handlePlayground(w http.ResponseWriter, r *http.Request) {
 	w.Write(data)
 }
 
+func (ws *WebServer) handlePluginsUI(w http.ResponseWriter, r *http.Request) {
+	pluginMu.RLock()
+	defer pluginMu.RUnlock()
+
+	type UIPayload struct {
+		Name string `json:"name"`
+		JS   string `json:"js"`
+		CSS  string `json:"css"`
+	}
+
+	var uis []UIPayload
+	for _, p := range loadedPlugins {
+		if p.IsEnabled() && p.UI != nil && (p.UI.JS != "" || p.UI.CSS != "") {
+			uis = append(uis, UIPayload{
+				Name: p.Name,
+				JS:   p.UI.JS,
+				CSS:  p.UI.CSS,
+			})
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(uis)
+}
+
+func (ws *WebServer) handlePlugins(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		// List all plugins with full info
+		pluginMu.RLock()
+		defer pluginMu.RUnlock()
+
+		type PluginInfo struct {
+			Name        string `json:"name"`
+			Description string `json:"description"`
+			Version     string `json:"version"`
+			Enabled     bool   `json:"enabled"`
+			Tested      bool   `json:"tested"`
+			TestResult  string `json:"test_result,omitempty"`
+			HasTool     bool   `json:"has_tool"`
+			HasUI       bool   `json:"has_ui"`
+		}
+
+		list := make([]PluginInfo, 0)
+		for _, p := range loadedPlugins {
+			list = append(list, PluginInfo{
+				Name:        p.Name,
+				Description: p.Description,
+				Version:     p.Version,
+				Enabled:     p.IsEnabled(),
+				Tested:      p.Tested,
+				TestResult:  p.TestResult,
+				HasTool:     p.Tool != nil,
+				HasUI:       p.UI != nil && (p.UI.JS != "" || p.UI.CSS != ""),
+			})
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(list)
+
+	case http.MethodPost:
+		// Toggle plugin enabled/disabled
+		var req struct {
+			Name    string `json:"name"`
+			Enabled bool   `json:"enabled"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		pluginMu.Lock()
+		found := false
+		for i := range loadedPlugins {
+			if loadedPlugins[i].Name == req.Name {
+				loadedPlugins[i].Enabled = &req.Enabled
+				// Persist to disk
+				if err := savePlugin(loadedPlugins[i]); err != nil {
+					pluginMu.Unlock()
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+					return
+				}
+				found = true
+				break
+			}
+		}
+		pluginMu.Unlock()
+
+		if !found {
+			http.Error(w, "plugin not found", http.StatusNotFound)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
 func (ws *WebServer) handleImages(w http.ResponseWriter, r *http.Request) {
 	targetURL := r.URL.Query().Get("url")
 	if targetURL == "" {
@@ -2214,12 +3361,222 @@ func (ws *WebServer) handleImages(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (ws *WebServer) handleThreads(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	path := r.URL.Path
+	// Strip base path
+	trimmed := strings.TrimPrefix(path, "/api/threads")
+	trimmed = strings.TrimPrefix(trimmed, "/")
+
+	if trimmed == "" {
+		// /api/threads
+		switch r.Method {
+		case http.MethodGet:
+			// List all threads
+			items, err := listThreads()
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			if items == nil {
+				items = []ThreadListItem{}
+			}
+			json.NewEncoder(w).Encode(items)
+		case http.MethodPost:
+			// Create new thread
+			var req struct {
+				ID    string `json:"id"`
+				Title string `json:"title"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if req.Title == "" {
+				req.Title = "New conversation"
+			}
+			id := req.ID
+			if id == "" {
+				id = fmt.Sprintf("%d", time.Now().UnixMilli())
+			}
+			t := &Thread{
+				ID:        id,
+				Title:     req.Title,
+				CreatedAt: time.Now(),
+				UpdatedAt: time.Now(),
+			}
+			if err := saveThread(t); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			json.NewEncoder(w).Encode(t)
+		default:
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
+		return
+	}
+
+	// /api/threads/search?q=...
+	if trimmed == "search" {
+		query := r.URL.Query().Get("q")
+		if query == "" {
+			json.NewEncoder(w).Encode([]interface{}{})
+			return
+		}
+		queryLower := strings.ToLower(query)
+		items, err := listThreads()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		type SearchResult struct {
+			ThreadID     string `json:"thread_id"`
+			ThreadTitle  string `json:"thread_title"`
+			MatchCount   int    `json:"match_count"`
+			Snippet      string `json:"snippet"`
+			SnippetRole  string `json:"snippet_role"`
+			MessageCount int    `json:"message_count"`
+		}
+		var results []SearchResult
+		for _, item := range items {
+			// Check title match
+			titleMatch := strings.Contains(strings.ToLower(item.Title), queryLower)
+
+			thread, err := loadThread(item.ID)
+			if err != nil {
+				if titleMatch {
+					results = append(results, SearchResult{
+						ThreadID: item.ID, ThreadTitle: item.Title,
+						MatchCount: 1, Snippet: item.Title, SnippetRole: "title",
+						MessageCount: item.MessageCount,
+					})
+				}
+				continue
+			}
+
+			matchCount := 0
+			var bestSnippet string
+			var bestRole string
+			for _, m := range thread.Messages {
+				if strings.Contains(strings.ToLower(m.Content), queryLower) {
+					matchCount++
+					// Extract snippet around the match
+					lower := strings.ToLower(m.Content)
+					idx := strings.Index(lower, queryLower)
+					start := idx - 40
+					if start < 0 {
+						start = 0
+					}
+					end := idx + len(query) + 80
+					if end > len(m.Content) {
+						end = len(m.Content)
+					}
+					snippet := m.Content[start:end]
+					if start > 0 {
+						snippet = "..." + snippet
+					}
+					if end < len(m.Content) {
+						snippet = snippet + "..."
+					}
+					bestSnippet = snippet
+					bestRole = m.Role
+				}
+			}
+			if titleMatch {
+				matchCount++
+			}
+			if matchCount > 0 {
+				if bestSnippet == "" {
+					bestSnippet = item.Title
+					bestRole = "title"
+				}
+				results = append(results, SearchResult{
+					ThreadID: item.ID, ThreadTitle: item.Title,
+					MatchCount: matchCount, Snippet: bestSnippet, SnippetRole: bestRole,
+					MessageCount: item.MessageCount,
+				})
+			}
+		}
+		if results == nil {
+			results = []SearchResult{}
+		}
+		json.NewEncoder(w).Encode(results)
+		return
+	}
+
+	// Extract thread ID and possible sub-path
+	parts := strings.SplitN(trimmed, "/", 2)
+	threadID := parts[0]
+	subPath := ""
+	if len(parts) > 1 {
+		subPath = parts[1]
+	}
+
+	switch subPath {
+	case "":
+		// /api/threads/{id}
+		switch r.Method {
+		case http.MethodGet:
+			t, err := loadThread(threadID)
+			if err != nil {
+				http.Error(w, "Thread not found", http.StatusNotFound)
+				return
+			}
+			json.NewEncoder(w).Encode(t)
+		case http.MethodDelete:
+			if err := deleteThread(threadID); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			// Also remove from in-memory cache
+			ws.mu.Lock()
+			delete(ws.conversations, threadID)
+			ws.mu.Unlock()
+			json.NewEncoder(w).Encode(map[string]string{"status": "deleted"})
+		default:
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
+	case "rename":
+		// /api/threads/{id}/rename
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			Title string `json:"title"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		t, err := loadThread(threadID)
+		if err != nil {
+			http.Error(w, "Thread not found", http.StatusNotFound)
+			return
+		}
+		t.Title = req.Title
+		t.UpdatedAt = time.Now()
+		if err := saveThread(t); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		json.NewEncoder(w).Encode(t)
+	default:
+		http.Error(w, "Not found", http.StatusNotFound)
+	}
+}
+
 func (ws *WebServer) handleStatus(w http.ResponseWriter, r *http.Request) {
+	pp := ws.config.primaryProvider()
 	resp := StatusResponse{
-		Model:    ws.config.ModelName,
-		Backend:  ws.config.Backend,
-		Endpoint: ws.config.APIEndpoint,
-		Version:  Version,
+		Model:     pp.Model,
+		Backend:   pp.Backend,
+		Endpoint:  pp.Endpoint,
+		Version:   Version,
+		HasAPIKey: pp.APIKey != "",
+		Providers: ws.config.Providers,
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
@@ -2238,14 +3595,43 @@ func (ws *WebServer) handleSettings(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ws.mu.Lock()
-	if req.Model != "" {
-		ws.config.ModelName = req.Model
-	}
-	if req.Backend != "" {
-		ws.config.Backend = req.Backend
-	}
-	if req.Endpoint != "" {
-		ws.config.APIEndpoint = req.Endpoint
+	switch req.Action {
+	case "set_providers":
+		// Replace entire providers list
+		ws.config.Providers = req.Providers
+		// Sync legacy fields from primary provider
+		if len(ws.config.Providers) > 0 {
+			pp := ws.config.Providers[0]
+			ws.config.Backend = pp.Backend
+			ws.config.ModelName = pp.Model
+			ws.config.APIEndpoint = pp.Endpoint
+			ws.config.APIKey = pp.APIKey
+		}
+	default:
+		// Legacy single-provider update
+		if req.Model != "" {
+			ws.config.ModelName = req.Model
+		}
+		if req.Backend != "" {
+			ws.config.Backend = req.Backend
+		}
+		if req.Endpoint != "" {
+			ws.config.APIEndpoint = req.Endpoint
+		}
+		ws.config.APIKey = req.APIKey
+		// Also update providers[0] if it exists
+		if len(ws.config.Providers) > 0 {
+			if req.Model != "" {
+				ws.config.Providers[0].Model = req.Model
+			}
+			if req.Backend != "" {
+				ws.config.Providers[0].Backend = req.Backend
+			}
+			if req.Endpoint != "" {
+				ws.config.Providers[0].Endpoint = req.Endpoint
+			}
+			ws.config.Providers[0].APIKey = req.APIKey
+		}
 	}
 	ws.mu.Unlock()
 
@@ -2267,10 +3653,14 @@ func (ws *WebServer) handleChat(w http.ResponseWriter, r *http.Request) {
 
 	agent := ws.getOrCreateAgent(req.ConversationID)
 
+	// Track starting index for new messages to save to thread
+	msgStartIdx := len(agent.messages)
+
 	// Add user message
 	agent.messages = append(agent.messages, Message{
 		Role:    "user",
 		Content: req.Message,
+		Images:  req.Images,
 	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
@@ -2335,6 +3725,11 @@ func (ws *WebServer) handleChat(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Save new messages to thread
+	if msgStartIdx < len(agent.messages) {
+		saveMessagesToThread(req.ConversationID, agent.messages[msgStartIdx:], req.Message)
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(apiResp)
 }
@@ -2354,6 +3749,7 @@ func (ws *WebServer) handleChatStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	r.Body = http.MaxBytesReader(w, r.Body, 50*1024*1024) // 50MB max for image uploads
 	var req ChatAPIRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -2380,10 +3776,14 @@ func (ws *WebServer) handleChatStream(w http.ResponseWriter, r *http.Request) {
 
 	agent := ws.getOrCreateAgent(req.ConversationID)
 
+	// Track starting index for new messages to save to thread
+	msgStartIdx := len(agent.messages)
+
 	// Add user message
 	agent.messages = append(agent.messages, Message{
 		Role:    "user",
 		Content: req.Message,
+		Images:  req.Images,
 	})
 
 	const maxRetries = 2
@@ -2496,6 +3896,11 @@ func (ws *WebServer) handleChatStream(w http.ResponseWriter, r *http.Request) {
 		break
 	}
 
+	// Save new messages to thread
+	if msgStartIdx < len(agent.messages) {
+		saveMessagesToThread(req.ConversationID, agent.messages[msgStartIdx:], req.Message)
+	}
+
 	sendEvent(StreamEvent{Type: "done"})
 	fmt.Fprintf(w, "data: [DONE]\n\n")
 	flusher.Flush()
@@ -2512,18 +3917,39 @@ func runWeb(config *Config, host string, port int) error {
 	http.HandleFunc("/api/images", ws.handleImages)
 	http.HandleFunc("/diagrams/", ws.handleDiagrams)
 	http.HandleFunc("/playground/", ws.handlePlayground)
+	http.HandleFunc("/api/plugins/ui", ws.handlePluginsUI)
+	http.HandleFunc("/api/plugins", ws.handlePlugins)
+	http.HandleFunc("/api/threads/", ws.handleThreads)
+	http.HandleFunc("/api/threads", ws.handleThreads)
 
 	// Initialize directories
+	if err := initThreadDir(); err != nil {
+		fmt.Printf("Warning: failed to initialize thread dir: %v\n", err)
+	}
 	if err := initDiagramDir(); err != nil {
 		fmt.Printf("Warning: failed to initialize diagram dir: %v\n", err)
 	}
 	if err := initPlaygroundDir(); err != nil {
 		fmt.Printf("Warning: failed to initialize playground dir: %v\n", err)
 	}
+	if err := loadPlugins(); err != nil {
+		fmt.Printf("Warning: failed to load plugins: %v\n", err)
+	}
 
 	fmt.Printf("siki v%s - 式神 Web GUI\n", Version)
-	fmt.Printf("Backend: %s, Model: %s\n", config.Backend, config.ModelName)
-	fmt.Printf("API Endpoint: %s\n", config.APIEndpoint)
+	pp := config.primaryProvider()
+	fmt.Printf("Backend: %s, Model: %s\n", pp.Backend, pp.Model)
+	fmt.Printf("API Endpoint: %s\n", pp.Endpoint)
+	if len(config.Providers) > 1 {
+		fmt.Printf("Configured providers: %d\n", len(config.Providers))
+		for i, p := range config.Providers {
+			marker := "  "
+			if i == 0 {
+				marker = "* "
+			}
+			fmt.Printf("  %s%s (%s, %s)\n", marker, p.Name, p.Backend, p.Model)
+		}
+	}
 
 	addr := fmt.Sprintf("%s:%d", host, port)
 	if host == "0.0.0.0" {
@@ -2601,8 +4027,9 @@ func runChat(config *Config) error {
 
 	reader := bufio.NewReader(os.Stdin)
 	fmt.Printf("siki v%s - 式神 Agentic AI - Type 'exit' to quit, 'clear' to reset\n", Version)
+	chatPP := config.primaryProvider()
 	fmt.Printf("Backend: %s, Model: %s, Endpoint: %s\n\n",
-		config.Backend, config.ModelName, config.APIEndpoint)
+		chatPP.Backend, chatPP.Model, chatPP.Endpoint)
 
 	for {
 		fmt.Print("> ")
@@ -2658,14 +4085,15 @@ func main() {
 		case "--backend":
 			if i+1 < len(args) {
 				config.Backend = args[i+1]
-				// Update endpoint based on backend if not explicitly set
 				if !endpointOverridden {
-					if args[i+1] == "ollama" {
-						config.APIEndpoint = "http://localhost:11434/v1"
-					} else {
-						config.APIEndpoint = "http://localhost:8000/v1"
-					}
+					config.APIEndpoint = defaultEndpointForBackend(args[i+1])
 				}
+				i += 2
+				continue
+			}
+		case "--api-key":
+			if i+1 < len(args) {
+				config.APIKey = args[i+1]
 				i += 2
 				continue
 			}
@@ -2705,6 +4133,17 @@ func main() {
 			return
 		}
 		break
+	}
+
+	// Initialize providers from legacy CLI flags if no providers configured
+	if len(config.Providers) == 0 {
+		config.Providers = []Provider{{
+			Name:     "default",
+			Backend:  config.Backend,
+			Endpoint: config.APIEndpoint,
+			Model:    config.ModelName,
+			APIKey:   config.APIKey,
+		}}
 	}
 
 	// Get remaining args as command

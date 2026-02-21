@@ -35,6 +35,196 @@
             flex-direction: column;
         }
 
+        .app-body {
+            flex: 1;
+            display: flex;
+            overflow: hidden;
+        }
+
+        .main-column {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            min-width: 0;
+        }
+
+        /* Plugin pane */
+        .plugin-pane {
+            width: 340px;
+            background: var(--bg-secondary);
+            border-left: 1px solid var(--border);
+            display: flex;
+            flex-direction: column;
+            transition: width 0.2s, min-width 0.2s;
+            overflow: hidden;
+        }
+
+        .plugin-pane.collapsed {
+            width: 0;
+            min-width: 0;
+            border-left: none;
+        }
+
+        .plugin-pane-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 0.5rem 0.75rem;
+            border-bottom: 1px solid var(--border);
+            background: var(--bg-tertiary);
+            font-size: 0.85rem;
+            font-weight: 600;
+            white-space: nowrap;
+        }
+
+        .plugin-pane-header button {
+            background: transparent;
+            border: none;
+            color: var(--text-secondary);
+            cursor: pointer;
+            font-size: 1rem;
+            padding: 0.2rem 0.4rem;
+        }
+
+        .plugin-pane-header button:hover {
+            color: var(--accent);
+        }
+
+        .plugin-pane-content {
+            flex: 1;
+            overflow-y: auto;
+            padding: 0.5rem;
+        }
+
+        .plugin-section {
+            margin-bottom: 0.75rem;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            overflow: hidden;
+        }
+
+        .plugin-section-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 0.4rem 0.6rem;
+            background: rgba(233, 69, 96, 0.1);
+            font-size: 0.8rem;
+            font-weight: 600;
+            color: var(--accent);
+            cursor: pointer;
+        }
+
+        .plugin-section-header:hover {
+            background: rgba(233, 69, 96, 0.15);
+        }
+
+        .plugin-section-body {
+            padding: 0.5rem;
+            font-size: 0.85rem;
+        }
+
+        .plugin-section-body.collapsed {
+            display: none;
+        }
+
+        #plugin-toggle-btn {
+            background: transparent;
+            border: 1px solid var(--border);
+            color: var(--text-secondary);
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.85rem;
+            padding: 0.3rem 0.6rem;
+            transition: border-color 0.2s, color 0.2s;
+        }
+
+        #plugin-toggle-btn:hover {
+            border-color: var(--accent);
+            color: var(--accent);
+        }
+
+        .plugin-list-item {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.5rem 0.75rem;
+            border-bottom: 1px solid var(--border-color);
+            font-size: 0.8rem;
+        }
+        .plugin-list-item:last-child {
+            border-bottom: none;
+        }
+        .plugin-list-item .plugin-info {
+            flex: 1;
+            min-width: 0;
+        }
+        .plugin-list-item .plugin-info .plugin-name {
+            font-weight: 600;
+            font-size: 0.8rem;
+        }
+        .plugin-list-item .plugin-info .plugin-desc {
+            color: var(--text-secondary);
+            font-size: 0.7rem;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .plugin-list-item .plugin-badges {
+            display: flex;
+            gap: 3px;
+        }
+        .plugin-list-item .plugin-badges span {
+            font-size: 0.6rem;
+            padding: 1px 4px;
+            border-radius: 3px;
+            background: var(--bg-secondary);
+            color: var(--text-secondary);
+            border: 1px solid var(--border);
+        }
+        .plugin-toggle-switch {
+            position: relative;
+            width: 36px;
+            height: 20px;
+            flex-shrink: 0;
+        }
+        .plugin-toggle-switch input {
+            opacity: 0;
+            width: 0;
+            height: 0;
+        }
+        .plugin-toggle-switch .slider {
+            position: absolute;
+            cursor: pointer;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background-color: #555;
+            border-radius: 20px;
+            transition: 0.3s;
+        }
+        .plugin-toggle-switch .slider:before {
+            content: "";
+            position: absolute;
+            height: 14px;
+            width: 14px;
+            left: 3px;
+            bottom: 3px;
+            background-color: white;
+            border-radius: 50%;
+            transition: 0.3s;
+        }
+        .plugin-toggle-switch input:checked + .slider {
+            background-color: #4a9eff;
+        }
+        .plugin-toggle-switch input:checked + .slider:before {
+            transform: translateX(16px);
+        }
+        .plugin-list-empty {
+            color: var(--text-secondary);
+            font-size: 0.75rem;
+            text-align: center;
+            padding: 0.75rem;
+        }
+
         header {
             background: var(--bg-secondary);
             padding: 1rem 2rem;
@@ -371,6 +561,63 @@
             cursor: not-allowed;
         }
 
+        #image-btn {
+            background: transparent;
+            border: 1px solid var(--border);
+            color: var(--text-secondary);
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 1.2rem;
+            padding: 0 0.75rem;
+            transition: border-color 0.2s, color 0.2s;
+        }
+
+        #image-btn:hover {
+            border-color: var(--accent);
+            color: var(--accent);
+        }
+
+        #image-preview-container {
+            display: none;
+            padding: 0.5rem 2rem;
+            background: var(--bg-secondary);
+            gap: 0.5rem;
+            flex-wrap: wrap;
+            border-top: 1px solid var(--border);
+        }
+
+        .image-preview-item {
+            position: relative;
+            display: inline-block;
+        }
+
+        .image-preview-item img {
+            height: 60px;
+            border-radius: 6px;
+            border: 1px solid var(--border);
+        }
+
+        .image-preview-item .remove-btn {
+            position: absolute;
+            top: -6px;
+            right: -6px;
+            background: var(--accent);
+            color: white;
+            border: none;
+            border-radius: 50%;
+            width: 18px;
+            height: 18px;
+            font-size: 12px;
+            cursor: pointer;
+            line-height: 18px;
+            text-align: center;
+        }
+
+        .input-container.drag-over {
+            border-top-color: var(--accent);
+            background: rgba(233, 69, 96, 0.05);
+        }
+
         .typing-indicator {
             display: none;
             align-self: flex-start;
@@ -466,6 +713,81 @@
             font-size: 1rem;
         }
 
+        .provider-row {
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 0.75rem;
+            margin-bottom: 0.5rem;
+            background: var(--bg-primary);
+            position: relative;
+        }
+        .provider-row.primary {
+            border-color: #4a9eff;
+            box-shadow: 0 0 0 1px #4a9eff33;
+        }
+        .provider-row .provider-header {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            margin-bottom: 0.5rem;
+        }
+        .provider-row .provider-header .primary-badge {
+            background: #4a9eff;
+            color: white;
+            font-size: 0.65rem;
+            padding: 1px 6px;
+            border-radius: 4px;
+        }
+        .provider-row .provider-fields {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 0.4rem 0.75rem;
+        }
+        .provider-row .provider-fields .full-width {
+            grid-column: 1 / -1;
+        }
+        .provider-row .provider-fields label {
+            font-size: 0.7rem;
+            color: var(--text-secondary);
+            margin-bottom: 2px;
+            display: block;
+        }
+        .provider-row .provider-fields input,
+        .provider-row .provider-fields select {
+            width: 100%;
+            padding: 0.4rem;
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            background: var(--bg-secondary);
+            color: var(--text-primary);
+            font-size: 0.8rem;
+        }
+        .provider-row .provider-actions {
+            position: absolute;
+            top: 0.5rem;
+            right: 0.5rem;
+            display: flex;
+            gap: 0.25rem;
+        }
+        .provider-row .provider-actions button {
+            background: transparent;
+            border: 1px solid var(--border);
+            color: var(--text-secondary);
+            cursor: pointer;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-size: 0.7rem;
+        }
+        .provider-row .provider-actions button:hover {
+            background: var(--bg-secondary);
+            color: var(--text-primary);
+        }
+        .provider-row .provider-actions button.delete-btn:hover {
+            background: #ff4a4a22;
+            color: #ff4a4a;
+            border-color: #ff4a4a;
+        }
+
         .modal-actions {
             display: flex;
             gap: 1rem;
@@ -505,6 +827,137 @@
             0%, 50% { opacity: 1; }
             51%, 100% { opacity: 0; }
         }
+
+        /* Thread sidebar */
+        .thread-sidebar {
+            width: 220px;
+            min-width: 220px;
+            background: var(--bg-secondary);
+            border-right: 1px solid var(--border);
+            display: flex;
+            flex-direction: column;
+            height: 100%;
+            overflow: hidden;
+        }
+        .thread-sidebar-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 0.75rem;
+            border-bottom: 1px solid var(--border);
+            font-weight: 600;
+            font-size: 0.85rem;
+        }
+        .thread-sidebar-header button {
+            background: transparent;
+            border: 1px solid var(--border);
+            color: var(--text-primary);
+            width: 28px;
+            height: 28px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 1.1rem;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .thread-sidebar-header button:hover {
+            background: var(--accent);
+            border-color: var(--accent);
+        }
+        .thread-search-box {
+            padding: 0.4rem 0.5rem;
+            border-bottom: 1px solid var(--border);
+        }
+        .thread-search-box input {
+            width: 100%;
+            padding: 0.35rem 0.5rem;
+            border: 1px solid var(--border);
+            border-radius: 5px;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            font-size: 0.75rem;
+            outline: none;
+        }
+        .thread-search-box input:focus {
+            border-color: var(--accent);
+        }
+        .thread-search-box input::placeholder {
+            color: var(--text-secondary);
+        }
+        .thread-list {
+            flex: 1;
+            overflow-y: auto;
+            padding: 0.25rem;
+        }
+        .thread-item .search-snippet {
+            font-size: 0.65rem;
+            color: var(--text-secondary);
+            margin-top: 2px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .thread-item .search-snippet mark {
+            background: #4a9eff44;
+            color: var(--text-primary);
+            padding: 0 1px;
+            border-radius: 2px;
+        }
+        .thread-item {
+            padding: 0.5rem 0.6rem;
+            border-radius: 6px;
+            cursor: pointer;
+            margin-bottom: 2px;
+            position: relative;
+        }
+        .thread-item:hover {
+            background: var(--bg-primary);
+        }
+        .thread-item.active {
+            background: var(--accent);
+            color: white;
+        }
+        .thread-item .thread-title {
+            font-size: 0.8rem;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            margin-bottom: 2px;
+        }
+        .thread-item .thread-meta {
+            font-size: 0.65rem;
+            color: var(--text-secondary);
+        }
+        .thread-item.active .thread-meta {
+            color: rgba(255,255,255,0.7);
+        }
+        .thread-item .thread-actions {
+            position: absolute;
+            top: 4px;
+            right: 4px;
+            display: none;
+            gap: 2px;
+        }
+        .thread-item:hover .thread-actions {
+            display: flex;
+        }
+        .thread-item .thread-actions button {
+            background: transparent;
+            border: none;
+            color: var(--text-secondary);
+            cursor: pointer;
+            font-size: 0.7rem;
+            padding: 2px 4px;
+            border-radius: 3px;
+        }
+        .thread-item .thread-actions button:hover {
+            background: var(--bg-secondary);
+            color: var(--text-primary);
+        }
+        .thread-item .thread-actions button.del-btn:hover {
+            color: #ff4a4a;
+        }
     </style>
 </head>
 <body>
@@ -517,9 +970,22 @@
             </div>
             <button class="settings-btn" onclick="showSettings()" data-i18n="settings">Settings</button>
             <button class="settings-btn" onclick="clearChat()" data-i18n="clear">Clear</button>
+            <button id="plugin-toggle-btn" onclick="togglePluginPane()">Plugins</button>
         </div>
     </header>
 
+    <div class="app-body">
+    <div class="thread-sidebar" id="thread-sidebar">
+        <div class="thread-sidebar-header">
+            <span>Threads</span>
+            <button onclick="createNewThread()" title="New thread">+</button>
+        </div>
+        <div class="thread-search-box">
+            <input type="text" id="thread-search-input" placeholder="Search threads..." oninput="onThreadSearchInput(this.value)">
+        </div>
+        <div class="thread-list" id="thread-list"></div>
+    </div>
+    <div class="main-column">
     <div class="chat-container" id="chat-container">
         <div class="message assistant" id="welcome-message">
             <p><span data-i18n="welcome">Welcome to</span> <strong>siki</strong> - <span data-i18n="welcome_sub">your local agentic AI assistant.</span></p>
@@ -538,19 +1004,37 @@
         <span></span><span></span><span></span>
     </div>
 
+    <div id="image-preview-container"></div>
     <div class="input-container">
         <div class="input-wrapper">
+            <button id="image-btn" onclick="document.getElementById('image-input').click()" title="Upload image">&#128247;</button>
+            <input type="file" id="image-input" accept="image/*" multiple style="display:none" onchange="handleImageSelect(event)">
             <textarea id="message-input" data-i18n-placeholder="input_placeholder" placeholder="Type your message..." rows="1"></textarea>
             <button id="send-btn" onclick="sendMessage()" data-i18n="send">Send</button>
         </div>
     </div>
+    </div><!-- .main-column -->
+
+    <div class="plugin-pane collapsed" id="plugin-pane">
+        <div class="plugin-pane-header">
+            <span>Plugins</span>
+            <button onclick="togglePluginPane()" title="Close">&times;</button>
+        </div>
+        <div id="plugin-list-container" style="border-bottom: 1px solid var(--border-color);"></div>
+        <div class="plugin-pane-content" id="plugin-pane-content">
+            <div style="color: var(--text-secondary); font-size: 0.8rem; text-align: center; padding: 2rem 0.5rem;">
+                No plugins loaded
+            </div>
+        </div>
+    </div>
+    </div><!-- .app-body -->
 
     <div class="image-modal" id="image-modal" onclick="hideImageModal()">
         <img id="modal-image" src="" alt="Full size image">
     </div>
 
     <div class="modal" id="settings-modal">
-        <div class="modal-content">
+        <div class="modal-content" style="max-width: 700px;">
             <h2 data-i18n="settings">Settings</h2>
             <div class="form-group">
                 <label data-i18n="language">Language</label>
@@ -564,22 +1048,11 @@
                     <option value="de">Deutsch</option>
                 </select>
             </div>
-            <div class="form-group">
-                <label data-i18n="model">Model</label>
-                <input type="text" id="setting-model" placeholder="gpt-oss:20b">
-            </div>
-            <div class="form-group">
-                <label data-i18n="backend">Backend</label>
-                <select id="setting-backend">
-                    <option value="ollama">Ollama</option>
-                    <option value="vllm">vLLM</option>
-                    <option value="mlx">MLX</option>
-                </select>
-            </div>
-            <div class="form-group">
-                <label data-i18n="api_endpoint">API Endpoint</label>
-                <input type="text" id="setting-endpoint" placeholder="http://localhost:11434/v1">
-            </div>
+
+            <h3 style="margin: 1rem 0 0.5rem; border-bottom: 1px solid var(--border-color); padding-bottom: 0.5rem;">Providers</h3>
+            <div id="providers-list" style="margin-bottom: 0.5rem;"></div>
+            <button class="btn-secondary" onclick="addProviderRow()" style="margin-bottom: 1rem; font-size: 0.8rem;">+ Add Provider</button>
+
             <div class="modal-actions">
                 <button class="btn-secondary" onclick="hideSettings()" data-i18n="cancel">Cancel</button>
                 <button class="btn-primary" onclick="saveSettings()" data-i18n="save">Save</button>
@@ -610,6 +1083,7 @@
                 model: 'Model',
                 backend: 'Backend',
                 api_endpoint: 'API Endpoint',
+                api_key: 'API Key',
                 language: 'Language',
                 cancel: 'Cancel',
                 save: 'Save',
@@ -633,6 +1107,7 @@
                 model: 'モデル',
                 backend: 'バックエンド',
                 api_endpoint: 'APIエンドポイント',
+                api_key: 'APIキー',
                 language: '言語',
                 cancel: 'キャンセル',
                 save: '保存',
@@ -656,6 +1131,7 @@
                 model: '模型',
                 backend: '后端',
                 api_endpoint: 'API端点',
+                api_key: 'API密钥',
                 language: '语言',
                 cancel: '取消',
                 save: '保存',
@@ -679,6 +1155,7 @@
                 model: '모델',
                 backend: '백엔드',
                 api_endpoint: 'API 엔드포인트',
+                api_key: 'API 키',
                 language: '언어',
                 cancel: '취소',
                 save: '저장',
@@ -702,6 +1179,7 @@
                 model: 'Modelo',
                 backend: 'Backend',
                 api_endpoint: 'Endpoint de API',
+                api_key: 'Clave API',
                 language: 'Idioma',
                 cancel: 'Cancelar',
                 save: 'Guardar',
@@ -725,6 +1203,7 @@
                 model: 'Modèle',
                 backend: 'Backend',
                 api_endpoint: 'Point de terminaison API',
+                api_key: 'Clé API',
                 language: 'Langue',
                 cancel: 'Annuler',
                 save: 'Enregistrer',
@@ -748,6 +1227,7 @@
                 model: 'Modell',
                 backend: 'Backend',
                 api_endpoint: 'API-Endpunkt',
+                api_key: 'API-Schlüssel',
                 language: 'Sprache',
                 cancel: 'Abbrechen',
                 save: 'Speichern',
@@ -793,6 +1273,124 @@
         applyTranslations();
 
         // ============================================
+        // Plugin Pane
+        // ============================================
+        function togglePluginPane() {
+            document.getElementById('plugin-pane').classList.toggle('collapsed');
+        }
+
+        async function loadPluginList() {
+            try {
+                const resp = await fetch('/api/plugins');
+                const plugins = await resp.json();
+                const container = document.getElementById('plugin-list-container');
+
+                if (!plugins || plugins.length === 0) {
+                    container.innerHTML = '<div class="plugin-list-empty">No plugins installed</div>';
+                    return;
+                }
+
+                container.innerHTML = '';
+                for (const p of plugins) {
+                    const item = document.createElement('div');
+                    item.className = 'plugin-list-item';
+                    const badges = [];
+                    if (p.has_tool) badges.push('<span>Tool</span>');
+                    if (p.has_ui) badges.push('<span>UI</span>');
+                    if (p.tested) {
+                        badges.push('<span style="background:#2d5a2d;color:#6fbf6f;border-color:#4a8a4a;">Tested</span>');
+                    } else if (p.has_tool) {
+                        badges.push('<span style="background:#5a3a2d;color:#ff9966;border-color:#8a5a3a;">Untested</span>');
+                    }
+                    item.innerHTML = `
+                        <div class="plugin-info">
+                            <div class="plugin-name">${p.name} <small style="color:var(--text-secondary);font-weight:normal;">v${p.version || '?'}</small></div>
+                            <div class="plugin-desc">${p.description || ''}${p.test_result ? ' ('+p.test_result+')' : ''}</div>
+                        </div>
+                        <div class="plugin-badges">${badges.join('')}</div>
+                        <label class="plugin-toggle-switch">
+                            <input type="checkbox" ${p.enabled ? 'checked' : ''} onchange="togglePlugin('${p.name}', this.checked)">
+                            <span class="slider"></span>
+                        </label>
+                    `;
+                    container.appendChild(item);
+                }
+            } catch (e) {
+                console.error('Failed to load plugin list:', e);
+            }
+        }
+
+        async function togglePlugin(name, enabled) {
+            try {
+                await fetch('/api/plugins', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name, enabled })
+                });
+                // Reload UI plugins (enabled ones only)
+                loadSikiPlugins();
+            } catch (e) {
+                console.error('Failed to toggle plugin:', e);
+            }
+        }
+
+        async function loadSikiPlugins() {
+            try {
+                const resp = await fetch('/api/plugins/ui');
+                const plugins = await resp.json();
+                const paneContent = document.getElementById('plugin-pane-content');
+                if (!plugins || plugins.length === 0) {
+                    paneContent.innerHTML = '<div style="color: var(--text-secondary); font-size: 0.8rem; text-align: center; padding: 2rem 0.5rem;">No active plugin UI</div>';
+                    return;
+                }
+
+                paneContent.innerHTML = '';
+                for (const plugin of plugins) {
+                    const section = document.createElement('div');
+                    section.className = 'plugin-section';
+
+                    const header = document.createElement('div');
+                    header.className = 'plugin-section-header';
+                    header.innerHTML = `<span>${plugin.name}</span><span class="toggle-arrow">&#9660;</span>`;
+                    header.onclick = function() {
+                        const body = section.querySelector('.plugin-section-body');
+                        body.classList.toggle('collapsed');
+                        header.querySelector('.toggle-arrow').innerHTML = body.classList.contains('collapsed') ? '&#9654;' : '&#9660;';
+                    };
+                    section.appendChild(header);
+
+                    const body = document.createElement('div');
+                    body.className = 'plugin-section-body';
+                    section.appendChild(body);
+
+                    if (plugin.css) {
+                        const style = document.createElement('style');
+                        style.textContent = plugin.css;
+                        body.appendChild(style);
+                    }
+
+                    if (plugin.js) {
+                        try {
+                            const fn = new Function('pane', plugin.js);
+                            fn(body);
+                        } catch (e) {
+                            body.innerHTML = `<div style="color:var(--accent);font-size:0.8rem;">Error: ${e.message}</div>`;
+                            console.error(`Plugin '${plugin.name}' JS error:`, e);
+                        }
+                    }
+
+                    paneContent.appendChild(section);
+                }
+                console.log(`Loaded ${plugins.length} UI plugin(s)`);
+            } catch (e) {
+                console.error('Failed to load plugins:', e);
+            }
+        }
+
+        loadPluginList();
+        loadSikiPlugins();
+
+        // ============================================
         // Configure marked
         // ============================================
         marked.setOptions({
@@ -811,6 +1409,7 @@
         const statusText = document.getElementById('status-text');
 
         let conversationId = Date.now().toString();
+        let threads = [];
 
         // Auto-resize textarea
         messageInput.addEventListener('input', function() {
@@ -837,6 +1436,108 @@
             }
         });
 
+        // Provider management
+        let currentProviders = [];
+
+        function getEndpointDefault(backend) {
+            const defaults = {
+                ollama: 'http://localhost:11434/v1',
+                vllm: 'http://localhost:8000/v1',
+                mlx: 'http://localhost:8000/v1',
+                openai: 'https://api.openai.com/v1',
+                anthropic: 'https://api.anthropic.com/v1',
+                gemini: 'https://generativelanguage.googleapis.com/v1beta/openai'
+            };
+            return defaults[backend] || defaults.ollama;
+        }
+
+        function isCloudBackend(backend) {
+            return ['openai', 'anthropic', 'gemini'].includes(backend);
+        }
+
+        function renderProviders() {
+            const container = document.getElementById('providers-list');
+            container.innerHTML = '';
+            currentProviders.forEach((p, idx) => {
+                const isPrimary = idx === 0;
+                const div = document.createElement('div');
+                div.className = 'provider-row' + (isPrimary ? ' primary' : '');
+                div.innerHTML = `
+                    <div class="provider-header">
+                        <strong style="font-size:0.85rem;">${p.name || 'Provider ' + (idx+1)}</strong>
+                        ${isPrimary ? '<span class="primary-badge">Primary</span>' : ''}
+                    </div>
+                    <div class="provider-actions">
+                        ${!isPrimary ? `<button onclick="setPrimaryProvider(${idx})" title="Set as primary">★</button>` : ''}
+                        ${currentProviders.length > 1 ? `<button class="delete-btn" onclick="removeProvider(${idx})" title="Remove">✕</button>` : ''}
+                    </div>
+                    <div class="provider-fields">
+                        <div>
+                            <label>Name</label>
+                            <input type="text" value="${p.name || ''}" onchange="currentProviders[${idx}].name=this.value" placeholder="my-provider">
+                        </div>
+                        <div>
+                            <label>Backend</label>
+                            <select onchange="onProviderBackendChange(${idx}, this.value)">
+                                <option value="ollama" ${p.backend==='ollama'?'selected':''}>Ollama</option>
+                                <option value="vllm" ${p.backend==='vllm'?'selected':''}>vLLM</option>
+                                <option value="mlx" ${p.backend==='mlx'?'selected':''}>MLX</option>
+                                <option value="openai" ${p.backend==='openai'?'selected':''}>OpenAI</option>
+                                <option value="anthropic" ${p.backend==='anthropic'?'selected':''}>Anthropic</option>
+                                <option value="gemini" ${p.backend==='gemini'?'selected':''}>Google Gemini</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label>Model</label>
+                            <input type="text" value="${p.model || ''}" onchange="currentProviders[${idx}].model=this.value" placeholder="model name">
+                        </div>
+                        <div>
+                            <label>API Key ${!isCloudBackend(p.backend) ? '(optional)' : ''}</label>
+                            <input type="password" value="${p.api_key || ''}" onchange="currentProviders[${idx}].api_key=this.value" placeholder="${p.api_key ? '••••••••' : 'sk-...'}">
+                        </div>
+                        <div class="full-width">
+                            <label>Endpoint</label>
+                            <input type="text" value="${p.endpoint || ''}" onchange="currentProviders[${idx}].endpoint=this.value" placeholder="${getEndpointDefault(p.backend)}">
+                        </div>
+                    </div>
+                `;
+                container.appendChild(div);
+            });
+        }
+
+        function onProviderBackendChange(idx, backend) {
+            const oldBackend = currentProviders[idx].backend;
+            currentProviders[idx].backend = backend;
+            // Auto-set endpoint if it was at the default for the old backend
+            const oldDefault = getEndpointDefault(oldBackend);
+            if (!currentProviders[idx].endpoint || currentProviders[idx].endpoint === oldDefault) {
+                currentProviders[idx].endpoint = getEndpointDefault(backend);
+            }
+            renderProviders();
+        }
+
+        function addProviderRow() {
+            currentProviders.push({
+                name: 'provider-' + (currentProviders.length + 1),
+                backend: 'openai',
+                endpoint: 'https://api.openai.com/v1',
+                model: '',
+                api_key: ''
+            });
+            renderProviders();
+        }
+
+        function removeProvider(idx) {
+            currentProviders.splice(idx, 1);
+            renderProviders();
+        }
+
+        function setPrimaryProvider(idx) {
+            const [p] = currentProviders.splice(idx, 1);
+            currentProviders.unshift(p);
+            renderProviders();
+        }
+
         // Check server status
         async function checkStatus() {
             try {
@@ -845,10 +1546,21 @@
                 statusDot.classList.remove('offline');
                 statusText.textContent = `${data.model} (${data.backend})`;
 
-                // Load settings
-                document.getElementById('setting-model').value = data.model;
-                document.getElementById('setting-backend').value = data.backend;
-                document.getElementById('setting-endpoint').value = data.endpoint;
+                // Update providers from server
+                if (data.providers && data.providers.length > 0) {
+                    // Don't overwrite API keys with empty strings from server
+                    // Server might redact them
+                    currentProviders = data.providers.map(p => ({...p}));
+                } else {
+                    // Legacy: single provider
+                    currentProviders = [{
+                        name: 'default',
+                        backend: data.backend,
+                        endpoint: data.endpoint,
+                        model: data.model,
+                        api_key: ''
+                    }];
+                }
             } catch (e) {
                 statusDot.classList.add('offline');
                 statusText.textContent = 'Offline';
@@ -1024,14 +1736,301 @@
             });
         }
 
+        // ============================================
+        // Thread Management
+        // ============================================
+        let threadSearchTimer = null;
+        let threadSearchResults = null;
+
+        async function loadThreadList() {
+            try {
+                const resp = await fetch('/api/threads');
+                threads = await resp.json();
+                threadSearchResults = null;
+                renderThreadList();
+            } catch(e) {
+                console.error('Failed to load threads:', e);
+            }
+        }
+
+        function onThreadSearchInput(value) {
+            clearTimeout(threadSearchTimer);
+            const q = value.trim();
+            if (!q) {
+                threadSearchResults = null;
+                renderThreadList();
+                return;
+            }
+            threadSearchTimer = setTimeout(() => searchThreads(q), 300);
+        }
+
+        async function searchThreads(query) {
+            try {
+                const resp = await fetch('/api/threads/search?q=' + encodeURIComponent(query));
+                threadSearchResults = await resp.json();
+                threadSearchResults._query = query;
+                renderThreadList();
+            } catch(e) {
+                console.error('Thread search failed:', e);
+            }
+        }
+
+        function highlightMatch(text, query) {
+            if (!query) return escapeHtml(text);
+            const escaped = escapeHtml(text);
+            const re = new RegExp('(' + query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ')', 'gi');
+            return escaped.replace(re, '<mark>$1</mark>');
+        }
+
+        function renderThreadList() {
+            const list = document.getElementById('thread-list');
+            list.innerHTML = '';
+
+            if (threadSearchResults && threadSearchResults.length === 0) {
+                list.innerHTML = '<div style="color:var(--text-secondary);font-size:0.75rem;text-align:center;padding:1rem 0.5rem;">No results</div>';
+                return;
+            }
+
+            if (threadSearchResults && threadSearchResults.length > 0) {
+                const query = threadSearchResults._query || '';
+                for (const r of threadSearchResults) {
+                    const div = document.createElement('div');
+                    div.className = 'thread-item' + (r.thread_id === conversationId ? ' active' : '');
+                    div.innerHTML = `
+                        <div class="thread-title">${highlightMatch(r.thread_title || 'Untitled', query)}</div>
+                        <div class="thread-meta">${r.match_count} match${r.match_count > 1 ? 'es' : ''} &middot; ${r.message_count} msgs</div>
+                        <div class="search-snippet">${highlightMatch(r.snippet || '', query)}</div>
+                    `;
+                    div.onclick = () => switchThread(r.thread_id);
+                    list.appendChild(div);
+                }
+                return;
+            }
+
+            // Normal thread list
+            const sorted = [...threads].sort((a,b) => new Date(b.updated_at) - new Date(a.updated_at));
+
+            for (const t of sorted) {
+                const div = document.createElement('div');
+                div.className = 'thread-item' + (t.id === conversationId ? ' active' : '');
+                const date = new Date(t.updated_at);
+                const dateStr = date.toLocaleDateString() + ' ' + date.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+                div.innerHTML = `
+                    <div class="thread-title">${escapeHtml(t.title || 'New thread')}</div>
+                    <div class="thread-meta">${t.message_count || 0} msgs &middot; ${dateStr}</div>
+                    <div class="thread-actions">
+                        <button onclick="event.stopPropagation(); renameThread('${t.id}')" title="Rename">&#9998;</button>
+                        <button class="del-btn" onclick="event.stopPropagation(); deleteThreadUI('${t.id}')" title="Delete">&#10005;</button>
+                    </div>
+                `;
+                div.onclick = () => switchThread(t.id);
+                list.appendChild(div);
+            }
+        }
+
+        async function switchThread(threadId) {
+            if (threadId === conversationId) return;
+
+            conversationId = threadId;
+            chatContainer.innerHTML = '';
+            // Clear search
+            document.getElementById('thread-search-input').value = '';
+            threadSearchResults = null;
+
+            // Load messages from server
+            try {
+                const resp = await fetch('/api/threads/' + threadId);
+                const thread = await resp.json();
+
+                if (thread.messages && thread.messages.length > 0) {
+                    for (const m of thread.messages) {
+                        if (m.role === 'system') continue;
+                        if (m.role === 'tool' && m.tool_name) {
+                            addMessage('tool', m.content, m.tool_name);
+                        } else if (m.role === 'user') {
+                            const userDiv = addMessage('user', m.content);
+                            if (m.images && m.images.length > 0) {
+                                let imgHtml = '<div style="display:flex;gap:4px;margin-top:8px;flex-wrap:wrap;">';
+                                for (const img of m.images) {
+                                    imgHtml += `<img src="${img}" style="max-height:100px;border-radius:6px;cursor:pointer;">`;
+                                }
+                                imgHtml += '</div>';
+                                userDiv.innerHTML += imgHtml;
+                            }
+                        } else if (m.role === 'assistant') {
+                            addMessage('assistant', m.content);
+                        }
+                    }
+                } else {
+                    addMessage('assistant', 'New thread started.');
+                }
+            } catch(e) {
+                addMessage('assistant', 'Failed to load thread.');
+            }
+
+            renderThreadList();
+        }
+
+        async function createNewThread() {
+            const newId = Date.now().toString();
+            try {
+                await fetch('/api/threads', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ id: newId, title: 'New thread' })
+                });
+            } catch(e) {}
+
+            conversationId = newId;
+            chatContainer.innerHTML = '';
+            addMessage('assistant', 'New thread started.');
+
+            await loadThreadList();
+        }
+
+        async function renameThread(threadId) {
+            const thread = threads.find(t => t.id === threadId);
+            const newTitle = prompt('Rename thread:', thread ? thread.title : '');
+            if (!newTitle) return;
+
+            try {
+                await fetch('/api/threads/' + threadId + '/rename', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ title: newTitle })
+                });
+                await loadThreadList();
+            } catch(e) {
+                alert('Failed to rename: ' + e.message);
+            }
+        }
+
+        async function deleteThreadUI(threadId) {
+            if (!confirm('Delete this thread?')) return;
+
+            try {
+                await fetch('/api/threads/' + threadId, { method: 'DELETE' });
+
+                if (threadId === conversationId) {
+                    createNewThread();
+                }
+
+                await loadThreadList();
+            } catch(e) {
+                alert('Failed to delete: ' + e.message);
+            }
+        }
+
+        // ============================================
+        // Image Upload
+        // ============================================
+        let pendingImages = [];
+
+        function handleImageSelect(event) {
+            const files = event.target.files;
+            for (const file of files) {
+                if (!file.type.startsWith('image/')) continue;
+                if (file.size > 20 * 1024 * 1024) {
+                    alert('Image too large (max 20MB)');
+                    continue;
+                }
+                const reader = new FileReader();
+                reader.onload = function(e) {
+                    pendingImages.push(e.target.result);
+                    updateImagePreviews();
+                };
+                reader.readAsDataURL(file);
+            }
+            event.target.value = '';
+        }
+
+        function updateImagePreviews() {
+            const container = document.getElementById('image-preview-container');
+            container.innerHTML = '';
+            if (pendingImages.length === 0) {
+                container.style.display = 'none';
+                return;
+            }
+            container.style.display = 'flex';
+            pendingImages.forEach((dataUri, index) => {
+                const item = document.createElement('div');
+                item.className = 'image-preview-item';
+                item.innerHTML = `<img src="${dataUri}" alt="Preview"><button class="remove-btn" onclick="removeImage(${index})">x</button>`;
+                container.appendChild(item);
+            });
+        }
+
+        function removeImage(index) {
+            pendingImages.splice(index, 1);
+            updateImagePreviews();
+        }
+
+        // Drag and drop
+        const inputContainer = document.querySelector('.input-container');
+        inputContainer.addEventListener('dragover', function(e) {
+            e.preventDefault();
+            inputContainer.classList.add('drag-over');
+        });
+        inputContainer.addEventListener('dragleave', function() {
+            inputContainer.classList.remove('drag-over');
+        });
+        inputContainer.addEventListener('drop', function(e) {
+            e.preventDefault();
+            inputContainer.classList.remove('drag-over');
+            for (const file of e.dataTransfer.files) {
+                if (!file.type.startsWith('image/')) continue;
+                const reader = new FileReader();
+                reader.onload = function(ev) {
+                    pendingImages.push(ev.target.result);
+                    updateImagePreviews();
+                };
+                reader.readAsDataURL(file);
+            }
+        });
+
+        // Paste support
+        messageInput.addEventListener('paste', function(e) {
+            const items = e.clipboardData.items;
+            for (const item of items) {
+                if (item.type.startsWith('image/')) {
+                    e.preventDefault();
+                    const file = item.getAsFile();
+                    const reader = new FileReader();
+                    reader.onload = function(ev) {
+                        pendingImages.push(ev.target.result);
+                        updateImagePreviews();
+                    };
+                    reader.readAsDataURL(file);
+                }
+            }
+        });
+
         async function sendMessage() {
             const message = messageInput.value.trim();
-            if (!message) return;
+            if (!message && pendingImages.length === 0) return;
 
-            addMessage('user', message);
+            // Show user message with image thumbnails
+            const userDiv = addMessage('user', message || '(image)');
+            if (pendingImages.length > 0) {
+                let imgHtml = '<div style="display:flex;gap:4px;margin-top:8px;flex-wrap:wrap;">';
+                for (const img of pendingImages) {
+                    imgHtml += `<img src="${img}" style="max-height:100px;border-radius:6px;cursor:pointer;">`;
+                }
+                imgHtml += '</div>';
+                userDiv.innerHTML += imgHtml;
+            }
+
+            const imagesToSend = [...pendingImages];
+            pendingImages = [];
+            updateImagePreviews();
+
             messageInput.value = '';
             messageInput.style.height = 'auto';
             sendBtn.disabled = true;
+
+            // Show typing indicator immediately
+            typing.classList.add('show');
+            chatContainer.scrollTop = chatContainer.scrollHeight;
 
             try {
                 const resp = await fetch('/api/chat/stream', {
@@ -1039,7 +2038,8 @@
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
                         message: message,
-                        conversation_id: conversationId
+                        conversation_id: conversationId,
+                        images: imagesToSend.length > 0 ? imagesToSend : undefined
                     })
                 });
 
@@ -1067,6 +2067,8 @@
                             const event = JSON.parse(data);
 
                             if (event.type === 'tool_call') {
+                                // Hide typing indicator on first event
+                                typing.classList.remove('show');
                                 // If there was streaming content before tool calls, finalize as "thinking"
                                 if (streamingDiv && fullContent) {
                                     finalizeStreamingMessage(streamingDiv, fullContent);
@@ -1079,6 +2081,8 @@
                                 // Show tool call
                                 addMessage('tool', event.result || 'Executing...', event.name);
                             } else if (event.type === 'content') {
+                                // Hide typing indicator on first content
+                                typing.classList.remove('show');
                                 // Streaming content
                                 if (!streamingDiv) {
                                     streamingDiv = createStreamingMessage();
@@ -1091,6 +2095,7 @@
                                     finalizeStreamingMessage(streamingDiv, fullContent);
                                 }
                             } else if (event.type === 'error') {
+                                typing.classList.remove('show');
                                 addMessage('assistant', `Error: ${event.error}`);
                             }
                         } catch (e) {
@@ -1105,22 +2110,23 @@
                 }
 
             } catch (e) {
+                typing.classList.remove('show');
                 addMessage('assistant', `Connection error: ${e.message}`);
             }
 
+            typing.classList.remove('show');
             sendBtn.disabled = false;
             messageInput.focus();
+            loadThreadList();
         }
 
         function clearChat() {
-            chatContainer.innerHTML = '';
-            conversationId = Date.now().toString();
-            addMessage('assistant', t.chat_cleared);
+            createNewThread();
         }
 
         function showSettings() {
-            // Set current language in selector
             document.getElementById('setting-language').value = lang;
+            renderProviders();
             document.getElementById('settings-modal').classList.add('show');
         }
 
@@ -1158,10 +2164,27 @@
             const newLang = document.getElementById('setting-language').value;
             changeLanguage(newLang);
 
+            // Read latest values from DOM inputs
+            const container = document.getElementById('providers-list');
+            const rows = container.querySelectorAll('.provider-row');
+            rows.forEach((row, idx) => {
+                if (idx < currentProviders.length) {
+                    const inputs = row.querySelectorAll('input, select');
+                    // Order: name, backend, model, apikey, endpoint
+                    currentProviders[idx].name = inputs[0].value;
+                    currentProviders[idx].backend = inputs[1].value;
+                    currentProviders[idx].model = inputs[2].value;
+                    // Only update api_key if user typed something
+                    if (inputs[3].value) {
+                        currentProviders[idx].api_key = inputs[3].value;
+                    }
+                    currentProviders[idx].endpoint = inputs[4].value;
+                }
+            });
+
             const settings = {
-                model: document.getElementById('setting-model').value,
-                backend: document.getElementById('setting-backend').value,
-                endpoint: document.getElementById('setting-endpoint').value
+                action: 'set_providers',
+                providers: currentProviders
             };
 
             try {
@@ -1177,7 +2200,16 @@
             }
         }
 
-        // Focus input on load
+        // Initialize threads and focus input
+        async function initThreads() {
+            await loadThreadList();
+            if (threads.length > 0) {
+                // Sort and switch to most recent
+                const sorted = [...threads].sort((a,b) => new Date(b.updated_at) - new Date(a.updated_at));
+                await switchThread(sorted[0].id);
+            }
+        }
+        initThreads();
         messageInput.focus();
     </script>
 </body>
