@@ -60,6 +60,7 @@ type Config struct {
 	Workspace    string     `json:"workspace"`
 	MaxTurns     int        `json:"max_turns"`
 	SystemPrompt string     `json:"system_prompt"`
+	VisionModel  string     `json:"vision_model"`
 }
 
 // primaryProvider returns the first provider, or builds one from legacy config fields
@@ -114,6 +115,7 @@ func defaultConfig() *Config {
 		APIEndpoint: endpoint,
 		Workspace:   ".",
 		MaxTurns:    MaxTurns,
+		VisionModel: "moondream",
 		SystemPrompt: `You are 式神 (Shikigami), a helpful AI assistant with access to powerful tools.
 
 ## Available Tools
@@ -1623,6 +1625,73 @@ func (a *Agent) extractPersonNames(articleURL string, articleText string) string
 	}
 
 	return strings.TrimSpace(chatResp.Choices[0].Message.Content)
+}
+
+// describeImages sends images to a lightweight VLM (e.g. moondream) via Ollama
+// native API and returns text descriptions. This allows non-vision models to
+// understand image content by converting images to text first.
+func describeImages(images []string, visionModel string, ollamaEndpoint string) string {
+	if len(images) == 0 || visionModel == "" {
+		return ""
+	}
+
+	// Strip /v1 suffix to get Ollama native API endpoint
+	baseEndpoint := strings.TrimSuffix(ollamaEndpoint, "/v1")
+
+	var descriptions []string
+	for i, img := range images {
+		// Extract base64 data (remove data URI prefix if present)
+		b64 := img
+		if idx := strings.Index(img, ","); idx >= 0 {
+			b64 = img[idx+1:]
+		}
+
+		reqBody := map[string]interface{}{
+			"model": visionModel,
+			"messages": []map[string]interface{}{
+				{
+					"role":    "user",
+					"content": "この画像を詳細に説明してください。何が写っているか、色、形、テキストなど見えるものを全て記述してください。",
+					"images":  []string{b64},
+				},
+			},
+			"stream": false,
+		}
+
+		body, err := json.Marshal(reqBody)
+		if err != nil {
+			descriptions = append(descriptions, fmt.Sprintf("[画像%d: 変換エラー]", i+1))
+			continue
+		}
+
+		client := &http.Client{Timeout: 60 * time.Second}
+		resp, err := client.Post(baseEndpoint+"/api/chat", "application/json", bytes.NewReader(body))
+		if err != nil {
+			descriptions = append(descriptions, fmt.Sprintf("[画像%d: VLMリクエストエラー: %v]", i+1, err))
+			continue
+		}
+
+		var chatResp struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		}
+		err = json.NewDecoder(resp.Body).Decode(&chatResp)
+		resp.Body.Close()
+		if err != nil {
+			descriptions = append(descriptions, fmt.Sprintf("[画像%d: レスポンス解析エラー]", i+1))
+			continue
+		}
+
+		desc := strings.TrimSpace(chatResp.Message.Content)
+		if desc == "" {
+			descriptions = append(descriptions, fmt.Sprintf("[画像%d: 説明を取得できませんでした]", i+1))
+		} else {
+			descriptions = append(descriptions, fmt.Sprintf("[画像%d の内容: %s]", i+1, desc))
+		}
+	}
+
+	return strings.Join(descriptions, "\n")
 }
 
 func (a *Agent) webImages(targetURL string) (string, error) {
@@ -3749,6 +3818,7 @@ type StatusResponse struct {
 	Providers        []Provider `json:"providers"`
 	DockerAvailable  bool       `json:"docker_available"`
 	DockerImageReady bool       `json:"docker_image_ready"`
+	VisionModel      string     `json:"vision_model,omitempty"`
 }
 
 type SettingsRequest struct {
@@ -4388,6 +4458,7 @@ func (ws *WebServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 		Providers:        ws.config.Providers,
 		DockerAvailable:  isDockerAvailable(),
 		DockerImageReady: isDockerAvailable() && isDockerImageAvailable(),
+		VisionModel:      ws.config.VisionModel,
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
@@ -4468,13 +4539,34 @@ func (ws *WebServer) handleChat(w http.ResponseWriter, r *http.Request) {
 		appendMessageToThread(threadID, msg, toolName)
 	}
 
+	// If images are present and a vision model is configured, convert to text
+	userContent := req.Message
+	userImages := req.Images
+	if len(req.Images) > 0 && ws.config.VisionModel != "" {
+		endpoint := ws.config.primaryProvider().Endpoint
+		imageDesc := describeImages(req.Images, ws.config.VisionModel, endpoint)
+		if imageDesc != "" {
+			if userContent != "" {
+				userContent = userContent + "\n\n" + imageDesc
+			} else {
+				userContent = imageDesc
+			}
+		}
+		userImages = nil
+	}
+
 	userMsg := Message{
 		Role:    "user",
-		Content: req.Message,
-		Images:  req.Images,
+		Content: userContent,
+		Images:  userImages,
 	}
 	agent.messages = append(agent.messages, userMsg)
-	saveMsg(userMsg, "")
+	logMsg := Message{
+		Role:    "user",
+		Content: userContent,
+		Images:  req.Images,
+	}
+	saveMsg(logMsg, "")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
@@ -4600,13 +4692,37 @@ func (ws *WebServer) handleChatStream(w http.ResponseWriter, r *http.Request) {
 		isFirstMessage = true
 	}
 
+	// If images are present and a vision model is configured, convert images to text
+	userContent := req.Message
+	userImages := req.Images
+	if len(req.Images) > 0 && ws.config.VisionModel != "" {
+		sendEvent(StreamEvent{Type: "thinking", Content: "画像を解析中..."})
+		endpoint := ws.config.primaryProvider().Endpoint
+		imageDesc := describeImages(req.Images, ws.config.VisionModel, endpoint)
+		if imageDesc != "" {
+			if userContent != "" {
+				userContent = userContent + "\n\n" + imageDesc
+			} else {
+				userContent = imageDesc
+			}
+		}
+		// Clear images from LLM message since we converted them to text
+		userImages = nil
+	}
+
 	userMsg := Message{
 		Role:    "user",
-		Content: req.Message,
-		Images:  req.Images,
+		Content: userContent,
+		Images:  userImages,
 	}
 	agent.messages = append(agent.messages, userMsg)
-	saveMsg(userMsg, "")
+	// Save original message with images to log (for record keeping)
+	logMsg := Message{
+		Role:    "user",
+		Content: userContent,
+		Images:  req.Images,
+	}
+	saveMsg(logMsg, "")
 
 	// Compress once before the agent loop (not inside chatStream)
 	// This prevents context loss during multi-turn tool calling
@@ -4880,6 +4996,9 @@ func runWeb(config *Config, host string, port int) error {
 	fmt.Printf("siki v%s - 式神 Web GUI\n", Version)
 	pp := config.primaryProvider()
 	fmt.Printf("Backend: %s, Model: %s\n", pp.Backend, pp.Model)
+	if config.VisionModel != "" {
+		fmt.Printf("Vision Model: %s\n", config.VisionModel)
+	}
 	fmt.Printf("API Endpoint: %s\n", pp.Endpoint)
 	if len(config.Providers) > 1 {
 		fmt.Printf("Configured providers: %d\n", len(config.Providers))
@@ -5060,6 +5179,12 @@ func main() {
 			if i+1 < len(args) {
 				config.APIEndpoint = args[i+1]
 				endpointOverridden = true
+				i += 2
+				continue
+			}
+		case "--vision-model":
+			if i+1 < len(args) {
+				config.VisionModel = args[i+1]
 				i += 2
 				continue
 			}
