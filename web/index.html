@@ -292,22 +292,45 @@
         }
 
         .message.thinking {
-            background: rgba(233, 69, 96, 0.08);
-            border: 1px solid rgba(233, 69, 96, 0.25);
+            background: rgba(233, 69, 96, 0.06);
+            border: 1px solid rgba(233, 69, 96, 0.2);
             align-self: flex-start;
             border-bottom-left-radius: 4px;
-            font-size: 0.9rem;
+            font-size: 0.85rem;
             color: var(--text-secondary);
+            padding: 0.5rem 1rem;
+            max-width: 90%;
         }
 
-        .message.thinking::before {
-            content: '💭 Thinking...';
-            display: block;
+        .message.thinking .thinking-header {
+            cursor: pointer;
+            user-select: none;
             font-size: 0.75rem;
             color: var(--accent);
-            margin-bottom: 0.5rem;
             font-weight: 600;
             opacity: 0.8;
+            display: flex;
+            align-items: center;
+            gap: 0.4rem;
+        }
+
+        .message.thinking .thinking-header .toggle-icon {
+            transition: transform 0.2s;
+            font-size: 0.6rem;
+        }
+
+        .message.thinking.collapsed .thinking-header .toggle-icon {
+            transform: rotate(-90deg);
+        }
+
+        .message.thinking .thinking-body {
+            margin-top: 0.5rem;
+            white-space: pre-wrap;
+            line-height: 1.5;
+        }
+
+        .message.thinking.collapsed .thinking-body {
+            display: none;
         }
 
         .message.tool {
@@ -1470,7 +1493,7 @@
         const statusDot = document.getElementById('status-dot');
         const statusText = document.getElementById('status-text');
 
-        let conversationId = Date.now().toString();
+        let conversationId = localStorage.getItem('siki-current-thread') || Date.now().toString();
         let threads = [];
 
         // Auto-resize textarea
@@ -1802,15 +1825,40 @@
             return div;
         }
 
+        function createThinkingMessage() {
+            const div = document.createElement('div');
+            div.className = 'message thinking';
+            div.innerHTML = `<div class="thinking-header" onclick="this.parentElement.classList.toggle('collapsed')"><span class="toggle-icon">&#9660;</span> Thinking...</div><div class="thinking-body"><span class="streaming-cursor"></span></div>`;
+            chatContainer.appendChild(div);
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+            return div;
+        }
+
         function updateStreamingMessage(div, content) {
-            div.innerHTML = renderMarkdown(content) + '<span class="streaming-cursor"></span>';
+            if (div.classList.contains('thinking')) {
+                const body = div.querySelector('.thinking-body');
+                if (body) {
+                    body.innerHTML = renderMarkdown(content) + '<span class="streaming-cursor"></span>';
+                }
+            } else {
+                div.innerHTML = renderMarkdown(content) + '<span class="streaming-cursor"></span>';
+            }
             chatContainer.scrollTop = chatContainer.scrollHeight;
         }
 
         function finalizeStreamingMessage(div, content) {
-            div.innerHTML = renderMarkdown(content);
+            if (div.classList.contains('thinking')) {
+                const body = div.querySelector('.thinking-body');
+                if (body) {
+                    body.innerHTML = renderMarkdown(content);
+                }
+                // Collapse thinking after finalization
+                div.classList.add('collapsed');
+            } else {
+                div.innerHTML = renderMarkdown(content);
+                fetchLinkPreviews(div);
+            }
             chatContainer.scrollTop = chatContainer.scrollHeight;
-            fetchLinkPreviews(div);
         }
 
         // Fetch representative images for URLs in a message element
@@ -1945,6 +1993,7 @@
             if (threadId === conversationId) return;
 
             conversationId = threadId;
+            localStorage.setItem('siki-current-thread', threadId);
             chatContainer.innerHTML = '';
             // Clear search
             document.getElementById('thread-search-input').value = '';
@@ -1958,9 +2007,15 @@
                 if (thread.messages && thread.messages.length > 0) {
                     for (const m of thread.messages) {
                         if (m.role === 'system') continue;
-                        // Skip empty and internal tool_calls markers
+
+                        // Assistant message with tool_calls but no text content
+                        if (m.role === 'assistant' && m.tool_calls && m.tool_calls.length > 0 && !m.content) {
+                            continue; // tool results will be shown individually below
+                        }
+                        // Skip legacy [tool_calls:] text markers
+                        if (m.role === 'assistant' && m.content && m.content.startsWith('[tool_calls:')) continue;
+
                         if (!m.content) continue;
-                        if (m.role === 'assistant' && m.content.startsWith('[tool_calls:')) continue;
 
                         if (m.role === 'tool') {
                             addMessage('tool', m.content, m.tool_name || 'tool');
@@ -1975,6 +2030,13 @@
                                 userDiv.innerHTML += imgHtml;
                             }
                         } else if (m.role === 'assistant') {
+                            // Show thinking if present
+                            if (m.thinking) {
+                                const tDiv = document.createElement('div');
+                                tDiv.className = 'message thinking collapsed';
+                                tDiv.innerHTML = `<div class="thinking-header" onclick="this.parentElement.classList.toggle('collapsed')"><span class="toggle-icon">&#9660;</span> Thinking...</div><div class="thinking-body">${renderMarkdown(m.thinking)}</div>`;
+                                chatContainer.appendChild(tDiv);
+                            }
                             if (m.summarized) {
                                 // Show summarization marker as a collapsible note
                                 const div = document.createElement('div');
@@ -2007,6 +2069,7 @@
             } catch(e) {}
 
             conversationId = newId;
+            localStorage.setItem('siki-current-thread', newId);
             chatContainer.innerHTML = '';
             addMessage('assistant', 'New thread started.');
 
@@ -2172,6 +2235,8 @@
                 const decoder = new TextDecoder();
                 let streamingDiv = null;
                 let fullContent = '';
+                let thinkingDiv = null;
+                let thinkingContent = '';
                 let buffer = '';
                 let hasToolCalls = false;
 
@@ -2191,9 +2256,23 @@
                         try {
                             const event = JSON.parse(data);
 
-                            if (event.type === 'tool_call') {
+                            if (event.type === 'thinking') {
+                                // LLM thinking/reasoning (from <think> tags)
+                                typing.classList.remove('show');
+                                if (!thinkingDiv) {
+                                    thinkingDiv = createThinkingMessage();
+                                }
+                                thinkingContent += event.content;
+                                updateStreamingMessage(thinkingDiv, thinkingContent);
+                            } else if (event.type === 'tool_call') {
                                 // Hide typing indicator on first event
                                 typing.classList.remove('show');
+                                // Finalize any thinking bubble
+                                if (thinkingDiv && thinkingContent) {
+                                    finalizeStreamingMessage(thinkingDiv, thinkingContent);
+                                    thinkingDiv = null;
+                                    thinkingContent = '';
+                                }
                                 // If there was streaming content before tool calls, finalize as "thinking"
                                 if (streamingDiv && fullContent) {
                                     finalizeStreamingMessage(streamingDiv, fullContent);
@@ -2208,14 +2287,29 @@
                             } else if (event.type === 'content') {
                                 // Hide typing indicator on first content
                                 typing.classList.remove('show');
+                                // Finalize any thinking bubble (thinking ended, now content)
+                                if (thinkingDiv && thinkingContent) {
+                                    finalizeStreamingMessage(thinkingDiv, thinkingContent);
+                                    thinkingDiv = null;
+                                    thinkingContent = '';
+                                }
                                 // Streaming content
                                 if (!streamingDiv) {
                                     streamingDiv = createStreamingMessage();
                                 }
                                 fullContent += event.content;
                                 updateStreamingMessage(streamingDiv, fullContent);
+                            } else if (event.type === 'title') {
+                                // Thread title updated by LLM
+                                const t = threads.find(th => th.id === conversationId);
+                                if (t) { t.title = event.result; }
+                                renderThreadList();
                             } else if (event.type === 'done') {
-                                // Finalize
+                                // Finalize thinking
+                                if (thinkingDiv && thinkingContent) {
+                                    finalizeStreamingMessage(thinkingDiv, thinkingContent);
+                                }
+                                // Finalize content
                                 if (streamingDiv) {
                                     finalizeStreamingMessage(streamingDiv, fullContent);
                                 }
@@ -2229,7 +2323,10 @@
                     }
                 }
 
-                // Handle any remaining content
+                // Handle any remaining thinking/content
+                if (thinkingDiv && thinkingContent) {
+                    finalizeStreamingMessage(thinkingDiv, thinkingContent);
+                }
                 if (streamingDiv && fullContent) {
                     finalizeStreamingMessage(streamingDiv, fullContent);
                 }
@@ -2329,9 +2426,20 @@
         async function initThreads() {
             await loadThreadList();
             if (threads.length > 0) {
-                // Sort and switch to most recent
-                const sorted = [...threads].sort((a,b) => new Date(b.updated_at) - new Date(a.updated_at));
-                await switchThread(sorted[0].id);
+                // Try to restore the last viewed thread
+                const savedId = localStorage.getItem('siki-current-thread');
+                const savedThread = savedId && threads.find(t => t.id === savedId);
+                if (savedThread) {
+                    // Force reload by temporarily clearing conversationId
+                    conversationId = '';
+                    await switchThread(savedThread.id);
+                } else {
+                    // Fallback: switch to most recent thread with messages
+                    const sorted = [...threads].sort((a,b) => new Date(b.updated_at) - new Date(a.updated_at));
+                    const target = sorted.find(t => t.message_count > 0) || sorted[0];
+                    conversationId = '';
+                    await switchThread(target.id);
+                }
             }
         }
         initThreads();

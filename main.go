@@ -198,6 +198,15 @@ Examples:
 - User asks about topic A → You answer → User: "もっと" → give more detail on A
 - User uploads a file → User: "これを処理して" → process that file
 
+## Orchestration Pattern (重要)
+あなたはオーケストレーターとして動作する。ユーザーの質問を受けたら:
+1. **まず情報収集**: 必要なツールを呼び出して情報を集める。回答を書き始めるな。
+2. **すべての結果を確認**: ツール実行結果がすべて揃うまで最終回答を生成しない。
+3. **統合して回答**: 収集した情報をすべて踏まえて、正確で包括的な回答を提示する。
+
+ツールを使うべき場面では、必ずツールを先に呼び出してから回答すること。
+ツール結果なしに推測で回答してはならない。
+
 ## Other Rules
 - For news/current events: use web_search
 - For relationships/architecture: use diagram
@@ -1970,22 +1979,25 @@ func stopDockerContainer() {
 }
 
 type Thread struct {
-	ID        string          `json:"id"`
-	Title     string          `json:"title"`
-	CreatedAt time.Time       `json:"created_at"`
-	UpdatedAt time.Time       `json:"updated_at"`
-	Messages  []ThreadMessage `json:"messages"`
-	Summary   string          `json:"summary,omitempty"`
+	ID           string          `json:"id"`
+	Title        string          `json:"title"`
+	CreatedAt    time.Time       `json:"created_at"`
+	UpdatedAt    time.Time       `json:"updated_at"`
+	Messages     []ThreadMessage `json:"messages,omitempty"` // omitempty: metadata JSON has no messages
+	MessageCount int             `json:"message_count,omitempty"`
+	Summary      string          `json:"summary,omitempty"`
 }
 
 type ThreadMessage struct {
-	Role       string   `json:"role"`
-	Content    string   `json:"content"`
-	Images     []string `json:"images,omitempty"`
-	ToolCallID string   `json:"tool_call_id,omitempty"`
-	ToolName   string   `json:"tool_name,omitempty"`
-	Summarized bool     `json:"summarized,omitempty"`
-	Timestamp  int64    `json:"timestamp"`
+	Role       string     `json:"role"`
+	Content    string     `json:"content"`
+	Thinking   string     `json:"thinking,omitempty"`
+	Images     []string   `json:"images,omitempty"`
+	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string     `json:"tool_call_id,omitempty"`
+	ToolName   string     `json:"tool_name,omitempty"`
+	Summarized bool       `json:"summarized,omitempty"`
+	Timestamp  int64      `json:"timestamp"`
 }
 
 type ThreadListItem struct {
@@ -2009,17 +2021,100 @@ func initThreadDir() error {
 	return os.MkdirAll(threadDir, 0755)
 }
 
-func saveThread(t *Thread) error {
+// saveThreadMeta saves only the thread metadata (no messages) to {id}.json.
+// Messages are stored separately in {id}.jsonl (append-only).
+func saveThreadMeta(t *Thread) error {
 	if err := initThreadDir(); err != nil {
 		return err
 	}
-	data, err := json.MarshalIndent(t, "", "  ")
+	meta := Thread{
+		ID:           t.ID,
+		Title:        t.Title,
+		CreatedAt:    t.CreatedAt,
+		UpdatedAt:    t.UpdatedAt,
+		MessageCount: t.MessageCount,
+		Summary:      t.Summary,
+	}
+	data, err := json.MarshalIndent(meta, "", "  ")
 	if err != nil {
 		return err
 	}
 	return os.WriteFile(filepath.Join(threadDir, t.ID+".json"), data, 0644)
 }
 
+// saveThread saves metadata; kept as alias for compatibility with callers that
+// don't need to write messages (e.g. handleThreads POST, rename).
+func saveThread(t *Thread) error {
+	return saveThreadMeta(t)
+}
+
+// appendToLog appends a single ThreadMessage as a JSON line to {id}.jsonl.
+func appendToLog(threadID string, tm ThreadMessage) error {
+	if err := initThreadDir(); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(filepath.Join(threadDir, threadID+".jsonl"),
+		os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	data, err := json.Marshal(tm)
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(f, "%s\n", data)
+	return err
+}
+
+// loadThreadMessages reads all messages from {id}.jsonl.
+func loadThreadMessages(id string) ([]ThreadMessage, error) {
+	if err := initThreadDir(); err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(filepath.Join(threadDir, id+".jsonl"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var msgs []ThreadMessage
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var tm ThreadMessage
+		if err := json.Unmarshal([]byte(line), &tm); err != nil {
+			fmt.Printf("[siki] Warning: skipping malformed JSONL line: %v\n", err)
+			continue
+		}
+		msgs = append(msgs, tm)
+	}
+	return msgs, nil
+}
+
+// loadThreadMeta loads only metadata from {id}.json (no messages).
+// Fast — used for title updates, listing, etc.
+func loadThreadMeta(id string) (*Thread, error) {
+	if err := initThreadDir(); err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(filepath.Join(threadDir, id+".json"))
+	if err != nil {
+		return nil, err
+	}
+	var t Thread
+	if err := json.Unmarshal(data, &t); err != nil {
+		return nil, err
+	}
+	t.Messages = nil // don't return old-format messages
+	return &t, nil
+}
+
+// loadThread loads metadata from {id}.json and messages from {id}.jsonl.
+// Backward compatible: if the .json file contains messages (old format), migrate them.
 func loadThread(id string) (*Thread, error) {
 	if err := initThreadDir(); err != nil {
 		return nil, err
@@ -2031,6 +2126,46 @@ func loadThread(id string) (*Thread, error) {
 	var t Thread
 	if err := json.Unmarshal(data, &t); err != nil {
 		return nil, err
+	}
+
+	// Backward compatibility: if .json has messages (old format), migrate to .jsonl
+	if len(t.Messages) > 0 {
+		jsonlPath := filepath.Join(threadDir, id+".jsonl")
+		if _, err := os.Stat(jsonlPath); os.IsNotExist(err) {
+			fmt.Printf("[siki] Migrating thread %s: %d messages → JSONL\n", id, len(t.Messages))
+			for _, tm := range t.Messages {
+				if err := appendToLog(id, tm); err != nil {
+					return &t, nil // return with old messages on migration error
+				}
+			}
+		}
+		// Fix "New thread" / "New conversation" titles during migration
+		if t.Title == "New thread" || t.Title == "New conversation" || t.Title == "" {
+			for _, tm := range t.Messages {
+				if tm.Role == "user" && tm.Content != "" {
+					title := tm.Content
+					if len(title) > 50 {
+						title = title[:50] + "..."
+					}
+					t.Title = title
+					break
+				}
+			}
+		}
+		// Update metadata without messages
+		t.MessageCount = len(t.Messages)
+		t.Messages = nil
+		saveThreadMeta(&t)
+	}
+
+	// Load messages from JSONL
+	msgs, err := loadThreadMessages(id)
+	if err != nil {
+		return &t, nil
+	}
+	t.Messages = msgs
+	if t.MessageCount == 0 {
+		t.MessageCount = len(msgs)
 	}
 	return &t, nil
 }
@@ -2048,9 +2183,35 @@ func listThreads() ([]ThreadListItem, error) {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
 			continue
 		}
-		id := strings.TrimSuffix(entry.Name(), ".json")
-		t, err := loadThread(id)
+		// Skip .jsonl files (only process .json metadata)
+		name := entry.Name()
+		if strings.HasSuffix(name, ".jsonl") {
+			continue
+		}
+		id := strings.TrimSuffix(name, ".json")
+		// Check if this is old format (has messages in .json, no .jsonl yet)
+		jsonlPath := filepath.Join(threadDir, id+".jsonl")
+		if _, err := os.Stat(jsonlPath); os.IsNotExist(err) {
+			// Might be old format — do a full load to trigger migration
+			if t, err := loadThread(id); err == nil {
+				items = append(items, ThreadListItem{
+					ID:           t.ID,
+					Title:        t.Title,
+					CreatedAt:    t.CreatedAt,
+					UpdatedAt:    t.UpdatedAt,
+					MessageCount: t.MessageCount,
+					Summary:      t.Summary,
+				})
+			}
+			continue
+		}
+		// Read metadata only (fast, no message loading)
+		data, err := os.ReadFile(filepath.Join(threadDir, name))
 		if err != nil {
+			continue
+		}
+		var t Thread
+		if err := json.Unmarshal(data, &t); err != nil {
 			continue
 		}
 		items = append(items, ThreadListItem{
@@ -2058,7 +2219,7 @@ func listThreads() ([]ThreadListItem, error) {
 			Title:        t.Title,
 			CreatedAt:    t.CreatedAt,
 			UpdatedAt:    t.UpdatedAt,
-			MessageCount: len(t.Messages),
+			MessageCount: t.MessageCount,
 			Summary:      t.Summary,
 		})
 	}
@@ -2069,6 +2230,8 @@ func deleteThread(id string) error {
 	if err := initThreadDir(); err != nil {
 		return err
 	}
+	// Remove both metadata and message log
+	os.Remove(filepath.Join(threadDir, id+".jsonl"))
 	return os.Remove(filepath.Join(threadDir, id+".json"))
 }
 
@@ -2086,66 +2249,137 @@ func truncateString(s string, maxLen int) string {
 	return s[:maxLen] + "..."
 }
 
-func saveMessagesToThread(threadID string, newMsgs []Message, userMessage string) {
-	thread, err := loadThread(threadID)
+// generateThreadTitle uses the LLM to create a concise thread title from the
+// first user message and assistant response. Runs asynchronously.
+func generateThreadTitle(config *Config, threadID, userMessage, assistantResponse string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	prompt := fmt.Sprintf("以下の会話の内容を表す短いタイトル（15文字以内）を1つだけ出力してください。説明や記号は不要です。\n\nユーザー: %s", userMessage)
+	if len(assistantResponse) > 300 {
+		assistantResponse = assistantResponse[:300]
+	}
+	if assistantResponse != "" {
+		prompt += fmt.Sprintf("\nアシスタント: %s", assistantResponse)
+	}
+
+	messages := []Message{
+		{Role: "user", Content: prompt},
+	}
+
+	req := ChatRequest{
+		Model:       config.primaryProvider().Model,
+		Messages:    messages,
+		MaxTokens:   50,
+		Temperature: 0.3,
+	}
+
+	body, err := json.Marshal(req)
 	if err != nil {
-		// Create new thread
-		title := userMessage
-		if len(title) > 50 {
-			title = title[:50] + "..."
-		}
-		thread = &Thread{
+		return
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, "POST",
+		config.primaryProvider().Endpoint+"/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		return
+	}
+	setProviderHeaders(httpReq, config.primaryProvider())
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return
+	}
+
+	var chatResp ChatResponse
+	if err := json.NewDecoder(resp.Body).Decode(&chatResp); err != nil {
+		return
+	}
+	if len(chatResp.Choices) == 0 {
+		return
+	}
+
+	title := strings.TrimSpace(chatResp.Choices[0].Message.Content)
+	// Clean up: remove quotes, periods, etc.
+	title = strings.Trim(title, "\"'「」『』。.")
+	if title == "" {
+		return
+	}
+	if len(title) > 50 {
+		title = title[:50]
+	}
+
+	thread, err := loadThreadMeta(threadID)
+	if err != nil {
+		return
+	}
+	thread.Title = title
+	thread.UpdatedAt = time.Now()
+	saveThreadMeta(thread)
+	fmt.Printf("[siki] Thread %s titled: %s\n", threadID, title)
+}
+
+
+// appendMessageToThread appends a single message to the thread log (JSONL, append-only).
+// Also updates thread metadata (title, timestamps, message count).
+// toolNameHint is used for tool result messages to record which tool produced the result.
+func appendMessageToThread(threadID string, msg Message, toolNameHint string) {
+	if msg.Role == "system" {
+		return
+	}
+
+	tm := ThreadMessage{
+		Role:       msg.Role,
+		Content:    msg.Content,
+		Thinking:   msg.Thinking,
+		Images:     msg.Images,
+		ToolCalls:  msg.ToolCalls,
+		ToolCallID: msg.ToolCallID,
+		Timestamp:  time.Now().Unix(),
+	}
+	if msg.Role == "assistant" && (strings.HasPrefix(msg.Content, "[以前の会話の要約]") || strings.HasPrefix(msg.Content, "[Previous conversation summary]")) {
+		tm.Summarized = true
+	}
+	if msg.Role == "tool" && toolNameHint != "" {
+		tm.ToolName = toolNameHint
+	}
+
+	// Append message to JSONL log (append-only, never rewrite)
+	if err := appendToLog(threadID, tm); err != nil {
+		fmt.Printf("[siki] Warning: failed to append message to log %s: %v\n", threadID, err)
+		return
+	}
+
+	// Update thread metadata
+	metaPath := filepath.Join(threadDir, threadID+".json")
+	var thread Thread
+	if data, err := os.ReadFile(metaPath); err == nil {
+		json.Unmarshal(data, &thread)
+	} else {
+		// Thread metadata doesn't exist yet — create it
+		thread = Thread{
 			ID:        threadID,
-			Title:     title,
 			CreatedAt: time.Now(),
 		}
 	}
 
+	// Set title from first user message
+	if msg.Role == "user" && thread.MessageCount == 0 {
+		title := msg.Content
+		if len(title) > 50 {
+			title = title[:50] + "..."
+		}
+		thread.Title = title
+	}
+	thread.MessageCount++
 	thread.UpdatedAt = time.Now()
-
-	// Build mapping from ToolCallID → ToolName from assistant messages
-	toolNameMap := make(map[string]string)
-	for _, m := range newMsgs {
-		if m.Role == "assistant" && len(m.ToolCalls) > 0 {
-			for _, tc := range m.ToolCalls {
-				toolNameMap[tc.ID] = tc.Function.Name
-			}
-		}
-	}
-
-	for _, m := range newMsgs {
-		if m.Role == "system" {
-			continue
-		}
-		tm := ThreadMessage{
-			Role:       m.Role,
-			Content:    m.Content,
-			Images:     m.Images,
-			ToolCallID: m.ToolCallID,
-			Timestamp:  time.Now().Unix(),
-		}
-		// Mark summarization markers with Summarized flag
-		if m.Role == "assistant" && (strings.HasPrefix(m.Content, "[以前の会話の要約]") || strings.HasPrefix(m.Content, "[Previous conversation summary]")) {
-			tm.Summarized = true
-		}
-		// For tool results, look up the tool name from the preceding assistant tool_calls
-		if m.Role == "tool" && m.ToolCallID != "" {
-			tm.ToolName = toolNameMap[m.ToolCallID]
-		}
-		// For assistant messages that only have tool_calls and no text content,
-		// store a summary of which tools were called
-		if m.Role == "assistant" && m.Content == "" && len(m.ToolCalls) > 0 {
-			var names []string
-			for _, tc := range m.ToolCalls {
-				names = append(names, tc.Function.Name)
-			}
-			tm.Content = "[tool_calls: " + strings.Join(names, ", ") + "]"
-		}
-		thread.Messages = append(thread.Messages, tm)
-	}
-	if err := saveThread(thread); err != nil {
-		fmt.Printf("[siki] Warning: failed to save thread %s: %v\n", threadID, err)
-	}
+	saveThreadMeta(&thread)
 }
 
 func initPlaygroundDir() error {
@@ -2337,6 +2571,7 @@ func (a *Agent) resolvePath(path string) string {
 type Message struct {
 	Role       string     `json:"-"`
 	Content    string     `json:"-"`
+	Thinking   string     `json:"-"` // <think> content, saved to log but excluded from LLM context
 	Images     []string   `json:"-"` // base64 data URIs for vision
 	ToolCalls  []ToolCall `json:"-"`
 	ToolCallID string     `json:"-"`
@@ -2457,7 +2692,7 @@ func (a *Agent) checkServerHealth() error {
 }
 
 func (a *Agent) chat(ctx context.Context) (*Message, error) {
-	return a.chatStream(ctx, nil)
+	return a.chatStream(ctx, StreamCallbacks{})
 }
 
 // validateResponse checks if the response is relevant to the user's question
@@ -2521,13 +2756,15 @@ Be lenient - only flag clearly irrelevant or nonsensical responses.`},
 
 // compressConversation summarizes older messages to reduce context size
 func (a *Agent) compressConversation(ctx context.Context) {
-	// Keep system message + last 6 messages, compress everything in between
-	if len(a.messages) <= 8 {
+	// Keep system message + last 60 messages, compress everything older
+	// Model has 64k context so we can keep a lot of history
+	const keepRecent = 60
+	if len(a.messages) <= keepRecent+2 {
 		return
 	}
 
-	// Messages to compress: from index 1 (after system) to len-6
-	compressEnd := len(a.messages) - 6
+	// Messages to compress: from index 1 (after system) to len-keepRecent
+	compressEnd := len(a.messages) - keepRecent
 	if compressEnd <= 1 {
 		return
 	}
@@ -2535,31 +2772,42 @@ func (a *Agent) compressConversation(ctx context.Context) {
 	var historyText strings.Builder
 	for i := 1; i < compressEnd; i++ {
 		msg := a.messages[i]
-		if msg.Role == "tool" {
-			continue // skip tool results for compression
+		content := msg.Content
+		if len(content) > 1000 {
+			content = content[:1000] + "..."
 		}
-		historyText.WriteString(fmt.Sprintf("[%s]: %s\n", msg.Role, msg.Content))
+		switch msg.Role {
+		case "user":
+			historyText.WriteString(fmt.Sprintf("[user]: %s\n", content))
+		case "assistant":
+			historyText.WriteString(fmt.Sprintf("[assistant]: %s\n", content))
+		case "tool":
+			historyText.WriteString(fmt.Sprintf("[tool result]: %s\n", content))
+		}
 	}
 
 	if historyText.Len() == 0 {
 		return
 	}
 
-	// Truncate history text if too long
 	history := historyText.String()
-	if len(history) > 10000 {
-		history = history[:10000]
+	if len(history) > 30000 {
+		history = history[:30000]
 	}
 
 	compressMessages := []Message{
-		{Role: "system", Content: "会話履歴を簡潔に要約してください。重要な事実、ユーザーの質問の要点、AIの回答の要点を保持してください。200文字以内で要約してください。"},
+		{Role: "system", Content: `以下の会話履歴を要約してください。以下を必ず保持すること:
+- ユーザーが質問した内容とその回答の要点
+- ツールで取得した重要な情報（検索結果、ウェブページの内容など）
+- 会話の流れと現在のトピック
+2000文字以内で要約してください。`},
 		{Role: "user", Content: history},
 	}
 
 	req := ChatRequest{
 		Model:       a.config.primaryProvider().Model,
 		Messages:    compressMessages,
-		MaxTokens:   300,
+		MaxTokens:   2500,
 		Temperature: 0.1,
 		Stream:      false,
 	}
@@ -2585,7 +2833,7 @@ func (a *Agent) compressConversation(ctx context.Context) {
 	}
 
 	summary := chatResp.Choices[0].Message.Content
-	fmt.Printf("[siki] Compressed %d messages into summary\n", compressEnd-1)
+	fmt.Printf("[siki] Compressed %d messages into summary (%d chars)\n", compressEnd-1, len(summary))
 
 	// Rebuild messages: system + summary + recent messages
 	newMessages := []Message{a.messages[0]}
@@ -2706,12 +2954,20 @@ func (a *Agent) searchConversation(query string) string {
 		if m.Summarized {
 			continue
 		}
+		if m.Role == "assistant" && m.Content == "" && len(m.ToolCalls) > 0 {
+			continue
+		}
 		if m.Role == "assistant" && strings.HasPrefix(m.Content, "[tool_calls:") {
 			continue
 		}
-		contentLower := strings.ToLower(m.Content)
+		searchContent := m.Content
+		roleLabel := m.Role
+		if m.Role == "tool" && m.ToolName != "" {
+			roleLabel = "tool:" + m.ToolName
+		}
+		contentLower := strings.ToLower(searchContent)
 		if strings.Contains(contentLower, queryLower) {
-			snippet := m.Content
+			snippet := searchContent
 			if len(snippet) > 300 {
 				idx := strings.Index(contentLower, queryLower)
 				start := idx - 100
@@ -2725,7 +2981,7 @@ func (a *Agent) searchConversation(query string) string {
 				snippet = "..." + snippet[start:end] + "..."
 			}
 			ts := time.Unix(m.Timestamp, 0).Format("2006-01-02 15:04")
-			results = append(results, fmt.Sprintf("- [#%d %s %s]: %s", i+1, ts, m.Role, snippet))
+			results = append(results, fmt.Sprintf("- [#%d %s %s]: %s", i+1, ts, roleLabel, snippet))
 		}
 	}
 
@@ -2763,6 +3019,9 @@ func (a *Agent) searchThreadLogForContext(query string) string {
 		if m.Summarized || m.Role == "system" {
 			continue
 		}
+		if m.Role == "assistant" && m.Content == "" && len(m.ToolCalls) > 0 {
+			continue
+		}
 		if m.Role == "assistant" && strings.HasPrefix(m.Content, "[tool_calls:") {
 			continue
 		}
@@ -2778,12 +3037,16 @@ func (a *Agent) searchThreadLogForContext(query string) string {
 			continue
 		}
 
+		roleLabel := m.Role
+		if m.Role == "tool" && m.ToolName != "" {
+			roleLabel = "tool:" + m.ToolName
+		}
 		snippet := m.Content
 		if len(snippet) > 500 {
 			snippet = snippet[:500] + "..."
 		}
 		ts := time.Unix(m.Timestamp, 0).Format("01/02 15:04")
-		hit := fmt.Sprintf("[%s %s]: %s", ts, m.Role, snippet)
+		hit := fmt.Sprintf("[%s %s]: %s", ts, roleLabel, snippet)
 		totalChars += len(hit)
 		if totalChars > maxChars {
 			break
@@ -2870,13 +3133,20 @@ func (a *Agent) recallContext(query string) (string, error) {
 		if m.Summarized {
 			continue
 		}
+		if m.Role == "assistant" && m.Content == "" && len(m.ToolCalls) > 0 {
+			continue
+		}
 		if m.Role == "assistant" && strings.HasPrefix(m.Content, "[tool_calls:") {
 			continue
 		}
 		if strings.Contains(strings.ToLower(m.Content), queryLower) {
+			roleLabel := m.Role
+			if m.Role == "tool" && m.ToolName != "" {
+				roleLabel = "tool:" + m.ToolName
+			}
 			ts := time.Unix(m.Timestamp, 0).Format("2006-01-02 15:04")
 			content := truncateString(m.Content, 500)
-			matches = append(matches, fmt.Sprintf("[#%d %s %s]: %s", i+1, ts, m.Role, content))
+			matches = append(matches, fmt.Sprintf("[#%d %s %s]: %s", i+1, ts, roleLabel, content))
 		}
 	}
 	if len(matches) == 0 {
@@ -2919,9 +3189,10 @@ func (a *Agent) searchAllThreads(query string) (string, error) {
 	return fmt.Sprintf("Found matches in %d threads:\n\n%s", len(results), strings.Join(results, "\n\n---\n")), nil
 }
 
-func (a *Agent) chatStream(ctx context.Context, onContent func(string)) (*Message, error) {
-	// Auto-compress conversation if it's getting long
-	a.compressConversation(ctx)
+func (a *Agent) chatStream(ctx context.Context, cb StreamCallbacks) (*Message, error) {
+	// NOTE: compression is NOT called here. It is called once per user message
+	// in handleChatStream, before the agent loop starts. This prevents context
+	// loss during multi-turn tool-calling loops.
 
 	// Convert tools to OpenAI format
 	var toolDefs []map[string]interface{}
@@ -2936,6 +3207,7 @@ func (a *Agent) chatStream(ctx context.Context, onContent func(string)) (*Messag
 		})
 	}
 
+	streaming := cb.OnContent != nil || cb.OnThinking != nil
 	req := ChatRequest{
 		Model:       a.config.primaryProvider().Model,
 		Messages:    a.messages,
@@ -2943,7 +3215,7 @@ func (a *Agent) chatStream(ctx context.Context, onContent func(string)) (*Messag
 		ToolChoice:  "auto",
 		MaxTokens:   4096,
 		Temperature: 0.7,
-		Stream:      onContent != nil,
+		Stream:      streaming,
 	}
 
 	body, err := json.Marshal(req)
@@ -2971,8 +3243,8 @@ func (a *Agent) chatStream(ctx context.Context, onContent func(string)) (*Messag
 	}
 
 	// Handle streaming response
-	if onContent != nil {
-		return a.handleStreamingResponse(resp.Body, onContent)
+	if streaming {
+		return a.handleStreamingResponse(resp.Body, cb)
 	}
 
 	var chatResp ChatResponse
@@ -3007,11 +3279,41 @@ type StreamResponse struct {
 	Choices []StreamChoice `json:"choices"`
 }
 
-func (a *Agent) handleStreamingResponse(body io.Reader, onContent func(string)) (*Message, error) {
+// StreamCallbacks provides callbacks for different types of streaming content.
+type StreamCallbacks struct {
+	OnContent  func(string) // regular content chunks
+	OnThinking func(string) // thinking/reasoning chunks (inside <think> tags)
+}
+
+func (a *Agent) handleStreamingResponse(body io.Reader, cb StreamCallbacks) (*Message, error) {
 	reader := bufio.NewReader(body)
 	var fullContent strings.Builder
+	var fullThinking strings.Builder
 	var toolCalls []ToolCall
 	toolCallArgs := make(map[int]string) // index -> accumulated arguments
+	inThink := false                     // tracking <think> state
+
+	// Buffer for detecting partial <think> / </think> tags across chunks
+	var pendingBuf string
+
+	flushContent := func(s string) {
+		if s == "" {
+			return
+		}
+		fullContent.WriteString(s)
+		if cb.OnContent != nil {
+			cb.OnContent(s)
+		}
+	}
+	flushThinking := func(s string) {
+		if s == "" {
+			return
+		}
+		fullThinking.WriteString(s)
+		if cb.OnThinking != nil {
+			cb.OnThinking(s)
+		}
+	}
 
 	for {
 		line, err := reader.ReadString('\n')
@@ -3043,10 +3345,42 @@ func (a *Agent) handleStreamingResponse(body io.Reader, onContent func(string)) 
 
 		delta := streamResp.Choices[0].Delta
 
-		// Handle content
+		// Handle content — route to thinking or content based on <think> tags
 		if delta.Content != "" {
-			fullContent.WriteString(delta.Content)
-			onContent(delta.Content)
+			chunk := pendingBuf + delta.Content
+			pendingBuf = ""
+
+			for len(chunk) > 0 {
+				if inThink {
+					// Inside <think> — look for </think>
+					if idx := strings.Index(chunk, "</think>"); idx != -1 {
+						flushThinking(chunk[:idx])
+						chunk = chunk[idx+8:]
+						inThink = false
+					} else if strings.Contains("</think>"[:min(len(chunk), 8)], chunk[max(0, len(chunk)-7):]) {
+						// Possible partial </think> at end of chunk
+						pendingBuf = chunk
+						chunk = ""
+					} else {
+						flushThinking(chunk)
+						chunk = ""
+					}
+				} else {
+					// Outside <think> — look for <think>
+					if idx := strings.Index(chunk, "<think>"); idx != -1 {
+						flushContent(chunk[:idx])
+						chunk = chunk[idx+7:]
+						inThink = true
+					} else if len(chunk) >= 1 && strings.HasPrefix("<think>", chunk[max(0, len(chunk)-6):]) {
+						// Possible partial <think> at end of chunk
+						pendingBuf = chunk
+						chunk = ""
+					} else {
+						flushContent(chunk)
+						chunk = ""
+					}
+				}
+			}
 		}
 
 		// Handle tool calls
@@ -3077,6 +3411,15 @@ func (a *Agent) handleStreamingResponse(body io.Reader, onContent func(string)) 
 		}
 	}
 
+	// Flush any remaining pending buffer
+	if pendingBuf != "" {
+		if inThink {
+			flushThinking(pendingBuf)
+		} else {
+			flushContent(pendingBuf)
+		}
+	}
+
 	// Finalize tool call arguments
 	for idx, args := range toolCallArgs {
 		if idx < len(toolCalls) {
@@ -3087,6 +3430,7 @@ func (a *Agent) handleStreamingResponse(body io.Reader, onContent func(string)) 
 	return &Message{
 		Role:      "assistant",
 		Content:   fullContent.String(),
+		Thinking:  fullThinking.String(),
 		ToolCalls: toolCalls,
 	}, nil
 }
@@ -3495,14 +3839,15 @@ func (ws *WebServer) getOrCreateAgent(convID string) *Agent {
 	// Build LLM context from thread log (log file itself is never modified)
 	thread, err := loadThread(convID)
 	if err == nil && len(thread.Messages) > 0 {
-		const recentCount = 10
-		// Filter out internal markers for LLM context
+		const recentCount = 60
+		// Filter out summarization markers
 		var contextMsgs []ThreadMessage
 		for _, tm := range thread.Messages {
 			if tm.Summarized {
 				continue
 			}
-			if tm.Role == "assistant" && strings.HasPrefix(tm.Content, "[tool_calls:") {
+			// Skip legacy [tool_calls:] text markers (old format without ToolCalls field)
+			if tm.Role == "assistant" && strings.HasPrefix(tm.Content, "[tool_calls:") && len(tm.ToolCalls) == 0 {
 				continue
 			}
 			contextMsgs = append(contextMsgs, tm)
@@ -3513,7 +3858,7 @@ func (ws *WebServer) getOrCreateAgent(convID string) *Agent {
 			for _, tm := range contextMsgs {
 				agent.messages = append(agent.messages, Message{
 					Role: tm.Role, Content: tm.Content,
-					Images: tm.Images, ToolCallID: tm.ToolCallID,
+					Images: tm.Images, ToolCalls: tm.ToolCalls, ToolCallID: tm.ToolCallID,
 				})
 			}
 		} else {
@@ -3523,14 +3868,30 @@ func (ws *WebServer) getOrCreateAgent(convID string) *Agent {
 			var digest strings.Builder
 			for _, tm := range olderMsgs {
 				if tm.Role == "tool" {
-					continue // skip tool results in digest for brevity
+					// Include tool results in digest with tool name
+					toolLabel := tm.ToolName
+					if toolLabel == "" {
+						toolLabel = "tool"
+					}
+					line := truncateString(tm.Content, 800)
+					digest.WriteString(fmt.Sprintf("[tool result (%s)]: %s\n", toolLabel, line))
+					continue
 				}
-				line := truncateString(tm.Content, 200)
+				if tm.Role == "assistant" && len(tm.ToolCalls) > 0 && tm.Content == "" {
+					// Summarize tool calls in digest
+					var names []string
+					for _, tc := range tm.ToolCalls {
+						names = append(names, tc.Function.Name)
+					}
+					digest.WriteString(fmt.Sprintf("[assistant → tool calls: %s]\n", strings.Join(names, ", ")))
+					continue
+				}
+				line := truncateString(tm.Content, 800)
 				digest.WriteString(fmt.Sprintf("[%s]: %s\n", tm.Role, line))
 			}
 			digestText := digest.String()
-			if len(digestText) > 6000 {
-				digestText = digestText[:6000] + "\n...(older messages omitted)"
+			if len(digestText) > 20000 {
+				digestText = digestText[:20000] + "\n...(older messages omitted)"
 			}
 			if digestText != "" {
 				agent.messages = append(agent.messages, Message{
@@ -3539,12 +3900,12 @@ func (ws *WebServer) getOrCreateAgent(convID string) *Agent {
 				})
 			}
 
-			// Load recent messages directly
+			// Load recent messages directly (with proper ToolCalls for API compatibility)
 			recentMsgs := contextMsgs[len(contextMsgs)-recentCount:]
 			for _, tm := range recentMsgs {
 				agent.messages = append(agent.messages, Message{
 					Role: tm.Role, Content: tm.Content,
-					Images: tm.Images, ToolCallID: tm.ToolCallID,
+					Images: tm.Images, ToolCalls: tm.ToolCalls, ToolCallID: tm.ToolCallID,
 				})
 			}
 		}
@@ -3943,14 +4304,14 @@ func (ws *WebServer) handleThreads(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		t, err := loadThread(threadID)
+		t, err := loadThreadMeta(threadID)
 		if err != nil {
 			http.Error(w, "Thread not found", http.StatusNotFound)
 			return
 		}
 		t.Title = req.Title
 		t.UpdatedAt = time.Now()
-		if err := saveThread(t); err != nil {
+		if err := saveThreadMeta(t); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -4046,9 +4407,10 @@ func (ws *WebServer) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	agent := ws.getOrCreateAgent(req.ConversationID)
-
-	// Collect new messages independently from agent.messages
-	var newMessages []Message
+	threadID := req.ConversationID
+	saveMsg := func(msg Message, toolName string) {
+		appendMessageToThread(threadID, msg, toolName)
+	}
 
 	userMsg := Message{
 		Role:    "user",
@@ -4056,7 +4418,7 @@ func (ws *WebServer) handleChat(w http.ResponseWriter, r *http.Request) {
 		Images:  req.Images,
 	}
 	agent.messages = append(agent.messages, userMsg)
-	newMessages = append(newMessages, userMsg)
+	saveMsg(userMsg, "")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
@@ -4074,7 +4436,7 @@ func (ws *WebServer) handleChat(w http.ResponseWriter, r *http.Request) {
 		}
 
 		agent.messages = append(agent.messages, *response)
-		newMessages = append(newMessages, *response)
+		saveMsg(*response, "")
 
 		if len(response.ToolCalls) == 0 {
 			apiResp.Response = response.Content
@@ -4091,7 +4453,7 @@ func (ws *WebServer) handleChat(w http.ResponseWriter, r *http.Request) {
 					ToolCallID: tc.ID,
 				}
 				agent.messages = append(agent.messages, toolMsg)
-				newMessages = append(newMessages, toolMsg)
+				saveMsg(toolMsg, tc.Function.Name)
 				apiResp.ToolCalls = append(apiResp.ToolCalls, ToolCallResult{
 					Name:   tc.Function.Name,
 					Result: fmt.Sprintf("Error: %v", err),
@@ -4104,7 +4466,6 @@ func (ws *WebServer) handleChat(w http.ResponseWriter, r *http.Request) {
 				result = fmt.Sprintf("Error: %v", err)
 			}
 
-			// Truncate very long results for display
 			displayResult := result
 			if len(displayResult) > 2000 {
 				displayResult = displayResult[:2000] + "\n... (truncated)"
@@ -4121,13 +4482,8 @@ func (ws *WebServer) handleChat(w http.ResponseWriter, r *http.Request) {
 				ToolCallID: tc.ID,
 			}
 			agent.messages = append(agent.messages, toolMsg)
-			newMessages = append(newMessages, toolMsg)
+			saveMsg(toolMsg, tc.Function.Name)
 		}
-	}
-
-	// Save new messages to thread (unaffected by compression)
-	if len(newMessages) > 0 {
-		saveMessagesToThread(req.ConversationID, newMessages, req.Message)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -4176,9 +4532,17 @@ func (ws *WebServer) handleChatStream(w http.ResponseWriter, r *http.Request) {
 
 	agent := ws.getOrCreateAgent(req.ConversationID)
 
-	// Collect new messages independently from agent.messages
-	// so that conversation compression doesn't affect what gets saved to thread
-	var newMessages []Message
+	// Helper: save a message to thread log immediately
+	threadID := req.ConversationID
+	saveMsg := func(msg Message, toolName string) {
+		appendMessageToThread(threadID, msg, toolName)
+	}
+
+	// Check if this is the first user message (for title generation later)
+	isFirstMessage := false
+	if meta, err := loadThreadMeta(threadID); err != nil || meta.MessageCount == 0 {
+		isFirstMessage = true
+	}
 
 	userMsg := Message{
 		Role:    "user",
@@ -4186,137 +4550,106 @@ func (ws *WebServer) handleChatStream(w http.ResponseWriter, r *http.Request) {
 		Images:  req.Images,
 	}
 	agent.messages = append(agent.messages, userMsg)
-	newMessages = append(newMessages, userMsg)
+	saveMsg(userMsg, "")
 
-	const maxRetries = 2
+	// Compress once before the agent loop (not inside chatStream)
+	// This prevents context loss during multi-turn tool calling
+	{
+		compressCtx, compressCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		agent.compressConversation(compressCtx)
+		compressCancel()
+	}
 
-	for retry := 0; retry <= maxRetries; retry++ {
-		ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
-		var fullResponse string
-		var hitTimeout bool
+	var lastAssistantReply string
 
-		// Agent loop
-		for turn := 0; turn < ws.config.MaxTurns; turn++ {
-			// Try streaming first
-			response, err := agent.chatStream(ctx, func(content string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	var hitTimeout bool
+
+	// Agent loop: stream content + tool events, save each message in real-time
+	for turn := 0; turn < ws.config.MaxTurns; turn++ {
+		response, err := agent.chatStream(ctx, StreamCallbacks{
+			OnContent: func(content string) {
 				sendEvent(StreamEvent{Type: "content", Content: content})
-			})
+			},
+			OnThinking: func(thinking string) {
+				sendEvent(StreamEvent{Type: "thinking", Content: thinking})
+			},
+		})
 
-			if err != nil {
-				// Check if it's a timeout/context error
-				if strings.Contains(err.Error(), "deadline exceeded") || strings.Contains(err.Error(), "context canceled") {
-					hitTimeout = true
-					break
-				}
-				sendEvent(StreamEvent{Type: "error", Error: err.Error()})
-				cancel()
-				return
-			}
-
-			agent.messages = append(agent.messages, *response)
-			newMessages = append(newMessages, *response)
-
-			if len(response.ToolCalls) == 0 {
-				fullResponse = response.Content
+		if err != nil {
+			if strings.Contains(err.Error(), "deadline exceeded") || strings.Contains(err.Error(), "context canceled") {
+				hitTimeout = true
 				break
 			}
+			sendEvent(StreamEvent{Type: "error", Error: err.Error()})
+			cancel()
+			return
+		}
 
-			// Execute tool calls
-			for _, tc := range response.ToolCalls {
-				var args map[string]interface{}
-				if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
-					result := fmt.Sprintf("Error parsing arguments: %v", err)
-					sendEvent(StreamEvent{Type: "tool_call", Name: tc.Function.Name, Result: result})
-					toolMsg := Message{
-						Role:       "tool",
-						Content:    result,
-						ToolCallID: tc.ID,
-					}
-					agent.messages = append(agent.messages, toolMsg)
-					newMessages = append(newMessages, toolMsg)
-					continue
-				}
+		agent.messages = append(agent.messages, *response)
+		saveMsg(*response, "")
 
-				result, err := agent.executeTool(tc.Function.Name, args)
-				if err != nil {
-					result = fmt.Sprintf("Error: %v", err)
-				}
+		if len(response.ToolCalls) == 0 {
+			lastAssistantReply = response.Content
+			break
+		}
 
-				// Truncate very long results for display
-				displayResult := result
-				if len(displayResult) > 2000 {
-					displayResult = displayResult[:2000] + "\n... (truncated)"
-				}
-
-				sendEvent(StreamEvent{Type: "tool_call", Name: tc.Function.Name, Result: displayResult})
-
+		// Execute tool calls
+		for _, tc := range response.ToolCalls {
+			var args map[string]interface{}
+			if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
+				result := fmt.Sprintf("Error parsing arguments: %v", err)
+				sendEvent(StreamEvent{Type: "tool_call", Name: tc.Function.Name, Result: result})
 				toolMsg := Message{
 					Role:       "tool",
 					Content:    result,
 					ToolCallID: tc.ID,
 				}
 				agent.messages = append(agent.messages, toolMsg)
-				newMessages = append(newMessages, toolMsg)
-			}
-		}
-		cancel()
-
-		// Handle timeout: compress conversation and retry
-		if hitTimeout {
-			fmt.Printf("[siki] Context deadline exceeded, compressing conversation (attempt %d)\n", retry+1)
-			sendEvent(StreamEvent{Type: "content", Content: "\n\n*会話履歴を要約しています...*\n\n"})
-
-			// Force compress with a fresh context
-			compressCtx, compressCancel := context.WithTimeout(context.Background(), 60*time.Second)
-			agent.forceCompressConversation(compressCtx)
-			compressCancel()
-
-			if retry < maxRetries {
-				sendEvent(StreamEvent{Type: "content", Content: "*要約完了。回答を再生成しています...*\n\n"})
-				continue
-			} else {
-				// Show what we have as summary
-				sendEvent(StreamEvent{Type: "content", Content: "*会話が長くなりすぎたため要約しました。もう一度質問してください。*"})
-				break
-			}
-		}
-
-		// Validate the response
-		if fullResponse != "" && retry < maxRetries {
-			valCtx, valCancel := context.WithTimeout(context.Background(), 30*time.Second)
-			ok, reason := agent.validateResponse(valCtx, req.Message, fullResponse)
-			valCancel()
-			if !ok {
-				fmt.Printf("[siki] Response validation failed (attempt %d): %s\n", retry+1, reason)
-				// Remove the bad response from agent memory (for retry)
-				agent.messages = agent.messages[:len(agent.messages)-1]
-				// But keep it in newMessages (it was actually generated)
-
-				// Search past conversation logs for context relevant to the question
-				sendEvent(StreamEvent{Type: "content", Content: "\n\n---\n*過去の会話ログを検索しています...*\n\n"})
-				logContext := agent.searchThreadLogForContext(req.Message)
-
-				var retryContent string
-				if logContext != "" {
-					fmt.Printf("[siki] Found relevant context from thread log (%d chars)\n", len(logContext))
-					retryContent = fmt.Sprintf("先ほどの回答は質問の意図を正しく把握できていませんでした（理由: %s）。\n\n以下は過去の会話ログから検索した関連コンテキストです:\n%s\n\n上記のコンテキストを踏まえて、元の質問「%s」にもう一度回答してください。", reason, logContext, req.Message)
-				} else {
-					retryContent = fmt.Sprintf("先ほどの回答は質問の意図を正しく把握できていませんでした（理由: %s）。元の質問「%s」に対して、会話の文脈を踏まえてもう一度回答してください。", reason, req.Message)
-				}
-
-				retryMsg := Message{Role: "user", Content: retryContent}
-				agent.messages = append(agent.messages, retryMsg)
-				newMessages = append(newMessages, retryMsg)
-				sendEvent(StreamEvent{Type: "content", Content: "*回答を再生成しています...*\n\n"})
+				saveMsg(toolMsg, tc.Function.Name)
 				continue
 			}
+
+			result, err := agent.executeTool(tc.Function.Name, args)
+			if err != nil {
+				result = fmt.Sprintf("Error: %v", err)
+			}
+
+			displayResult := result
+			if len(displayResult) > 2000 {
+				displayResult = displayResult[:2000] + "\n... (truncated)"
+			}
+
+			sendEvent(StreamEvent{Type: "tool_call", Name: tc.Function.Name, Result: displayResult})
+
+			toolMsg := Message{
+				Role:       "tool",
+				Content:    result,
+				ToolCallID: tc.ID,
+			}
+			agent.messages = append(agent.messages, toolMsg)
+			saveMsg(toolMsg, tc.Function.Name)
 		}
-		break
+	}
+	cancel()
+
+	// Handle timeout: compress conversation and retry once
+	if hitTimeout {
+		fmt.Printf("[siki] Context deadline exceeded, compressing conversation\n")
+		sendEvent(StreamEvent{Type: "content", Content: "\n\n*会話履歴を要約しています...*\n\n"})
+
+		compressCtx, compressCancel := context.WithTimeout(context.Background(), 60*time.Second)
+		agent.forceCompressConversation(compressCtx)
+		compressCancel()
+		sendEvent(StreamEvent{Type: "content", Content: "*会話が長くなりすぎたため要約しました。もう一度質問してください。*"})
 	}
 
-	// Save new messages to thread (unaffected by compression)
-	if len(newMessages) > 0 {
-		saveMessagesToThread(req.ConversationID, newMessages, req.Message)
+	// Generate thread title with LLM, then notify frontend
+	if isFirstMessage && req.Message != "" {
+		generateThreadTitle(ws.config, threadID, req.Message, lastAssistantReply)
+		if t, err := loadThreadMeta(threadID); err == nil {
+			sendEvent(StreamEvent{Type: "title", Result: t.Title})
+		}
 	}
 
 	sendEvent(StreamEvent{Type: "done"})
