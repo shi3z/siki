@@ -3315,13 +3315,15 @@ func (a *Agent) handleStreamingResponse(body io.Reader, cb StreamCallbacks) (*Me
 		}
 	}
 
+	var readErr error
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {
 			if err == io.EOF {
 				break
 			}
-			return nil, err
+			readErr = err
+			break // don't return nil — fall through to return partial content
 		}
 
 		line = strings.TrimSpace(line)
@@ -3432,7 +3434,7 @@ func (a *Agent) handleStreamingResponse(body io.Reader, cb StreamCallbacks) (*Me
 		Content:   fullContent.String(),
 		Thinking:  fullThinking.String(),
 		ToolCalls: toolCalls,
-	}, nil
+	}, readErr
 }
 
 // ============================================================================
@@ -3911,8 +3913,62 @@ func (ws *WebServer) getOrCreateAgent(convID string) *Agent {
 		}
 	}
 
+	// Fix incomplete tool call sequences: if the last assistant message has
+	// tool_calls but not all tool results are present, add placeholder results.
+	// This can happen when a network error interrupts the agent loop mid-execution.
+	agent.messages = fixIncompleteToolCalls(agent.messages)
+
 	ws.conversations[convID] = agent
 	return agent
+}
+
+// fixIncompleteToolCalls ensures that every assistant tool_call has a matching
+// tool result message. Missing results (from interrupted sessions) get a
+// placeholder inserted right after the corresponding tool results.
+// This prevents the LLM API from rejecting incomplete message sequences.
+func fixIncompleteToolCalls(msgs []Message) []Message {
+	if len(msgs) == 0 {
+		return msgs
+	}
+
+	// Build a new message list, inserting placeholders where needed
+	var result []Message
+	for i := 0; i < len(msgs); i++ {
+		result = append(result, msgs[i])
+
+		if msgs[i].Role != "assistant" || len(msgs[i].ToolCalls) == 0 {
+			continue
+		}
+
+		// This assistant message has tool_calls — check which results exist
+		needed := make(map[string]string) // id -> function name
+		for _, tc := range msgs[i].ToolCalls {
+			needed[tc.ID] = tc.Function.Name
+		}
+
+		// Consume consecutive tool result messages
+		j := i + 1
+		for j < len(msgs) && msgs[j].Role == "tool" {
+			if msgs[j].ToolCallID != "" {
+				delete(needed, msgs[j].ToolCallID)
+			}
+			result = append(result, msgs[j])
+			j++
+		}
+
+		// Insert placeholders for any missing tool results
+		for id, name := range needed {
+			result = append(result, Message{
+				Role:       "tool",
+				Content:    fmt.Sprintf("[%s の結果は取得できませんでした（ネットワークエラー等で中断）]", name),
+				ToolCallID: id,
+			})
+		}
+
+		// Skip the tool messages we already consumed
+		i = j - 1
+	}
+	return result
 }
 
 func (ws *WebServer) handleIndex(w http.ResponseWriter, r *http.Request) {
@@ -4577,13 +4633,28 @@ func (ws *WebServer) handleChatStream(w http.ResponseWriter, r *http.Request) {
 		})
 
 		if err != nil {
+			// Save partial response if any content was received
+			if response != nil && (response.Content != "" || len(response.ToolCalls) > 0) {
+				agent.messages = append(agent.messages, *response)
+				saveMsg(*response, "")
+				// Add placeholder results for any tool_calls in the partial response
+				for _, tc := range response.ToolCalls {
+					placeholder := Message{
+						Role:       "tool",
+						Content:    fmt.Sprintf("[%s の結果は取得できませんでした（ネットワークエラー等で中断）]", tc.Function.Name),
+						ToolCallID: tc.ID,
+					}
+					agent.messages = append(agent.messages, placeholder)
+					saveMsg(placeholder, tc.Function.Name)
+				}
+			}
 			if strings.Contains(err.Error(), "deadline exceeded") || strings.Contains(err.Error(), "context canceled") {
 				hitTimeout = true
 				break
 			}
 			sendEvent(StreamEvent{Type: "error", Error: err.Error()})
 			cancel()
-			return
+			break // break instead of return — still do title generation & done event
 		}
 
 		agent.messages = append(agent.messages, *response)
