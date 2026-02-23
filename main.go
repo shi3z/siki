@@ -2794,7 +2794,7 @@ Be lenient - only flag clearly irrelevant or nonsensical responses.`},
 	}
 	a.setAuthHeaders(httpReq)
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := &http.Client{}
 	resp, err := client.Do(httpReq)
 	if err != nil {
 		return true, ""
@@ -2889,7 +2889,7 @@ func (a *Agent) compressConversation(ctx context.Context) {
 	}
 	a.setAuthHeaders(httpReq)
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := &http.Client{}
 	resp, err := client.Do(httpReq)
 	if err != nil {
 		return
@@ -2973,7 +2973,7 @@ func (a *Agent) forceCompressConversation(ctx context.Context) {
 	}
 	a.setAuthHeaders(httpReq)
 
-	client := &http.Client{Timeout: 60 * time.Second}
+	client := &http.Client{}
 	resp, err := client.Do(httpReq)
 	if err != nil {
 		// Fallback: just truncate messages without summarizing
@@ -3299,7 +3299,9 @@ func (a *Agent) chatStream(ctx context.Context, cb StreamCallbacks) (*Message, e
 	}
 	a.setAuthHeaders(httpReq)
 
-	client := &http.Client{Timeout: 120 * time.Second}
+	// No client-level timeout — context cancellation handles it.
+	// Local models (Ollama) can take minutes per response depending on hardware.
+	client := &http.Client{}
 	resp, err := client.Do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("API request failed (is the model server running?): %w\nTry: siki serve <model>", err)
@@ -4734,7 +4736,8 @@ func (ws *WebServer) handleChatStream(w http.ResponseWriter, r *http.Request) {
 
 	var lastAssistantReply string
 
-	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	// 10 minutes for the full agent loop — local models can be very slow
+	ctx, cancel := context.WithTimeout(context.Background(), 600*time.Second)
 	var hitTimeout bool
 
 	// Agent loop: stream content + tool events, save each message in real-time
@@ -4820,21 +4823,35 @@ func (ws *WebServer) handleChatStream(w http.ResponseWriter, r *http.Request) {
 	}
 	cancel()
 
-	// Handle timeout: compress conversation and retry once
+	// Handle timeout: only compress if conversation is actually long
 	if hitTimeout {
-		fmt.Printf("[siki] Context deadline exceeded, compressing conversation\n")
-		sendEvent(StreamEvent{Type: "content", Content: "\n\n*会話履歴を要約しています...*\n\n"})
-
-		compressCtx, compressCancel := context.WithTimeout(context.Background(), 60*time.Second)
-		agent.forceCompressConversation(compressCtx)
-		compressCancel()
-		sendEvent(StreamEvent{Type: "content", Content: "*会話が長くなりすぎたため要約しました。もう一度質問してください。*"})
+		fmt.Printf("[siki] Context deadline exceeded (messages: %d)\n", len(agent.messages))
+		if len(agent.messages) > 30 {
+			// Conversation is genuinely long — compress it
+			sendEvent(StreamEvent{Type: "content", Content: "\n\n*会話履歴を要約しています...*\n\n"})
+			compressCtx, compressCancel := context.WithTimeout(context.Background(), 300*time.Second)
+			agent.forceCompressConversation(compressCtx)
+			compressCancel()
+			sendEvent(StreamEvent{Type: "content", Content: "*会話が長くなりすぎたため要約しました。もう一度質問してください。*"})
+		} else {
+			// Short conversation — timeout was due to slow model, not context size
+			sendEvent(StreamEvent{Type: "content", Content: "\n\n*応答がタイムアウトしました。モデルの処理に時間がかかっています。もう一度お試しください。*"})
+		}
 	}
 
-	// Generate thread title with LLM, then notify frontend
+	// Generate thread title: try LLM, fall back to truncated user message
 	if isFirstMessage && req.Message != "" {
 		generateThreadTitle(ws.config, threadID, req.Message, lastAssistantReply)
 		if t, err := loadThreadMeta(threadID); err == nil {
+			// If LLM title generation failed, use truncated user message
+			if t.Title == "" || t.Title == "New thread" {
+				title := req.Message
+				if len(title) > 30 {
+					title = title[:30] + "..."
+				}
+				t.Title = title
+				saveThreadMeta(t)
+			}
 			sendEvent(StreamEvent{Type: "title", Result: t.Title})
 		}
 	}
