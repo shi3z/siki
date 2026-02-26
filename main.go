@@ -2477,6 +2477,370 @@ func generateCodeWithSubModel(userRequest string, config *Config) (string, error
 	return html, nil
 }
 
+// ============================================================================
+// Dual-Model Pipeline: lfm (fast ack) + gpt-oss (real orchestration)
+// ============================================================================
+
+// callOllamaGenerate calls any model via Ollama's /api/generate endpoint.
+// Strips <think> tags from response. Returns the generated text.
+func callOllamaGenerate(model, prompt string, maxTokens int, timeout time.Duration, config *Config) (string, error) {
+	endpoint := strings.TrimSuffix(config.primaryProvider().Endpoint, "/v1")
+	reqBody := map[string]interface{}{
+		"model":  model,
+		"prompt": prompt,
+		"stream": false,
+		"options": map[string]interface{}{
+			"num_predict": maxTokens,
+		},
+	}
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", fmt.Errorf("marshal error: %w", err)
+	}
+
+	client := &http.Client{Timeout: timeout}
+	resp, err := client.Post(endpoint+"/api/generate", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return "", fmt.Errorf("generate request error: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var genResp struct {
+		Response string `json:"response"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&genResp); err != nil {
+		return "", fmt.Errorf("decode error: %w", err)
+	}
+
+	content := genResp.Response
+	if ti := strings.Index(content, "<think>"); ti >= 0 {
+		if te := strings.Index(content, "</think>"); te > ti {
+			content = strings.TrimSpace(content[:ti] + content[te+8:])
+		}
+	}
+	return content, nil
+}
+
+// OrchestratorDecision represents gpt-oss's decision on how to handle a request
+type OrchestratorDecision struct {
+	Tool     string                 `json:"tool"`
+	Args     map[string]interface{} `json:"args,omitempty"`
+	Response string                 `json:"response,omitempty"`
+}
+
+// quickAck generates a fast 1-sentence acknowledgment using lfm (primary model).
+// Gives the user immediate feedback while gpt-oss processes the real request.
+func quickAck(userMsg string, config *Config) string {
+	prompt := fmt.Sprintf(`ユーザーのメッセージに1文だけで応答しろ。何をするか短く宣言しろ。
+
+例:
+- 「AIニュース教えて」→「最新のAIニュースを検索しますね！」
+- 「マンデルブロ集合書いて」→「マンデルブロ集合を描画しますね！」
+- 「こんにちは」→「こんにちは！何かお手伝いしましょうか？」
+
+ユーザー: %s
+応答:`, userMsg)
+
+	ack, err := callOllamaGenerate(config.primaryProvider().Model, prompt, 80, 15*time.Second, config)
+	if err != nil {
+		fmt.Printf("[siki] Quick ack failed: %v\n", err)
+		return ""
+	}
+	ack = strings.TrimSpace(ack)
+	ack = strings.Trim(ack, "\"「」")
+	// Limit to first line, max 100 runes
+	if nl := strings.IndexByte(ack, '\n'); nl >= 0 {
+		ack = ack[:nl]
+	}
+	runes := []rune(ack)
+	if len(runes) > 100 {
+		ack = string(runes[:100])
+	}
+	return ack
+}
+
+// subModelOrchestrate asks gpt-oss to analyze the user's request and decide which tool to call.
+func subModelOrchestrate(userMsg string, messages []Message, config *Config) (*OrchestratorDecision, error) {
+	// Build conversation context (last 10 messages)
+	var ctx strings.Builder
+	start := 0
+	if len(messages) > 10 {
+		start = len(messages) - 10
+	}
+	for _, m := range messages[start:] {
+		switch m.Role {
+		case "user":
+			ctx.WriteString(fmt.Sprintf("ユーザー: %s\n", m.Content))
+		case "assistant":
+			if m.Content != "" {
+				c := m.Content
+				if len(c) > 200 {
+					c = c[:200] + "..."
+				}
+				ctx.WriteString(fmt.Sprintf("アシスタント: %s\n", c))
+			}
+		case "tool":
+			c := m.Content
+			if len(c) > 100 {
+				c = c[:100] + "..."
+			}
+			ctx.WriteString(fmt.Sprintf("[ツール結果: %s]\n", c))
+		}
+	}
+
+	now := time.Now()
+	prompt := fmt.Sprintf(`あなたはAIオーケストレーター。ユーザーのリクエストを分析し、適切なアクションを決定せよ。
+
+## 利用可能なツール
+- web_search: インターネット検索。引数: {"query": "検索クエリ"}
+- web_fetch: URL内容取得。引数: {"url": "URL"}
+- run_code: HTML/JS/Canvas実行（描画・可視化・ゲーム・アニメーション）。引数: {"html": "完全なHTML"}
+- diagram: Graphviz図生成（構成図・関係図）。引数: {"dot_source": "DOTコード"}
+- execute_command: シェルコマンド。引数: {"command": "コマンド"}
+- read_file: ファイル読込。引数: {"path": "ファイルパス"}
+- write_file: ファイル書込。引数: {"path": "パス", "content": "内容"}
+
+## 会話履歴
+%s
+## 現在のリクエスト
+%s
+
+## 注意
+- 今日は%d年%d月%d日
+- run_codeの場合、完全で美しいHTMLを生成せよ（<html>から</html>まで、CSS/JS全部含む）
+- web_searchの場合、適切な検索クエリを指定
+- ツール不要（挨拶・計算・知識質問）なら直接回答
+
+以下のJSON形式のみ出力せよ（他の文章は絶対に書くな）:
+ツール使用: {"tool":"ツール名","args":{引数}}
+直接回答: {"tool":"none","response":"回答テキスト"}`,
+		ctx.String(), userMsg, now.Year(), int(now.Month()), now.Day())
+
+	response, err := callOllamaGenerate(config.SubModel, prompt, 4096, 600*time.Second, config)
+	if err != nil {
+		return nil, fmt.Errorf("orchestration failed: %w", err)
+	}
+	response = strings.TrimSpace(response)
+
+	// Parse JSON from response
+	var decision OrchestratorDecision
+	if err := json.Unmarshal([]byte(response), &decision); err != nil {
+		// Try to extract JSON object from response text
+		jsonStr := response
+		if idx := strings.Index(jsonStr, "{"); idx >= 0 {
+			jsonStr = jsonStr[idx:]
+			depth := 0
+			for i, ch := range jsonStr {
+				if ch == '{' {
+					depth++
+				}
+				if ch == '}' {
+					depth--
+					if depth == 0 {
+						jsonStr = jsonStr[:i+1]
+						break
+					}
+				}
+			}
+		}
+		if err2 := json.Unmarshal([]byte(jsonStr), &decision); err2 != nil {
+			// Last resort: treat entire response as direct answer
+			fmt.Printf("[siki] Could not parse orchestrator JSON, using as direct response\n")
+			decision = OrchestratorDecision{
+				Tool:     "none",
+				Response: response,
+			}
+		}
+	}
+
+	fmt.Printf("[siki] Orchestrator decision: tool=%s\n", decision.Tool)
+	return &decision, nil
+}
+
+// subModelSummarize asks gpt-oss to generate a final response based on tool results.
+func subModelSummarize(userMsg, toolName, toolResult string, config *Config) (string, error) {
+	result := toolResult
+	if len(result) > 4000 {
+		result = result[:4000] + "\n... (以下省略)"
+	}
+
+	prompt := fmt.Sprintf(`ユーザーのリクエスト: %s
+
+実行したツール: %s
+ツール結果:
+%s
+
+上記のツール結果に基づいて、ユーザーに日本語で回答せよ。
+- 重要な情報を分かりやすく整理して伝えろ
+- URLがあれば含めろ
+- 簡潔かつ有用に`, userMsg, toolName, result)
+
+	response, err := callOllamaGenerate(config.SubModel, prompt, 2048, 300*time.Second, config)
+	if err != nil {
+		return "", fmt.Errorf("summarization failed: %w", err)
+	}
+	return response, nil
+}
+
+// dualModelPipeline coordinates lfm (fast ack) and gpt-oss (real orchestration).
+// Returns the final assistant reply text.
+func (ws *WebServer) dualModelPipeline(ctx context.Context, agent *Agent, userMsg string, sendEvent func(StreamEvent), saveMsg func(Message, string)) string {
+	// Phase 1: Quick ack from lfm (parallel with Phase 2)
+	ackCh := make(chan string, 1)
+	go func() {
+		ackCh <- quickAck(userMsg, ws.config)
+	}()
+
+	// Phase 2: gpt-oss orchestration (parallel with Phase 1)
+	type orchResult struct {
+		decision *OrchestratorDecision
+		err      error
+	}
+	orchCh := make(chan orchResult, 1)
+	go func() {
+		d, err := subModelOrchestrate(userMsg, agent.messages, ws.config)
+		orchCh <- orchResult{d, err}
+	}()
+
+	// Show lfm ack immediately (it's fast)
+	select {
+	case ack := <-ackCh:
+		if ack != "" {
+			sendEvent(StreamEvent{Type: "content", Content: ack + "\n\n"})
+		}
+	case <-time.After(20 * time.Second):
+		// lfm took too long, skip
+	}
+
+	// Wait for gpt-oss decision
+	var decision *OrchestratorDecision
+	select {
+	case r := <-orchCh:
+		if r.err != nil {
+			sendEvent(StreamEvent{Type: "error", Error: fmt.Sprintf("Orchestration error: %v", r.err)})
+			return ""
+		}
+		decision = r.decision
+	case <-ctx.Done():
+		return ""
+	}
+
+	// No tool needed — direct response from gpt-oss
+	if decision.Tool == "" || decision.Tool == "none" {
+		resp := decision.Response
+		sendEvent(StreamEvent{Type: "content", Content: resp})
+		assistantMsg := Message{Role: "assistant", Content: resp}
+		agent.messages = append(agent.messages, assistantMsg)
+		saveMsg(assistantMsg, "")
+		return resp
+	}
+
+	// Tool execution
+	toolName := decision.Tool
+
+	// Redirect diagram → run_code for complex visualizations
+	if toolName == "diagram" && needsRunCode(userMsg) {
+		fmt.Printf("[siki] Redirecting diagram → run_code\n")
+		toolName = "run_code"
+	}
+
+	sendEvent(StreamEvent{Type: "tool_start", Name: toolName})
+
+	// Use gpt-oss's args, but for run_code ensure we have good HTML
+	args := decision.Args
+	if args == nil {
+		args = map[string]interface{}{}
+	}
+
+	// Validate run_code HTML — regenerate if too short
+	if toolName == "run_code" {
+		html, _ := args["html"].(string)
+		if len(html) < 100 {
+			fmt.Printf("[siki] run_code HTML too short (%d), regenerating\n", len(html))
+			if newHTML, err := generateCodeWithSubModel(userMsg, ws.config); err == nil {
+				args["html"] = newHTML
+			}
+		}
+	}
+
+	result, err := agent.executeTool(toolName, args)
+	if err != nil {
+		result = fmt.Sprintf("Error: %v", err)
+	}
+
+	displayResult := result
+	if len(displayResult) > 2000 {
+		displayResult = displayResult[:2000] + "\n... (truncated)"
+	}
+	sendEvent(StreamEvent{Type: "tool_call", Name: toolName, Result: displayResult})
+
+	// Save tool call to conversation history
+	toolCallID := fmt.Sprintf("orch-%d", time.Now().UnixMilli())
+	argsJSON, _ := json.Marshal(args)
+	assistantMsg := Message{
+		Role: "assistant",
+		ToolCalls: []ToolCall{{
+			ID:   toolCallID,
+			Type: "function",
+			Function: struct {
+				Name      string `json:"name"`
+				Arguments string `json:"arguments"`
+			}{Name: toolName, Arguments: string(argsJSON)},
+		}},
+	}
+	agent.messages = append(agent.messages, assistantMsg)
+	saveMsg(assistantMsg, "")
+
+	toolMsg := Message{
+		Role:       "tool",
+		Content:    result,
+		ToolCallID: toolCallID,
+	}
+	agent.messages = append(agent.messages, toolMsg)
+	saveMsg(toolMsg, toolName)
+
+	// For run_code/diagram, the tool result IS the response (iframe/image)
+	if toolName == "run_code" || toolName == "diagram" {
+		finalMsg := Message{Role: "assistant", Content: result}
+		agent.messages = append(agent.messages, finalMsg)
+		saveMsg(finalMsg, "")
+		return result
+	}
+
+	// Phase 3: gpt-oss summarizes tool results
+	sendEvent(StreamEvent{Type: "content", Content: "\n\n"})
+	finalResponse, err := subModelSummarize(userMsg, toolName, result, ws.config)
+	if err != nil {
+		fmt.Printf("[siki] Summarization failed: %v\n", err)
+		finalResponse = displayResult // Fall back to raw tool result
+	}
+
+	sendEvent(StreamEvent{Type: "content", Content: finalResponse})
+
+	finalMsg := Message{Role: "assistant", Content: finalResponse}
+	agent.messages = append(agent.messages, finalMsg)
+	saveMsg(finalMsg, "")
+
+	return finalResponse
+}
+
+// preWarmSubModel sends a tiny prompt to gpt-oss at startup to load it into memory.
+func preWarmSubModel(config *Config) {
+	if config.SubModel == "" {
+		return
+	}
+	go func() {
+		fmt.Printf("[siki] Pre-warming sub-model: %s ...\n", config.SubModel)
+		start := time.Now()
+		_, err := callOllamaGenerate(config.SubModel, "Say OK.", 5, 600*time.Second, config)
+		if err != nil {
+			fmt.Printf("[siki] Sub-model warm-up failed: %v\n", err)
+		} else {
+			fmt.Printf("[siki] Sub-model ready (%.1fs)\n", time.Since(start).Seconds())
+		}
+	}()
+}
+
 func (a *Agent) webImages(targetURL string) (string, error) {
 	// Fetch the HTML
 	client := &http.Client{
@@ -7629,129 +7993,91 @@ func (ws *WebServer) handleChatStream(w http.ResponseWriter, r *http.Request) {
 
 	var lastAssistantReply string
 
-	// 10 minutes for the full agent loop — local models can be very slow
+	// 10 minutes for the full pipeline — sub-model can be slow on first load
 	ctx, cancel := context.WithTimeout(context.Background(), 600*time.Second)
 	var hitTimeout bool
 
-	// Agent loop: stream content + tool events, save each message in real-time
-	for turn := 0; turn < ws.config.MaxTurns; turn++ {
-		response, err := agent.chatStream(ctx, StreamCallbacks{
-			OnContent: func(content string) {
-				sendEvent(StreamEvent{Type: "content", Content: content})
-			},
-			OnThinking: func(thinking string) {
-				sendEvent(StreamEvent{Type: "thinking", Content: thinking})
-			},
-		})
+	if ws.config.SubModel != "" {
+		// Dual-model pipeline: lfm (quick ack) + gpt-oss (real orchestration)
+		lastAssistantReply = ws.dualModelPipeline(ctx, agent, req.Message, sendEvent, saveMsg)
+	} else {
+		// Fallback: single model agent loop (lfm only, with tool overrides)
+		for turn := 0; turn < ws.config.MaxTurns; turn++ {
+			response, err := agent.chatStream(ctx, StreamCallbacks{
+				OnContent: func(content string) {
+					sendEvent(StreamEvent{Type: "content", Content: content})
+				},
+				OnThinking: func(thinking string) {
+					sendEvent(StreamEvent{Type: "thinking", Content: thinking})
+				},
+			})
 
-		if err != nil {
-			// Save partial response if any content was received
-			if response != nil && (response.Content != "" || len(response.ToolCalls) > 0) {
-				agent.messages = append(agent.messages, *response)
-				saveMsg(*response, "")
-				// Add placeholder results for any tool_calls in the partial response
-				for _, tc := range response.ToolCalls {
-					placeholder := Message{
-						Role:       "tool",
-						Content:    fmt.Sprintf("[%s の結果は取得できませんでした（ネットワークエラー等で中断）]", tc.Function.Name),
-						ToolCallID: tc.ID,
+			if err != nil {
+				if response != nil && (response.Content != "" || len(response.ToolCalls) > 0) {
+					agent.messages = append(agent.messages, *response)
+					saveMsg(*response, "")
+					for _, tc := range response.ToolCalls {
+						placeholder := Message{
+							Role:       "tool",
+							Content:    fmt.Sprintf("[%s の結果は取得できませんでした]", tc.Function.Name),
+							ToolCallID: tc.ID,
+						}
+						agent.messages = append(agent.messages, placeholder)
+						saveMsg(placeholder, tc.Function.Name)
 					}
-					agent.messages = append(agent.messages, placeholder)
-					saveMsg(placeholder, tc.Function.Name)
 				}
-			}
-			if strings.Contains(err.Error(), "deadline exceeded") || strings.Contains(err.Error(), "context canceled") {
-				hitTimeout = true
-				break
-			}
-			sendEvent(StreamEvent{Type: "error", Error: err.Error()})
-			cancel()
-			break // break instead of return — still do title generation & done event
-		}
-
-		agent.messages = append(agent.messages, *response)
-		saveMsg(*response, "")
-
-		if len(response.ToolCalls) == 0 {
-			// Fallback: if model didn't call tools but should have, auto-call
-			if turn == 0 {
-				if fallbackResult := autoToolFallback(agent, req.Message, response.Content, sendEvent, saveMsg); fallbackResult != "" {
-					lastAssistantReply = fallbackResult
+				if strings.Contains(err.Error(), "deadline exceeded") || strings.Contains(err.Error(), "context canceled") {
+					hitTimeout = true
 					break
 				}
-			}
-			lastAssistantReply = response.Content
-			break
-		}
-
-		// Execute tool calls
-		for _, tc := range response.ToolCalls {
-			toolName := tc.Function.Name
-
-			// Redirect: diagram can't handle complex visualizations — use run_code instead
-			if toolName == "diagram" {
-				userReq := agent.lastUserMessage()
-				if needsRunCode(userReq) {
-					fmt.Printf("[siki] Redirecting diagram → run_code for: %s\n", userReq)
-					toolName = "run_code"
-				}
+				sendEvent(StreamEvent{Type: "error", Error: err.Error()})
+				cancel()
+				break
 			}
 
-			// Send tool_start event so frontend shows spinner
-			sendEvent(StreamEvent{Type: "tool_start", Name: toolName})
+			agent.messages = append(agent.messages, *response)
+			saveMsg(*response, "")
 
-			var args map[string]interface{}
-			if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
-				result := fmt.Sprintf("Error parsing arguments: %v", err)
-				sendEvent(StreamEvent{Type: "tool_call", Name: toolName, Result: result})
-				toolMsg := Message{
-					Role:       "tool",
-					Content:    result,
-					ToolCallID: tc.ID,
-				}
-				agent.messages = append(agent.messages, toolMsg)
-				saveMsg(toolMsg, toolName)
-				continue
-			}
-
-			// Small orchestrator models (1.2B) can't generate reliable tool arguments.
-			// Override args with sensible defaults based on user's actual message.
-			userReq := agent.lastUserMessage()
-			args = overrideToolArgs(toolName, userReq, args, ws.config, sendEvent)
-
-			result, err := agent.executeTool(toolName, args)
-			if err != nil {
-				result = fmt.Sprintf("Error: %v", err)
-			}
-
-			displayResult := result
-			if len(displayResult) > 2000 {
-				displayResult = displayResult[:2000] + "\n... (truncated)"
-			}
-
-			sendEvent(StreamEvent{Type: "tool_call", Name: toolName, Result: displayResult})
-
-			toolMsg := Message{
-				Role:       "tool",
-				Content:    result,
-				ToolCallID: tc.ID,
-			}
-			agent.messages = append(agent.messages, toolMsg)
-			saveMsg(toolMsg, toolName)
-
-			// ACE Reflector: extract insights from tool execution (async, non-blocking)
-			go func(toolName, toolArgs, toolResult, userQuery string, cfg *Config) {
-				newBullets := reflectOnExecution(cfg, toolName, toolArgs, toolResult, userQuery)
-				if len(newBullets) > 0 {
-					existing, _ := loadPlaybook()
-					merged := curateBullets(existing, newBullets)
-					if err := savePlaybook(merged); err != nil {
-						fmt.Printf("[siki] Failed to save playbook: %v\n", err)
-					} else {
-						fmt.Printf("[siki] Playbook updated: %d bullets (added %d new)\n", len(merged), len(newBullets))
+			if len(response.ToolCalls) == 0 {
+				if turn == 0 {
+					if fallbackResult := autoToolFallback(agent, req.Message, response.Content, sendEvent, saveMsg); fallbackResult != "" {
+						lastAssistantReply = fallbackResult
+						break
 					}
 				}
-			}(tc.Function.Name, tc.Function.Arguments, result, req.Message, ws.config)
+				lastAssistantReply = response.Content
+				break
+			}
+
+			for _, tc := range response.ToolCalls {
+				toolName := tc.Function.Name
+				if toolName == "diagram" && needsRunCode(agent.lastUserMessage()) {
+					toolName = "run_code"
+				}
+				sendEvent(StreamEvent{Type: "tool_start", Name: toolName})
+
+				var args map[string]interface{}
+				if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
+					sendEvent(StreamEvent{Type: "tool_call", Name: toolName, Result: fmt.Sprintf("Error: %v", err)})
+					agent.messages = append(agent.messages, Message{Role: "tool", Content: fmt.Sprintf("Error: %v", err), ToolCallID: tc.ID})
+					continue
+				}
+				args = overrideToolArgs(toolName, agent.lastUserMessage(), args, ws.config, sendEvent)
+
+				result, err := agent.executeTool(toolName, args)
+				if err != nil {
+					result = fmt.Sprintf("Error: %v", err)
+				}
+				displayResult := result
+				if len(displayResult) > 2000 {
+					displayResult = displayResult[:2000] + "\n... (truncated)"
+				}
+				sendEvent(StreamEvent{Type: "tool_call", Name: toolName, Result: displayResult})
+
+				toolMsg := Message{Role: "tool", Content: result, ToolCallID: tc.ID}
+				agent.messages = append(agent.messages, toolMsg)
+				saveMsg(toolMsg, toolName)
+			}
 		}
 	}
 	cancel()
@@ -7995,6 +8321,9 @@ func runWeb(config *Config, host string, port int) error {
 		fmt.Printf("\nStarting web server on http://%s\n", addr)
 	}
 	fmt.Println("Press Ctrl+C to stop")
+
+	// Pre-warm sub-model (gpt-oss) in background so first request is fast
+	preWarmSubModel(config)
 
 	// Start self-improvement background loop
 	go ws.selfImproveLoop()
