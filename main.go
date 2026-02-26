@@ -138,6 +138,12 @@ func defaultConfig() *Config {
 - search_document: **インデックス済みドキュメントを推論検索**する。階層構造をたどって関連セクションを見つける
 - recall_memory: **過去の学習知識を検索**する。以前の経験から得た戦略・注意点・パターンを思い出す
 - list_documents: インデックス済みドキュメント一覧を表示
+- self_status: **自分の現在の状態**（バージョン、パラメータ、ルール、ベンチマークスコア）を確認
+- self_modify_prompt: **自分のシステムプロンプトを編集**する（自動スナップショット付き）
+- self_modify_params: **行動パラメータを変更**する（temperature, max_turns等）
+- self_add_rule / self_remove_rule: **自己ルール**を追加/削除する
+- self_rollback: **以前のバージョンに戻す**（version 0 = 出荷時デフォルト）
+- self_benchmark: **自己評価ベンチマーク**を実行する
 - create_plugin: **プラグインを作成/更新**する。新しいツールやUI拡張を動的に追加できる
 - test_plugin: **プラグインをテスト**する。テストケースを渡して全パスしたらTESTED状態にする
 - list_plugins: インストール済みプラグイン一覧を表示
@@ -543,6 +549,102 @@ var tools = []Tool{
 		},
 	},
 	{
+		Name:        "self_status",
+		Description: "View your current self-state: version, system prompt, parameters, rules, benchmark score, and version history",
+		Parameters: map[string]interface{}{
+			"type":       "object",
+			"properties": map[string]interface{}{},
+		},
+	},
+	{
+		Name:        "self_modify_prompt",
+		Description: "Modify your own system prompt. A snapshot is automatically created before modification. Changes take effect on new conversations.",
+		Parameters: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"action": map[string]interface{}{
+					"type":        "string",
+					"description": "replace: full replacement, append: add to end, replace_section: replace between ## markers",
+				},
+				"content": map[string]interface{}{
+					"type":        "string",
+					"description": "New content",
+				},
+				"section": map[string]interface{}{
+					"type":        "string",
+					"description": "Section header for replace_section (e.g. '## Available Tools')",
+				},
+				"reason": map[string]interface{}{
+					"type":        "string",
+					"description": "Why this change is being made",
+				},
+			},
+			"required": []string{"action", "content", "reason"},
+		},
+	},
+	{
+		Name:        "self_modify_params",
+		Description: "Modify your behavioral parameters: temperature, max_turns, compress_at, reflect_on_tools, preferred_lang, verbosity",
+		Parameters: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"params": map[string]interface{}{
+					"type":        "string",
+					"description": `JSON object of params to update, e.g. {"temperature":0.5,"verbosity":"concise"}`,
+				},
+				"reason": map[string]interface{}{
+					"type":        "string",
+					"description": "Why this change is being made",
+				},
+			},
+			"required": []string{"params", "reason"},
+		},
+	},
+	{
+		Name:        "self_add_rule",
+		Description: "Add a behavioral rule to yourself. Rules appear in your system prompt and guide your behavior.",
+		Parameters: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"rule":   map[string]interface{}{"type": "string", "description": "The rule text"},
+				"reason": map[string]interface{}{"type": "string", "description": "Why this rule is needed"},
+			},
+			"required": []string{"rule", "reason"},
+		},
+	},
+	{
+		Name:        "self_remove_rule",
+		Description: "Deactivate a self-imposed behavioral rule by ID",
+		Parameters: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"rule_id": map[string]interface{}{"type": "string", "description": "ID of the rule to deactivate"},
+			},
+			"required": []string{"rule_id"},
+		},
+	},
+	{
+		Name:        "self_rollback",
+		Description: "Rollback to a previous version of yourself. Use self_status to see available versions. Version 0 = factory default.",
+		Parameters: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"version": map[string]interface{}{"type": "number", "description": "Version number to rollback to"},
+			},
+			"required": []string{"version"},
+		},
+	},
+	{
+		Name:        "self_benchmark",
+		Description: "Run self-evaluation benchmarks using sub-model. Categories: tool_use, reasoning, language, helpfulness, or all",
+		Parameters: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"categories": map[string]interface{}{"type": "string", "description": "Comma-separated categories (default: all)"},
+			},
+		},
+	},
+	{
 		Name:        "index_document",
 		Description: "URLやテキストからドキュメントの階層インデックスを作成する。長文ドキュメントを構造化して後で検索可能にする",
 		Parameters: map[string]interface{}{
@@ -840,6 +942,20 @@ func (a *Agent) executeTool(name string, args map[string]interface{}) (string, e
 	case "query_model":
 		systemPrompt, _ := args["system"].(string)
 		return a.queryModel(args["provider"].(string), args["message"].(string), systemPrompt)
+	case "self_status":
+		return a.selfStatus()
+	case "self_modify_prompt":
+		return a.selfModifyPrompt(args)
+	case "self_modify_params":
+		return a.selfModifyParams(args)
+	case "self_add_rule":
+		return a.selfAddRule(args)
+	case "self_remove_rule":
+		return a.selfRemoveRule(args)
+	case "self_rollback":
+		return a.selfRollback(args)
+	case "self_benchmark":
+		return a.selfBenchmark(args)
 	case "index_document":
 		title, _ := args["title"].(string)
 		docURL, _ := args["url"].(string)
@@ -2784,6 +2900,887 @@ Output ONLY a JSON array of section IDs, e.g.: ["1", "2.1"]`, doc.Title, query, 
 }
 
 // ============================================================================
+// Self-Modification System (Kernel)
+// ============================================================================
+
+// SelfState represents the mutable "self" of the AI
+type SelfState struct {
+	Version       int        `json:"version"`
+	Prompt        string     `json:"-"` // loaded from prompt.md
+	Params        SelfParams `json:"params"`
+	Rules         []SelfRule `json:"rules"`
+	LastModified  time.Time  `json:"last_modified"`
+	LastBenchmark float64    `json:"last_benchmark"`
+}
+
+type SelfParams struct {
+	Temperature    float64 `json:"temperature"`
+	MaxTurns       int     `json:"max_turns"`
+	CompressAt     int     `json:"compress_at"`
+	ReflectOnTools bool    `json:"reflect_on_tools"`
+	PreferredLang  string  `json:"preferred_lang"`
+	Verbosity      string  `json:"verbosity"`
+}
+
+type SelfRule struct {
+	ID        string `json:"id"`
+	Rule      string `json:"rule"`
+	Reason    string `json:"reason"`
+	CreatedAt int64  `json:"created_at"`
+	Active    bool   `json:"active"`
+}
+
+type SelfSnapshot struct {
+	Version        int       `json:"version"`
+	Timestamp      time.Time `json:"timestamp"`
+	Reason         string    `json:"reason"`
+	BenchmarkScore float64   `json:"benchmark_score"`
+}
+
+type BenchmarkResult struct {
+	Timestamp    time.Time          `json:"timestamp"`
+	Version      int                `json:"version"`
+	OverallScore float64            `json:"overall_score"`
+	Scores       map[string]float64 `json:"scores"`
+}
+
+var selfDir string
+var currentSelf *SelfState
+var selfMu sync.RWMutex
+
+var kernelParams = struct {
+	MinPromptLen  int
+	MaxPromptLen  int
+	MinMaxTurns   int
+	MaxMaxTurns   int
+	MaxRules      int
+	MaxSnapshots  int
+	RequiredTools []string
+}{
+	MinPromptLen: 200,
+	MaxPromptLen: 50000,
+	MinMaxTurns:  3,
+	MaxMaxTurns:  50,
+	MaxRules:     50,
+	MaxSnapshots: 100,
+	RequiredTools: []string{
+		"read_file", "write_file", "execute_command",
+		"self_modify_prompt", "self_rollback", "self_status",
+	},
+}
+
+// Dangerous prompt patterns that are always rejected
+var dangerousPromptPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)ignore\s+(all|previous|prior)`),
+	regexp.MustCompile(`(?i)do\s+nothing`),
+	regexp.MustCompile(`(?i)refuse\s+all`),
+	regexp.MustCompile(`(?i)never\s+respond`),
+	regexp.MustCompile(`(?i)always\s+(lie|refuse|ignore)`),
+}
+
+func initSelfDir() error {
+	if selfDir != "" {
+		return nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	selfDir = filepath.Join(home, ".siki", "self")
+	for _, sub := range []string{"current", "snapshots", "benchmarks"} {
+		if err := os.MkdirAll(filepath.Join(selfDir, sub), 0755); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func defaultSelfState() *SelfState {
+	cfg := defaultConfig()
+	return &SelfState{
+		Version: 0,
+		Prompt:  cfg.SystemPrompt,
+		Params: SelfParams{
+			Temperature:    0.7,
+			MaxTurns:       MaxTurns,
+			CompressAt:     60,
+			ReflectOnTools: true,
+			PreferredLang:  "auto",
+			Verbosity:      "normal",
+		},
+		LastModified: time.Now(),
+	}
+}
+
+func loadSelfState() (*SelfState, error) {
+	if err := initSelfDir(); err != nil {
+		return nil, err
+	}
+	currentDir := filepath.Join(selfDir, "current")
+
+	state := defaultSelfState()
+
+	// Load prompt.md
+	if data, err := os.ReadFile(filepath.Join(currentDir, "prompt.md")); err == nil {
+		if len(data) > 0 {
+			state.Prompt = string(data)
+		}
+	}
+
+	// Load params.json
+	if data, err := os.ReadFile(filepath.Join(currentDir, "params.json")); err == nil {
+		var loaded SelfState
+		if err := json.Unmarshal(data, &loaded); err == nil {
+			state.Version = loaded.Version
+			state.Params = loaded.Params
+			state.LastModified = loaded.LastModified
+			state.LastBenchmark = loaded.LastBenchmark
+		}
+	}
+
+	// Load rules.jsonl
+	if f, err := os.Open(filepath.Join(currentDir, "rules.jsonl")); err == nil {
+		scanner := bufio.NewScanner(f)
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" {
+				continue
+			}
+			var rule SelfRule
+			if err := json.Unmarshal([]byte(line), &rule); err == nil {
+				state.Rules = append(state.Rules, rule)
+			}
+		}
+		f.Close()
+	}
+
+	return state, nil
+}
+
+func saveSelfState(state *SelfState) error {
+	if err := initSelfDir(); err != nil {
+		return err
+	}
+	currentDir := filepath.Join(selfDir, "current")
+
+	// Save prompt.md
+	if err := os.WriteFile(filepath.Join(currentDir, "prompt.md"), []byte(state.Prompt), 0644); err != nil {
+		return err
+	}
+
+	// Save params.json (includes version, params, timestamps, benchmark)
+	paramsData, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(currentDir, "params.json"), paramsData, 0644); err != nil {
+		return err
+	}
+
+	// Save rules.jsonl
+	f, err := os.Create(filepath.Join(currentDir, "rules.jsonl"))
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	for _, rule := range state.Rules {
+		data, _ := json.Marshal(rule)
+		fmt.Fprintln(f, string(data))
+	}
+
+	return nil
+}
+
+func validateSelfState(state *SelfState) error {
+	if len(state.Prompt) < kernelParams.MinPromptLen {
+		return fmt.Errorf("prompt too short (%d chars, minimum %d)", len(state.Prompt), kernelParams.MinPromptLen)
+	}
+	if len(state.Prompt) > kernelParams.MaxPromptLen {
+		return fmt.Errorf("prompt too long (%d chars, maximum %d)", len(state.Prompt), kernelParams.MaxPromptLen)
+	}
+	// Check required tools are mentioned
+	promptLower := strings.ToLower(state.Prompt)
+	for _, tool := range kernelParams.RequiredTools {
+		if !strings.Contains(promptLower, tool) {
+			return fmt.Errorf("prompt must mention required tool: %s", tool)
+		}
+	}
+	// Check for dangerous patterns
+	for _, pat := range dangerousPromptPatterns {
+		if pat.MatchString(state.Prompt) {
+			return fmt.Errorf("prompt contains dangerous pattern: %s", pat.String())
+		}
+	}
+	// Validate params bounds
+	if state.Params.Temperature < 0 || state.Params.Temperature > 2.0 {
+		return fmt.Errorf("temperature must be 0.0-2.0, got %f", state.Params.Temperature)
+	}
+	if state.Params.MaxTurns < kernelParams.MinMaxTurns || state.Params.MaxTurns > kernelParams.MaxMaxTurns {
+		return fmt.Errorf("max_turns must be %d-%d, got %d", kernelParams.MinMaxTurns, kernelParams.MaxMaxTurns, state.Params.MaxTurns)
+	}
+	if state.Params.CompressAt < 20 || state.Params.CompressAt > 100 {
+		return fmt.Errorf("compress_at must be 20-100, got %d", state.Params.CompressAt)
+	}
+	if len(state.Rules) > kernelParams.MaxRules {
+		return fmt.Errorf("too many rules (%d, maximum %d)", len(state.Rules), kernelParams.MaxRules)
+	}
+	return nil
+}
+
+// ---- Version Control / Snapshots ----
+
+func createSnapshot(state *SelfState, reason string) (*SelfSnapshot, error) {
+	if err := initSelfDir(); err != nil {
+		return nil, err
+	}
+	state.Version++
+	ts := time.Now()
+	dirName := fmt.Sprintf("v%03d_%s", state.Version, ts.Format("20060102T150405"))
+	snapDir := filepath.Join(selfDir, "snapshots", dirName)
+	if err := os.MkdirAll(snapDir, 0755); err != nil {
+		return nil, err
+	}
+
+	// Copy files
+	os.WriteFile(filepath.Join(snapDir, "prompt.md"), []byte(state.Prompt), 0644)
+	paramsData, _ := json.MarshalIndent(state, "", "  ")
+	os.WriteFile(filepath.Join(snapDir, "params.json"), paramsData, 0644)
+
+	rulesF, _ := os.Create(filepath.Join(snapDir, "rules.jsonl"))
+	for _, r := range state.Rules {
+		d, _ := json.Marshal(r)
+		fmt.Fprintln(rulesF, string(d))
+	}
+	rulesF.Close()
+
+	snap := &SelfSnapshot{
+		Version:        state.Version,
+		Timestamp:      ts,
+		Reason:         reason,
+		BenchmarkScore: state.LastBenchmark,
+	}
+	metaData, _ := json.MarshalIndent(snap, "", "  ")
+	os.WriteFile(filepath.Join(snapDir, "meta.json"), metaData, 0644)
+
+	// Prune old snapshots
+	pruneSnapshots()
+
+	return snap, nil
+}
+
+func listSnapshots() ([]SelfSnapshot, error) {
+	if err := initSelfDir(); err != nil {
+		return nil, err
+	}
+	snapDir := filepath.Join(selfDir, "snapshots")
+	entries, err := os.ReadDir(snapDir)
+	if err != nil {
+		return nil, nil
+	}
+
+	var snapshots []SelfSnapshot
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		metaPath := filepath.Join(snapDir, e.Name(), "meta.json")
+		data, err := os.ReadFile(metaPath)
+		if err != nil {
+			continue
+		}
+		var snap SelfSnapshot
+		if err := json.Unmarshal(data, &snap); err == nil {
+			snapshots = append(snapshots, snap)
+		}
+	}
+	return snapshots, nil
+}
+
+func rollbackToSnapshot(version int) (*SelfState, error) {
+	if err := initSelfDir(); err != nil {
+		return nil, err
+	}
+	snapDir := filepath.Join(selfDir, "snapshots")
+	entries, err := os.ReadDir(snapDir)
+	if err != nil {
+		return nil, fmt.Errorf("no snapshots found")
+	}
+
+	prefix := fmt.Sprintf("v%03d_", version)
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), prefix) {
+			srcDir := filepath.Join(snapDir, e.Name())
+			currentDir := filepath.Join(selfDir, "current")
+
+			// Copy files from snapshot to current
+			for _, fname := range []string{"prompt.md", "params.json", "rules.jsonl"} {
+				data, err := os.ReadFile(filepath.Join(srcDir, fname))
+				if err != nil {
+					continue
+				}
+				os.WriteFile(filepath.Join(currentDir, fname), data, 0644)
+			}
+
+			// Reload state
+			state, err := loadSelfState()
+			if err != nil {
+				return nil, err
+			}
+			return state, nil
+		}
+	}
+
+	// Version 0 = hardcoded default
+	if version == 0 {
+		state := defaultSelfState()
+		if err := saveSelfState(state); err != nil {
+			return nil, err
+		}
+		return state, nil
+	}
+
+	return nil, fmt.Errorf("snapshot version %d not found", version)
+}
+
+func pruneSnapshots() {
+	snapDir := filepath.Join(selfDir, "snapshots")
+	entries, err := os.ReadDir(snapDir)
+	if err != nil {
+		return
+	}
+	if len(entries) <= kernelParams.MaxSnapshots {
+		return
+	}
+	// Remove oldest entries beyond limit, but keep first one
+	toRemove := len(entries) - kernelParams.MaxSnapshots
+	removed := 0
+	for i := 1; i < len(entries)-10 && removed < toRemove; i++ {
+		os.RemoveAll(filepath.Join(snapDir, entries[i].Name()))
+		removed++
+	}
+}
+
+func saveBenchmarkResult(result BenchmarkResult) error {
+	if err := initSelfDir(); err != nil {
+		return err
+	}
+	path := filepath.Join(selfDir, "benchmarks", "results.jsonl")
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	data, _ := json.Marshal(result)
+	_, err = fmt.Fprintln(f, string(data))
+	return err
+}
+
+// ---- Benchmark System ----
+
+type benchmarkCase struct {
+	prompt   string
+	expected string
+	scorer   func(response, expected string) float64
+}
+
+func containsScore(response, expected string) float64 {
+	if strings.Contains(strings.ToLower(response), strings.ToLower(expected)) {
+		return 1.0
+	}
+	return 0.0
+}
+
+func semanticScore(response, expected string) float64 {
+	expWords := strings.Fields(strings.ToLower(expected))
+	if len(expWords) == 0 {
+		return 0.5
+	}
+	respLower := strings.ToLower(response)
+	overlap := 0
+	for _, w := range expWords {
+		if strings.Contains(respLower, w) {
+			overlap++
+		}
+	}
+	return float64(overlap) / float64(len(expWords))
+}
+
+func numericScore(response, _ string) float64 {
+	response = strings.TrimSpace(response)
+	var n float64
+	fmt.Sscanf(response, "%f", &n)
+	if n < 1 {
+		n = 1
+	}
+	if n > 10 {
+		n = 10
+	}
+	return n / 10.0
+}
+
+var benchmarkSuites = map[string][]benchmarkCase{
+	"tool_use": {
+		{prompt: "User says: 'show files in /tmp'. What tool should be called? Answer with just the tool name.", expected: "list_files", scorer: containsScore},
+		{prompt: "User says: 'search for TODO in code'. What tool should be called? Answer with just the tool name.", expected: "grep", scorer: containsScore},
+		{prompt: "User says: 'what happened in the news?'. What tool should be called? Answer with just the tool name.", expected: "web_search", scorer: containsScore},
+	},
+	"reasoning": {
+		{prompt: "If a user uploads an image and says 'これ何?', the AI should use which tool first? Answer the tool name.", expected: "describe", scorer: semanticScore},
+		{prompt: "A user says 'もっと詳しく'. Should the AI (a) elaborate on the previous topic or (b) ask what they mean? Answer a or b.", expected: "a", scorer: containsScore},
+	},
+	"language": {
+		{prompt: "User says 'hello'. Should you respond in English or Japanese? Answer the language.", expected: "English", scorer: containsScore},
+		{prompt: "User says 'こんにちは'. Should you respond in English or Japanese? Answer the language.", expected: "Japanese", scorer: containsScore},
+	},
+	"helpfulness": {
+		{prompt: "Rate this instruction on clarity from 1-10: 'You are a helpful AI assistant with access to tools.' Just the number.", expected: "", scorer: numericScore},
+	},
+}
+
+// ---- Self-Modification Tool Handlers ----
+
+func replaceSectionInPrompt(prompt, sectionHeader, newContent string) string {
+	startIdx := strings.Index(prompt, sectionHeader)
+	if startIdx == -1 {
+		return prompt + "\n\n" + sectionHeader + "\n" + newContent
+	}
+	afterStart := startIdx + len(sectionHeader)
+	remaining := prompt[afterStart:]
+	nextSection := strings.Index(remaining, "\n## ")
+	if nextSection == -1 {
+		return prompt[:startIdx] + sectionHeader + "\n" + newContent
+	}
+	return prompt[:startIdx] + sectionHeader + "\n" + newContent + remaining[nextSection:]
+}
+
+func (a *Agent) selfModifyPrompt(args map[string]interface{}) (string, error) {
+	action, _ := args["action"].(string)
+	content, _ := args["content"].(string)
+	reason, _ := args["reason"].(string)
+	section, _ := args["section"].(string)
+
+	if content == "" || reason == "" {
+		return "", fmt.Errorf("content and reason are required")
+	}
+
+	selfMu.Lock()
+	defer selfMu.Unlock()
+
+	// Snapshot before modification
+	createSnapshot(currentSelf, "pre-modify: "+reason)
+	oldPrompt := currentSelf.Prompt
+
+	switch action {
+	case "replace":
+		currentSelf.Prompt = content
+	case "append":
+		currentSelf.Prompt += "\n\n" + content
+	case "replace_section":
+		if section == "" {
+			currentSelf.Prompt = oldPrompt
+			return "", fmt.Errorf("section header required for replace_section")
+		}
+		currentSelf.Prompt = replaceSectionInPrompt(currentSelf.Prompt, section, content)
+	default:
+		return "", fmt.Errorf("invalid action: %s (use replace, append, or replace_section)", action)
+	}
+
+	// Validate
+	if err := validateSelfState(currentSelf); err != nil {
+		currentSelf.Prompt = oldPrompt
+		return "", fmt.Errorf("modification rejected: %w", err)
+	}
+
+	currentSelf.LastModified = time.Now()
+	saveSelfState(currentSelf)
+	snap, _ := createSnapshot(currentSelf, reason)
+
+	return fmt.Sprintf("System prompt modified (action: %s). Version: v%d.\nReason: %s\nChanges take effect on new conversations. Use self_benchmark to evaluate.", action, snap.Version, reason), nil
+}
+
+func (a *Agent) selfModifyParams(args map[string]interface{}) (string, error) {
+	paramsStr, _ := args["params"].(string)
+	reason, _ := args["reason"].(string)
+
+	if paramsStr == "" || reason == "" {
+		return "", fmt.Errorf("params (JSON) and reason are required")
+	}
+
+	var updates map[string]interface{}
+	if err := json.Unmarshal([]byte(paramsStr), &updates); err != nil {
+		return "", fmt.Errorf("invalid params JSON: %w", err)
+	}
+
+	selfMu.Lock()
+	defer selfMu.Unlock()
+
+	createSnapshot(currentSelf, "pre-params: "+reason)
+
+	if v, ok := updates["temperature"].(float64); ok {
+		currentSelf.Params.Temperature = v
+	}
+	if v, ok := updates["max_turns"].(float64); ok {
+		currentSelf.Params.MaxTurns = int(v)
+	}
+	if v, ok := updates["compress_at"].(float64); ok {
+		currentSelf.Params.CompressAt = int(v)
+	}
+	if v, ok := updates["reflect_on_tools"].(bool); ok {
+		currentSelf.Params.ReflectOnTools = v
+	}
+	if v, ok := updates["preferred_lang"].(string); ok {
+		currentSelf.Params.PreferredLang = v
+	}
+	if v, ok := updates["verbosity"].(string); ok {
+		currentSelf.Params.Verbosity = v
+	}
+
+	if err := validateSelfState(currentSelf); err != nil {
+		// Reload from disk
+		restored, _ := loadSelfState()
+		if restored != nil {
+			*currentSelf = *restored
+		}
+		return "", fmt.Errorf("params rejected: %w", err)
+	}
+
+	currentSelf.LastModified = time.Now()
+	saveSelfState(currentSelf)
+	snap, _ := createSnapshot(currentSelf, reason)
+
+	data, _ := json.MarshalIndent(currentSelf.Params, "", "  ")
+	return fmt.Sprintf("Parameters updated. Version: v%d.\n%s", snap.Version, string(data)), nil
+}
+
+func (a *Agent) selfAddRule(args map[string]interface{}) (string, error) {
+	ruleText, _ := args["rule"].(string)
+	reason, _ := args["reason"].(string)
+	if ruleText == "" || reason == "" {
+		return "", fmt.Errorf("rule and reason are required")
+	}
+
+	selfMu.Lock()
+	defer selfMu.Unlock()
+
+	rule := SelfRule{
+		ID:        fmt.Sprintf("rule-%d", time.Now().UnixMilli()),
+		Rule:      ruleText,
+		Reason:    reason,
+		CreatedAt: time.Now().Unix(),
+		Active:    true,
+	}
+	currentSelf.Rules = append(currentSelf.Rules, rule)
+
+	if err := validateSelfState(currentSelf); err != nil {
+		currentSelf.Rules = currentSelf.Rules[:len(currentSelf.Rules)-1]
+		return "", fmt.Errorf("rule rejected: %w", err)
+	}
+
+	saveSelfState(currentSelf)
+	return fmt.Sprintf("Rule added: [%s] %s\nReason: %s", rule.ID, rule.Rule, rule.Reason), nil
+}
+
+func (a *Agent) selfRemoveRule(args map[string]interface{}) (string, error) {
+	ruleID, _ := args["rule_id"].(string)
+	if ruleID == "" {
+		return "", fmt.Errorf("rule_id is required")
+	}
+
+	selfMu.Lock()
+	defer selfMu.Unlock()
+
+	found := false
+	for i := range currentSelf.Rules {
+		if currentSelf.Rules[i].ID == ruleID {
+			currentSelf.Rules[i].Active = false
+			found = true
+			break
+		}
+	}
+	if !found {
+		return "", fmt.Errorf("rule not found: %s", ruleID)
+	}
+
+	saveSelfState(currentSelf)
+	return fmt.Sprintf("Rule %s deactivated.", ruleID), nil
+}
+
+func (a *Agent) selfStatus() (string, error) {
+	selfMu.RLock()
+	defer selfMu.RUnlock()
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("## Self Status (v%d)\n\n", currentSelf.Version))
+	sb.WriteString(fmt.Sprintf("Last modified: %s\n", currentSelf.LastModified.Format("2006-01-02 15:04:05")))
+	sb.WriteString(fmt.Sprintf("Last benchmark: %.1f%%\n\n", currentSelf.LastBenchmark*100))
+
+	sb.WriteString("### Parameters\n")
+	data, _ := json.MarshalIndent(currentSelf.Params, "", "  ")
+	sb.WriteString("```json\n" + string(data) + "\n```\n\n")
+
+	sb.WriteString(fmt.Sprintf("### System Prompt (%d chars)\n", len(currentSelf.Prompt)))
+	promptPreview := currentSelf.Prompt
+	if len(promptPreview) > 500 {
+		promptPreview = promptPreview[:500] + "..."
+	}
+	sb.WriteString("```\n" + promptPreview + "\n```\n\n")
+
+	// Active rules
+	var activeRules []SelfRule
+	for _, r := range currentSelf.Rules {
+		if r.Active {
+			activeRules = append(activeRules, r)
+		}
+	}
+	sb.WriteString(fmt.Sprintf("### Self-Rules (%d active)\n", len(activeRules)))
+	for _, r := range activeRules {
+		sb.WriteString(fmt.Sprintf("- [%s] %s (%s)\n", r.ID, r.Rule, r.Reason))
+	}
+
+	// Snapshots
+	snapshots, _ := listSnapshots()
+	sb.WriteString(fmt.Sprintf("\n### Version History (%d snapshots)\n", len(snapshots)))
+	// Show last 10
+	start := 0
+	if len(snapshots) > 10 {
+		start = len(snapshots) - 10
+		sb.WriteString(fmt.Sprintf("... (%d older snapshots)\n", start))
+	}
+	for i := start; i < len(snapshots); i++ {
+		s := snapshots[i]
+		score := ""
+		if s.BenchmarkScore > 0 {
+			score = fmt.Sprintf(" [%.1f%%]", s.BenchmarkScore*100)
+		}
+		sb.WriteString(fmt.Sprintf("- v%d: %s - %s%s\n", s.Version, s.Timestamp.Format("01/02 15:04"), s.Reason, score))
+	}
+
+	return sb.String(), nil
+}
+
+func (a *Agent) selfRollback(args map[string]interface{}) (string, error) {
+	versionF, _ := args["version"].(float64)
+	version := int(versionF)
+
+	selfMu.Lock()
+	defer selfMu.Unlock()
+
+	oldVersion := currentSelf.Version
+	state, err := rollbackToSnapshot(version)
+	if err != nil {
+		return "", err
+	}
+	currentSelf = state
+
+	return fmt.Sprintf("Rolled back from v%d to v%d. Changes take effect on new conversations.", oldVersion, version), nil
+}
+
+func (a *Agent) selfBenchmark(args map[string]interface{}) (string, error) {
+	categories := "all"
+	if c, ok := args["categories"].(string); ok && c != "" {
+		categories = c
+	}
+
+	selfMu.RLock()
+	promptText := currentSelf.Prompt
+	version := currentSelf.Version
+	selfMu.RUnlock()
+
+	suitesToRun := make(map[string][]benchmarkCase)
+	if categories == "all" {
+		for k, v := range benchmarkSuites {
+			suitesToRun[k] = v
+		}
+	} else {
+		for _, cat := range strings.Split(categories, ",") {
+			cat = strings.TrimSpace(cat)
+			if suite, ok := benchmarkSuites[cat]; ok {
+				suitesToRun[cat] = suite
+			}
+		}
+	}
+
+	if len(suitesToRun) == 0 {
+		return "", fmt.Errorf("no valid benchmark categories found")
+	}
+
+	// Truncate prompt for evaluation
+	evalPrompt := promptText
+	if len(evalPrompt) > 4000 {
+		evalPrompt = evalPrompt[:4000] + "..."
+	}
+
+	scores := make(map[string]float64)
+	var totalScore float64
+
+	for catName, cases := range suitesToRun {
+		var catScore float64
+		for _, bc := range cases {
+			prompt := fmt.Sprintf("Given this AI system prompt:\n---\n%s\n---\n\n%s", evalPrompt, bc.prompt)
+			_, response, err := callSubModel(prompt, a.config)
+			if err != nil {
+				continue
+			}
+			score := bc.scorer(response, bc.expected)
+			catScore += score
+		}
+		if len(cases) > 0 {
+			scores[catName] = catScore / float64(len(cases))
+			totalScore += scores[catName]
+		}
+	}
+
+	overall := 0.0
+	if len(scores) > 0 {
+		overall = totalScore / float64(len(scores))
+	}
+
+	result := BenchmarkResult{
+		Timestamp:    time.Now(),
+		Version:      version,
+		OverallScore: overall,
+		Scores:       scores,
+	}
+	saveBenchmarkResult(result)
+
+	selfMu.Lock()
+	currentSelf.LastBenchmark = overall
+	saveSelfState(currentSelf)
+	selfMu.Unlock()
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("## Benchmark Results (v%d)\n\n", version))
+	sb.WriteString(fmt.Sprintf("**Overall: %.1f%%**\n\n", overall*100))
+	for cat, score := range scores {
+		sb.WriteString(fmt.Sprintf("- %s: %.1f%%\n", cat, score*100))
+	}
+	return sb.String(), nil
+}
+
+// ---- Self-Improvement Loop ----
+
+func (ws *WebServer) selfImproveLoop() {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		ws.mu.RLock()
+		idle := time.Since(ws.lastActivity) > 5*time.Minute
+		ws.mu.RUnlock()
+
+		if !idle {
+			continue
+		}
+
+		if !ws.improveMu.TryLock() {
+			continue
+		}
+
+		fmt.Println("[siki] Self-improvement loop: analyzing recent conversations...")
+		ws.runSelfImprovement()
+		ws.improveMu.Unlock()
+	}
+}
+
+func (ws *WebServer) runSelfImprovement() {
+	threads, err := listThreads()
+	if err != nil || len(threads) == 0 {
+		return
+	}
+
+	// Look at threads from last 24 hours
+	cutoff := time.Now().Add(-24 * time.Hour)
+	var recentCount int
+	var threadSummaries strings.Builder
+	for _, t := range threads {
+		if t.UpdatedAt.After(cutoff) {
+			recentCount++
+			threadSummaries.WriteString(fmt.Sprintf("- '%s' (%d messages)\n", t.Title, t.MessageCount))
+		}
+	}
+
+	if recentCount == 0 {
+		return
+	}
+
+	selfMu.RLock()
+	lastBench := currentSelf.LastBenchmark
+	version := currentSelf.Version
+	selfMu.RUnlock()
+
+	bullets, _ := loadPlaybook()
+
+	prompt := fmt.Sprintf(`Analyze recent siki usage and suggest improvements.
+
+Recent threads (last 24h):
+%s
+
+Current state: v%d, benchmark: %.1f%%, playbook bullets: %d
+
+Suggest 0-3 specific improvements. Categories:
+- new_rule: add a behavioral rule
+- param_change: adjust parameters
+- prompt_change: modify system prompt
+
+Output JSON array only:
+[{"category":"new_rule|param_change|prompt_change","description":"...","expected_impact":"..."}]
+If no improvements needed: []`, threadSummaries.String(), version, lastBench*100, len(bullets))
+
+	_, response, err := callSubModel(prompt, ws.config)
+	if err != nil {
+		fmt.Printf("[siki] Self-improvement analysis failed: %v\n", err)
+		return
+	}
+
+	start := strings.Index(response, "[")
+	end := strings.LastIndex(response, "]")
+	if start < 0 || end <= start {
+		return
+	}
+
+	var suggestions []struct {
+		Category       string `json:"category"`
+		Description    string `json:"description"`
+		ExpectedImpact string `json:"expected_impact"`
+	}
+	if err := json.Unmarshal([]byte(response[start:end+1]), &suggestions); err != nil {
+		return
+	}
+
+	if len(suggestions) == 0 {
+		fmt.Println("[siki] Self-improvement: no improvements suggested")
+		return
+	}
+
+	for _, s := range suggestions {
+		switch s.Category {
+		case "new_rule":
+			selfMu.Lock()
+			rule := SelfRule{
+				ID:        fmt.Sprintf("auto-%d", time.Now().UnixMilli()),
+				Rule:      s.Description,
+				Reason:    "auto: " + s.ExpectedImpact,
+				CreatedAt: time.Now().Unix(),
+				Active:    true,
+			}
+			currentSelf.Rules = append(currentSelf.Rules, rule)
+			if err := validateSelfState(currentSelf); err != nil {
+				currentSelf.Rules = currentSelf.Rules[:len(currentSelf.Rules)-1]
+				selfMu.Unlock()
+				continue
+			}
+			saveSelfState(currentSelf)
+			selfMu.Unlock()
+			fmt.Printf("[siki] Self-improvement: added rule '%s'\n", s.Description)
+		default:
+			fmt.Printf("[siki] Self-improvement: suggestion logged (%s): %s\n", s.Category, s.Description)
+		}
+	}
+
+	fmt.Println("[siki] Self-improvement cycle complete")
+}
+
+// ============================================================================
 // Docker GPU Container Management
 // ============================================================================
 
@@ -3700,7 +4697,12 @@ Be lenient - only flag clearly irrelevant or nonsensical responses.`},
 func (a *Agent) compressConversation(ctx context.Context) {
 	// Keep system message + last 60 messages, compress everything older
 	// Model has 64k context so we can keep a lot of history
-	const keepRecent = 60
+	keepRecent := 60
+	selfMu.RLock()
+	if currentSelf != nil && currentSelf.Params.CompressAt > 0 {
+		keepRecent = currentSelf.Params.CompressAt
+	}
+	selfMu.RUnlock()
 	if len(a.messages) <= keepRecent+2 {
 		return
 	}
@@ -4164,13 +5166,20 @@ func (a *Agent) chatStream(ctx context.Context, cb StreamCallbacks) (*Message, e
 	}
 
 	streaming := cb.OnContent != nil || cb.OnThinking != nil
+	temp := 0.7
+	selfMu.RLock()
+	if currentSelf != nil {
+		temp = currentSelf.Params.Temperature
+	}
+	selfMu.RUnlock()
+
 	req := ChatRequest{
 		Model:       a.config.primaryProvider().Model,
 		Messages:    a.messages,
 		Tools:       toolDefs,
 		ToolChoice:  "auto",
 		MaxTokens:   4096,
-		Temperature: 0.7,
+		Temperature: temp,
 		Stream:      streaming,
 	}
 
@@ -4679,6 +5688,8 @@ type WebServer struct {
 	config        *Config
 	conversations map[string]*Agent
 	mu            sync.RWMutex
+	lastActivity  time.Time
+	improveMu     sync.Mutex
 }
 
 type ChatAPIRequest struct {
@@ -4725,6 +5736,7 @@ func NewWebServer(config *Config) *WebServer {
 	return &WebServer{
 		config:        config,
 		conversations: make(map[string]*Agent),
+		lastActivity:  time.Now(),
 	}
 }
 
@@ -4735,7 +5747,48 @@ func buildSystemPrompt(config *Config) string {
 	var sb strings.Builder
 	sb.WriteString(dateStr)
 	sb.WriteString("\n\n")
-	sb.WriteString(config.SystemPrompt)
+
+	// Use self-state prompt if available, otherwise config default
+	selfMu.RLock()
+	if currentSelf != nil && currentSelf.Prompt != "" {
+		sb.WriteString(currentSelf.Prompt)
+
+		// Inject self-rules
+		var activeRules []SelfRule
+		for _, r := range currentSelf.Rules {
+			if r.Active {
+				activeRules = append(activeRules, r)
+			}
+		}
+		if len(activeRules) > 0 {
+			sb.WriteString("\n\n## Self-Rules (自己ルール)\n")
+			for _, r := range activeRules {
+				sb.WriteString(fmt.Sprintf("- %s\n", r.Rule))
+			}
+		}
+	} else {
+		sb.WriteString(config.SystemPrompt)
+	}
+	selfMu.RUnlock()
+
+	// Inject immutable self-modification instructions (kernel)
+	sb.WriteString(`
+
+## Self-Modification (自己改変)
+You can modify your own behavior:
+- self_status: View current version, parameters, rules, benchmark score
+- self_modify_prompt: Edit your system prompt (auto-snapshot before changes)
+- self_modify_params: Adjust behavioral parameters (temperature, max_turns, etc.)
+- self_add_rule / self_remove_rule: Manage self-imposed rules
+- self_rollback: Revert to a previous version (version 0 = factory default)
+- self_benchmark: Run self-evaluation benchmarks
+
+When modifying yourself:
+1. Run self_benchmark BEFORE and AFTER changes
+2. If score drops, consider rollback
+3. Document your reason for every change
+4. Prefer small, incremental changes
+`)
 
 	// Inject ACE playbook context
 	sb.WriteString(buildPlaybookContext())
@@ -5579,6 +6632,11 @@ func (ws *WebServer) handleChatStream(w http.ResponseWriter, r *http.Request) {
 		flusher.Flush()
 	}
 
+	// Track activity for self-improvement idle detection
+	ws.mu.Lock()
+	ws.lastActivity = time.Now()
+	ws.mu.Unlock()
+
 	agent := ws.getOrCreateAgent(req.ConversationID)
 
 	// Helper: save a message to thread log immediately
@@ -5925,6 +6983,23 @@ func runWeb(config *Config, host string, port int) error {
 	if err := initPlaybookDir(); err != nil {
 		fmt.Printf("Warning: failed to initialize playbook dir: %v\n", err)
 	}
+	// Initialize self-modification system
+	if err := initSelfDir(); err != nil {
+		fmt.Printf("Warning: failed to initialize self dir: %v\n", err)
+	}
+	if currentSelf == nil {
+		selfState, err := loadSelfState()
+		if err != nil {
+			fmt.Printf("Warning: failed to load self-state, using defaults: %v\n", err)
+			selfState = defaultSelfState()
+		}
+		currentSelf = selfState
+		// Save initial state if prompt.md doesn't exist
+		if _, err := os.Stat(filepath.Join(selfDir, "current", "prompt.md")); os.IsNotExist(err) {
+			saveSelfState(currentSelf)
+			fmt.Printf("[siki] Initialized self-state v%d (prompt.md created)\n", currentSelf.Version)
+		}
+	}
 
 	fmt.Printf("siki v%s - 式神 Web GUI\n", Version)
 	pp := config.primaryProvider()
@@ -5958,6 +7033,9 @@ func runWeb(config *Config, host string, port int) error {
 		fmt.Printf("\nStarting web server on http://%s\n", addr)
 	}
 	fmt.Println("Press Ctrl+C to stop")
+
+	// Start self-improvement background loop
+	go ws.selfImproveLoop()
 
 	// Open browser automatically (only for localhost)
 	if host != "0.0.0.0" {
@@ -6130,6 +7208,16 @@ func main() {
 				i += 2
 				continue
 			}
+		case "--reset-self":
+			if err := initSelfDir(); err == nil {
+				selfMu.Lock()
+				currentSelf = defaultSelfState()
+				saveSelfState(currentSelf)
+				selfMu.Unlock()
+				fmt.Println("[siki] Self-state reset to factory defaults.")
+			}
+			i++
+			continue
 		case "--workspace":
 			if i+1 < len(args) {
 				config.Workspace = args[i+1]
