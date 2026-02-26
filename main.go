@@ -164,7 +164,7 @@ func defaultConfig() *Config {
 
 ## run_code
 描画・可視化・ゲーム → 必ず run_code で実行。コード例を見せるな。
-完全なHTML（<html><head><style>...</style></head><body>...</body></html>）を渡せ。
+コード生成はサブモデルが自動で担当する。run_codeツールを呼べばよい。
 
 ## プラグイン
 create_pluginで作成後、必ずtest_pluginでテストせよ。
@@ -173,8 +173,8 @@ create_pluginで作成後、必ずtest_pluginでテストせよ。
 日本語ユーザーは主語を省略する。直前の文脈から推測して対応しろ。「何についてですか？」と聞き返すな。
 
 ## 回答パターン
-1. まずツールを呼ぶ（情報収集）
-2. 結果を確認
+1. ツールを呼ぶ前に宣言しろ（例:「web_searchで調べます」「run_codeで描画します」）
+2. ツールを呼ぶ
 3. 結果に基づいて回答
 
 ユーザーの言語で回答せよ。`,
@@ -888,6 +888,130 @@ func selectToolsForContext(messages []Message) []Tool {
 	return selected
 }
 
+// autoToolFallback detects when the model should have called a tool but didn't,
+// and automatically executes the appropriate tool. Returns the tool result if
+// a fallback was triggered, empty string otherwise.
+func autoToolFallback(agent *Agent, userMsg string, modelResponse string, sendEvent func(StreamEvent), saveMsg func(Message, string)) string {
+	lower := strings.ToLower(userMsg)
+
+	type fallback struct {
+		keywords []string
+		tool     string
+		argsFn   func() map[string]interface{}
+	}
+
+	fallbacks := []fallback{
+		{
+			keywords: []string{"ニュース", "最新", "速報", "news", "latest", "トレンド"},
+			tool:     "web_search",
+			argsFn:   func() map[string]interface{} { return map[string]interface{}{"query": userMsg} },
+		},
+		{
+			keywords: []string{"調べて", "検索して", "について教えて"},
+			tool:     "web_search",
+			argsFn:   func() map[string]interface{} { return map[string]interface{}{"query": userMsg} },
+		},
+		{
+			keywords: []string{"描いて", "書いて", "可視化", "グラフ描", "ゲーム作", "フラクタル", "マンデルブロ", "シミュレーション", "アニメーション"},
+			tool:     "run_code",
+			argsFn: func() map[string]interface{} {
+				// Delegate code generation to the sub-model (gpt-oss:20b)
+				sendEvent(StreamEvent{Type: "content", Content: "\n\n🔧 run_code — サブモデルでコード生成中...\n"})
+				html, err := generateCodeWithSubModel(userMsg, agent.config)
+				if err != nil {
+					fmt.Printf("[siki] Sub-model code gen failed: %v, trying model response\n", err)
+					// Fall back: try to extract HTML from the orchestrator's text response
+					html = modelResponse
+					if idx := strings.Index(html, "<html"); idx >= 0 {
+						html = html[idx:]
+						if end := strings.Index(html, "</html>"); end >= 0 {
+							html = html[:end+7]
+						}
+					} else if idx := strings.Index(html, "```html"); idx >= 0 {
+						html = html[idx+7:]
+						if end := strings.Index(html, "```"); end >= 0 {
+							html = html[:end]
+						}
+					}
+					html = strings.TrimSpace(html)
+					if html == "" || len(html) < 20 {
+						return nil // skip this fallback
+					}
+					if !strings.Contains(html, "<html") {
+						html = "<html><body>" + html + "</body></html>"
+					}
+				}
+				return map[string]interface{}{"html": html}
+			},
+		},
+	}
+
+	for _, fb := range fallbacks {
+		matched := false
+		for _, kw := range fb.keywords {
+			if strings.Contains(lower, kw) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			continue
+		}
+
+		args := fb.argsFn()
+		if args == nil {
+			continue
+		}
+
+		fmt.Printf("[siki] Auto-fallback: model didn't call %s, executing automatically\n", fb.tool)
+
+		result, err := agent.executeTool(fb.tool, args)
+		if err != nil {
+			result = fmt.Sprintf("Error: %v", err)
+		}
+
+		displayResult := result
+		if len(displayResult) > 2000 {
+			displayResult = displayResult[:2000] + "\n... (truncated)"
+		}
+
+		sendEvent(StreamEvent{Type: "tool_call", Name: fb.tool, Result: displayResult})
+
+		// Add tool call and result to conversation
+		toolCallID := fmt.Sprintf("auto-%d", time.Now().UnixMilli())
+		argsJSON, _ := json.Marshal(args)
+		assistantMsg := Message{
+			Role:    "assistant",
+			Content: "",
+			ToolCalls: []ToolCall{{
+				ID:   toolCallID,
+				Type: "function",
+				Function: struct {
+					Name      string `json:"name"`
+					Arguments string `json:"arguments"`
+				}{Name: fb.tool, Arguments: string(argsJSON)},
+			}},
+		}
+		// Replace last assistant message (the text response) with tool call
+		if len(agent.messages) > 0 && agent.messages[len(agent.messages)-1].Role == "assistant" {
+			agent.messages[len(agent.messages)-1] = assistantMsg
+		}
+		saveMsg(assistantMsg, "")
+
+		toolMsg := Message{
+			Role:       "tool",
+			Content:    result,
+			ToolCallID: toolCallID,
+		}
+		agent.messages = append(agent.messages, toolMsg)
+		saveMsg(toolMsg, fb.tool)
+
+		return result
+	}
+
+	return ""
+}
+
 // ============================================================================
 // Tool Execution
 // ============================================================================
@@ -896,6 +1020,16 @@ type Agent struct {
 	config   *Config
 	messages []Message
 	threadID string
+}
+
+// lastUserMessage returns the content of the most recent user message
+func (a *Agent) lastUserMessage() string {
+	for i := len(a.messages) - 1; i >= 0; i-- {
+		if a.messages[i].Role == "user" {
+			return a.messages[i].Content
+		}
+	}
+	return ""
 }
 
 func defaultEndpointForBackend(backend string) string {
@@ -2140,6 +2274,110 @@ func callSubModel(prompt string, config *Config) (thinking string, response stri
 	}
 
 	return thinking, content, nil
+}
+
+// generateCodeWithSubModel delegates code generation to the sub-model (e.g., gpt-oss:20b)
+// for higher quality output. The orchestrator (1.2B) decides WHAT tool to call,
+// the sub-model generates the actual code. Returns complete HTML string.
+func generateCodeWithSubModel(userRequest string, config *Config) (string, error) {
+	if config.SubModel == "" {
+		return "", fmt.Errorf("no sub-model configured")
+	}
+
+	prompt := fmt.Sprintf(`以下のリクエストに対して、完全なHTMLページを生成せよ。
+
+要件:
+- HTMLコードのみ出力（説明不要）
+- <html>, <head>, <body>タグを含む完全なHTML文書
+- CSSは<style>タグ、JavaScriptは<script>タグ内に記述
+- Canvas APIを使ったグラフィックス/アニメーションが必要な場合はCanvas使用
+- 視覚的に美しいモダンなデザイン
+- 日本語UIにすること
+
+リクエスト: %s`, userRequest)
+
+	endpoint := strings.TrimSuffix(config.primaryProvider().Endpoint, "/v1")
+
+	reqBody := map[string]interface{}{
+		"model":  config.SubModel,
+		"prompt": prompt,
+		"stream": false,
+		"options": map[string]interface{}{
+			"num_predict": 4096,
+		},
+	}
+
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", fmt.Errorf("marshal error: %w", err)
+	}
+
+	// Longer timeout: sub-model may need to load first (20B model takes minutes on RPi)
+	client := &http.Client{Timeout: 600 * time.Second}
+	resp, err := client.Post(endpoint+"/api/generate", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return "", fmt.Errorf("sub-model request error: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var genResp struct {
+		Response string `json:"response"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&genResp); err != nil {
+		return "", fmt.Errorf("sub-model decode error: %w", err)
+	}
+
+	content := genResp.Response
+
+	// Strip <think>...</think> tags
+	if ti := strings.Index(content, "<think>"); ti >= 0 {
+		if te := strings.Index(content, "</think>"); te > ti {
+			content = strings.TrimSpace(content[:ti] + content[te+8:])
+		}
+	}
+
+	// Extract HTML from response
+	html := content
+	if idx := strings.Index(html, "<!DOCTYPE"); idx >= 0 {
+		html = html[idx:]
+	} else if idx := strings.Index(html, "<html"); idx >= 0 {
+		html = html[idx:]
+	}
+	// Find end of HTML document
+	if end := strings.LastIndex(html, "</html>"); end >= 0 {
+		html = html[:end+7]
+	}
+
+	// Try code fences if no HTML tags found
+	if !strings.Contains(html, "<html") && !strings.Contains(html, "<!DOCTYPE") {
+		if idx := strings.Index(content, "```html"); idx >= 0 {
+			html = content[idx+7:]
+			if end := strings.Index(html, "```"); end >= 0 {
+				html = html[:end]
+			}
+		} else if idx := strings.Index(content, "```"); idx >= 0 {
+			html = content[idx+3:]
+			if nl := strings.Index(html, "\n"); nl >= 0 {
+				html = html[nl+1:]
+			}
+			if end := strings.Index(html, "```"); end >= 0 {
+				html = html[:end]
+			}
+		}
+	}
+
+	html = strings.TrimSpace(html)
+	if html == "" || len(html) < 50 {
+		return "", fmt.Errorf("sub-model generated insufficient code (%d bytes)", len(html))
+	}
+
+	// Wrap in HTML if not already
+	if !strings.Contains(html, "<html") && !strings.Contains(html, "<!DOCTYPE") {
+		html = "<!DOCTYPE html>\n<html><head><meta charset=\"UTF-8\"></head><body>\n" + html + "\n</body></html>"
+	}
+
+	fmt.Printf("[siki] Sub-model generated %d bytes of HTML code\n", len(html))
+	return html, nil
 }
 
 func (a *Agent) webImages(targetURL string) (string, error) {
@@ -7149,6 +7387,16 @@ func (ws *WebServer) handleChat(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 
+			// For code generation tools, delegate to sub-model
+			if tc.Function.Name == "run_code" {
+				userReq := agent.lastUserMessage()
+				if html, genErr := generateCodeWithSubModel(userReq, ws.config); genErr == nil {
+					args["html"] = html
+				} else {
+					fmt.Printf("[siki] Sub-model code gen failed: %v, using orchestrator HTML\n", genErr)
+				}
+			}
+
 			result, err := agent.executeTool(tc.Function.Name, args)
 			if err != nil {
 				result = fmt.Sprintf("Error: %v", err)
@@ -7323,12 +7571,24 @@ func (ws *WebServer) handleChatStream(w http.ResponseWriter, r *http.Request) {
 		saveMsg(*response, "")
 
 		if len(response.ToolCalls) == 0 {
+			// Fallback: if model didn't call tools but should have, auto-call
+			if turn == 0 {
+				if fallbackResult := autoToolFallback(agent, req.Message, response.Content, sendEvent, saveMsg); fallbackResult != "" {
+					lastAssistantReply = fallbackResult
+					break
+				}
+			}
 			lastAssistantReply = response.Content
 			break
 		}
 
 		// Execute tool calls
 		for _, tc := range response.ToolCalls {
+			// Announce tool call to user (only if model didn't already say something)
+			if response.Content == "" {
+				sendEvent(StreamEvent{Type: "content", Content: fmt.Sprintf("\n🔧 %s を呼びます...\n", tc.Function.Name)})
+			}
+
 			var args map[string]interface{}
 			if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
 				result := fmt.Sprintf("Error parsing arguments: %v", err)
@@ -7341,6 +7601,17 @@ func (ws *WebServer) handleChatStream(w http.ResponseWriter, r *http.Request) {
 				agent.messages = append(agent.messages, toolMsg)
 				saveMsg(toolMsg, tc.Function.Name)
 				continue
+			}
+
+			// For code generation tools, delegate to sub-model for higher quality
+			if tc.Function.Name == "run_code" {
+				sendEvent(StreamEvent{Type: "content", Content: "サブモデルでコード生成中...\n"})
+				userReq := agent.lastUserMessage()
+				if html, genErr := generateCodeWithSubModel(userReq, ws.config); genErr == nil {
+					args["html"] = html
+				} else {
+					fmt.Printf("[siki] Sub-model code gen failed: %v, using orchestrator HTML\n", genErr)
+				}
 			}
 
 			result, err := agent.executeTool(tc.Function.Name, args)
