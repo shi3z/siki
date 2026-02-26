@@ -2364,13 +2364,7 @@ func callSubModel(prompt string, config *Config) (thinking string, response stri
 	content := genResp.Response
 	thinking = genResp.Thinking
 
-	// If response is empty but thinking has content, use thinking as content
-	if content == "" && thinking != "" {
-		content = thinking
-		thinking = ""
-	}
-
-	// Also strip inline <think> tags (some models embed them in response)
+	// Strip inline <think> tags (some models embed them in response)
 	if ti := strings.Index(content, "<think>"); ti >= 0 {
 		if te := strings.Index(content, "</think>"); te > ti {
 			thinking = strings.TrimSpace(content[ti+7 : te])
@@ -2434,9 +2428,6 @@ func generateCodeWithSubModel(userRequest string, config *Config) (string, error
 	}
 
 	content := genResp.Response
-	if content == "" && genResp.Thinking != "" {
-		content = genResp.Thinking
-	}
 
 	// Strip <think>...</think> tags
 	if ti := strings.Index(content, "<think>"); ti >= 0 {
@@ -2525,13 +2516,9 @@ func callOllamaGenerate(model, prompt string, maxTokens int, timeout time.Durati
 		return "", fmt.Errorf("decode error: %w", err)
 	}
 
-	// Thinking models may put content in "thinking" field with empty "response"
 	content := genResp.Response
-	if content == "" && genResp.Thinking != "" {
-		content = genResp.Thinking
-	}
 
-	// Also strip inline <think> tags (some models embed them in response)
+	// Strip inline <think> tags (some models embed them in response)
 	if ti := strings.Index(content, "<think>"); ti >= 0 {
 		if te := strings.Index(content, "</think>"); te > ti {
 			content = strings.TrimSpace(content[:ti] + content[te+8:])
