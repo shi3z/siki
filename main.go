@@ -888,6 +888,27 @@ func selectToolsForContext(messages []Message) []Tool {
 	return selected
 }
 
+// needsRunCode checks if a user request requires run_code (Canvas/JS) rather than diagram (Graphviz).
+// Used to redirect when the model picks the wrong tool.
+func needsRunCode(userMsg string) bool {
+	lower := strings.ToLower(userMsg)
+	keywords := []string{
+		"マンデルブロ", "フラクタル", "mandelbrot", "fractal",
+		"シミュレーション", "simulation", "アニメーション", "animation",
+		"ゲーム", "game", "3d", "canvas", "物理", "physics",
+		"パーティクル", "particle", "波", "wave",
+		"可視化", "visualization", "インタラクティブ", "interactive",
+		"ライフゲーム", "life", "テトリス", "tetris", "スネーク", "snake",
+		"迷路", "maze", "ソート", "sort",
+	}
+	for _, kw := range keywords {
+		if strings.Contains(lower, kw) {
+			return true
+		}
+	}
+	return false
+}
+
 // autoToolFallback detects when the model should have called a tool but didn't,
 // and automatically executes the appropriate tool. Returns the tool result if
 // a fallback was triggered, empty string otherwise.
@@ -7371,6 +7392,17 @@ func (ws *WebServer) handleChat(w http.ResponseWriter, r *http.Request) {
 
 		// Execute tool calls
 		for _, tc := range response.ToolCalls {
+			toolName := tc.Function.Name
+
+			// Redirect: diagram can't handle complex visualizations
+			if toolName == "diagram" {
+				userReq := agent.lastUserMessage()
+				if needsRunCode(userReq) {
+					fmt.Printf("[siki] Redirecting diagram → run_code for: %s\n", userReq)
+					toolName = "run_code"
+				}
+			}
+
 			var args map[string]interface{}
 			if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
 				toolMsg := Message{
@@ -7379,16 +7411,16 @@ func (ws *WebServer) handleChat(w http.ResponseWriter, r *http.Request) {
 					ToolCallID: tc.ID,
 				}
 				agent.messages = append(agent.messages, toolMsg)
-				saveMsg(toolMsg, tc.Function.Name)
+				saveMsg(toolMsg, toolName)
 				apiResp.ToolCalls = append(apiResp.ToolCalls, ToolCallResult{
-					Name:   tc.Function.Name,
+					Name:   toolName,
 					Result: fmt.Sprintf("Error: %v", err),
 				})
 				continue
 			}
 
 			// For code generation tools, delegate to sub-model
-			if tc.Function.Name == "run_code" {
+			if toolName == "run_code" {
 				userReq := agent.lastUserMessage()
 				if html, genErr := generateCodeWithSubModel(userReq, ws.config); genErr == nil {
 					args["html"] = html
@@ -7397,7 +7429,7 @@ func (ws *WebServer) handleChat(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 
-			result, err := agent.executeTool(tc.Function.Name, args)
+			result, err := agent.executeTool(toolName, args)
 			if err != nil {
 				result = fmt.Sprintf("Error: %v", err)
 			}
@@ -7408,7 +7440,7 @@ func (ws *WebServer) handleChat(w http.ResponseWriter, r *http.Request) {
 			}
 
 			apiResp.ToolCalls = append(apiResp.ToolCalls, ToolCallResult{
-				Name:   tc.Function.Name,
+				Name:   toolName,
 				Result: displayResult,
 			})
 
@@ -7584,27 +7616,38 @@ func (ws *WebServer) handleChatStream(w http.ResponseWriter, r *http.Request) {
 
 		// Execute tool calls
 		for _, tc := range response.ToolCalls {
+			toolName := tc.Function.Name
+
+			// Redirect: diagram can't handle complex visualizations — use run_code instead
+			if toolName == "diagram" {
+				userReq := agent.lastUserMessage()
+				if needsRunCode(userReq) {
+					fmt.Printf("[siki] Redirecting diagram → run_code for: %s\n", userReq)
+					toolName = "run_code"
+				}
+			}
+
 			// Announce tool call to user (only if model didn't already say something)
 			if response.Content == "" {
-				sendEvent(StreamEvent{Type: "content", Content: fmt.Sprintf("\n🔧 %s を呼びます...\n", tc.Function.Name)})
+				sendEvent(StreamEvent{Type: "content", Content: fmt.Sprintf("\n🔧 %s を呼びます...\n", toolName)})
 			}
 
 			var args map[string]interface{}
 			if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
 				result := fmt.Sprintf("Error parsing arguments: %v", err)
-				sendEvent(StreamEvent{Type: "tool_call", Name: tc.Function.Name, Result: result})
+				sendEvent(StreamEvent{Type: "tool_call", Name: toolName, Result: result})
 				toolMsg := Message{
 					Role:       "tool",
 					Content:    result,
 					ToolCallID: tc.ID,
 				}
 				agent.messages = append(agent.messages, toolMsg)
-				saveMsg(toolMsg, tc.Function.Name)
+				saveMsg(toolMsg, toolName)
 				continue
 			}
 
 			// For code generation tools, delegate to sub-model for higher quality
-			if tc.Function.Name == "run_code" {
+			if toolName == "run_code" {
 				sendEvent(StreamEvent{Type: "content", Content: "サブモデルでコード生成中...\n"})
 				userReq := agent.lastUserMessage()
 				if html, genErr := generateCodeWithSubModel(userReq, ws.config); genErr == nil {
@@ -7614,7 +7657,7 @@ func (ws *WebServer) handleChatStream(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 
-			result, err := agent.executeTool(tc.Function.Name, args)
+			result, err := agent.executeTool(toolName, args)
 			if err != nil {
 				result = fmt.Sprintf("Error: %v", err)
 			}
@@ -7624,7 +7667,7 @@ func (ws *WebServer) handleChatStream(w http.ResponseWriter, r *http.Request) {
 				displayResult = displayResult[:2000] + "\n... (truncated)"
 			}
 
-			sendEvent(StreamEvent{Type: "tool_call", Name: tc.Function.Name, Result: displayResult})
+			sendEvent(StreamEvent{Type: "tool_call", Name: toolName, Result: displayResult})
 
 			toolMsg := Message{
 				Role:       "tool",
@@ -7632,7 +7675,7 @@ func (ws *WebServer) handleChatStream(w http.ResponseWriter, r *http.Request) {
 				ToolCallID: tc.ID,
 			}
 			agent.messages = append(agent.messages, toolMsg)
-			saveMsg(toolMsg, tc.Function.Name)
+			saveMsg(toolMsg, toolName)
 
 			// ACE Reflector: extract insights from tool execution (async, non-blocking)
 			go func(toolName, toolArgs, toolResult, userQuery string, cfg *Config) {
