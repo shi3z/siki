@@ -897,7 +897,14 @@ func (a *Agent) setAuthHeaders(req *http.Request) {
 	setProviderHeaders(req, a.config.primaryProvider())
 }
 
-func (a *Agent) executeTool(name string, args map[string]interface{}) (string, error) {
+func (a *Agent) executeTool(name string, args map[string]interface{}) (result string, err error) {
+	// Recover from panics (e.g. nil type assertions when model omits required args)
+	defer func() {
+		if r := recover(); r != nil {
+			result = ""
+			err = fmt.Errorf("tool %s panicked: %v (check arguments)", name, r)
+		}
+	}()
 	// Sanitize tool name: strip model artifacts like <|channel|>commentary
 	if idx := strings.Index(name, "<"); idx != -1 {
 		name = strings.TrimSpace(name[:idx])
@@ -958,7 +965,11 @@ func (a *Agent) executeTool(name string, args map[string]interface{}) (string, e
 		if t, ok := args["title"].(string); ok {
 			title = t
 		}
-		return a.runCode(args["html"].(string), title)
+		html, _ := args["html"].(string)
+		if html == "" {
+			return "", fmt.Errorf("html parameter is required")
+		}
+		return a.runCode(html, title)
 	case "docker_exec":
 		timeout := 300
 		if t, ok := args["timeout"].(float64); ok {
@@ -1533,8 +1544,42 @@ func (a *Agent) grep(pattern, path string) (string, error) {
 }
 
 func (a *Agent) webSearch(query string) (string, error) {
+	// Detect time-sensitive queries and auto-append current date context
+	timeSensitivePatterns := []string{
+		"ニュース", "最新", "最近", "今日", "今週", "今月", "速報", "動向", "トレンド",
+		"news", "latest", "recent", "today", "current", "trending", "update",
+	}
+	queryLower := strings.ToLower(query)
+	isTimeSensitive := false
+	for _, pat := range timeSensitivePatterns {
+		if strings.Contains(queryLower, pat) {
+			isTimeSensitive = true
+			break
+		}
+	}
+
+	// Build search URL with date filter for time-sensitive queries
+	now := time.Now()
+	searchQuery := query
+	dateFilter := ""
+	if isTimeSensitive {
+		// Append year+month to bias results toward current time
+		hasYear := false
+		for y := now.Year() - 1; y <= now.Year(); y++ {
+			if strings.Contains(query, fmt.Sprintf("%d", y)) {
+				hasYear = true
+				break
+			}
+		}
+		if !hasYear {
+			searchQuery = fmt.Sprintf("%s %d年%d月", query, now.Year(), int(now.Month()))
+		}
+		dateFilter = "&df=m" // DuckDuckGo: filter to past month
+	}
+
 	// Use DuckDuckGo HTML search
-	searchURL := fmt.Sprintf("https://html.duckduckgo.com/html/?q=%s", strings.ReplaceAll(query, " ", "+"))
+	encodedQuery := url.QueryEscape(searchQuery)
+	searchURL := fmt.Sprintf("https://html.duckduckgo.com/html/?q=%s%s", encodedQuery, dateFilter)
 
 	client := &http.Client{Timeout: 30 * time.Second}
 	req, err := http.NewRequest("GET", searchURL, nil)
@@ -1635,7 +1680,11 @@ func (a *Agent) webSearch(query string) (string, error) {
 		return "No search results found.", nil
 	}
 
-	return fmt.Sprintf("Search results for: %s\n\n%s", query, strings.Join(results, "\n---\n")), nil
+	header := fmt.Sprintf("Search results for: %s", query)
+	if searchQuery != query {
+		header += fmt.Sprintf(" (searched: %s)", searchQuery)
+	}
+	return fmt.Sprintf("%s\n\n%s", header, strings.Join(results, "\n---\n")), nil
 }
 
 func cleanHTMLEntities(s string) string {
