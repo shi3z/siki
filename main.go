@@ -645,6 +645,40 @@ var tools = []Tool{
 		},
 	},
 	{
+		Name:        "self_evolve",
+		Description: "Modify your own Go source code, rebuild, test, and hot-reload. This is code-level self-modification with automatic backup, test gating, and graceful process restart.",
+		Parameters: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"action": map[string]interface{}{
+					"type":        "string",
+					"description": "view_source: view source lines, patch: apply text replacement, build_test: compile and run tests, deploy: deploy tested binary and restart, status: show evolution state, abort: revert all patches",
+				},
+				"start_line": map[string]interface{}{
+					"type":        "number",
+					"description": "Start line for view_source (default: 1)",
+				},
+				"end_line": map[string]interface{}{
+					"type":        "number",
+					"description": "End line for view_source (default: 50)",
+				},
+				"old_text": map[string]interface{}{
+					"type":        "string",
+					"description": "Text to replace (for patch action)",
+				},
+				"new_text": map[string]interface{}{
+					"type":        "string",
+					"description": "Replacement text (for patch action)",
+				},
+				"description": map[string]interface{}{
+					"type":        "string",
+					"description": "Description of the patch or deployment reason",
+				},
+			},
+			"required": []string{"action"},
+		},
+	},
+	{
 		Name:        "index_document",
 		Description: "URLやテキストからドキュメントの階層インデックスを作成する。長文ドキュメントを構造化して後で検索可能にする",
 		Parameters: map[string]interface{}{
@@ -956,6 +990,8 @@ func (a *Agent) executeTool(name string, args map[string]interface{}) (string, e
 		return a.selfRollback(args)
 	case "self_benchmark":
 		return a.selfBenchmark(args)
+	case "self_evolve":
+		return a.selfEvolve(args)
 	case "index_document":
 		title, _ := args["title"].(string)
 		docURL, _ := args["url"].(string)
@@ -3781,6 +3817,467 @@ If no improvements needed: []`, threadSummaries.String(), version, lastBench*100
 }
 
 // ============================================================================
+// Self-Evolution System (Code-Level Kernel Modification)
+// ============================================================================
+
+// EvolveState tracks an in-progress code evolution
+type EvolveState struct {
+	SourceDir   string        `json:"source_dir"`
+	Patches     []EvolvePatch `json:"patches"`
+	BuildStatus string        `json:"build_status"` // "", "success", "failed"
+	TestStatus  string        `json:"test_status"`  // "", "success", "failed"
+	BuildOutput string        `json:"build_output"`
+	TestOutput  string        `json:"test_output"`
+	TempBinary  string        `json:"temp_binary"`
+	OrigSource  string        `json:"-"` // backup of main.go before patches
+	StartedAt   time.Time     `json:"started_at"`
+}
+
+type EvolvePatch struct {
+	Description string `json:"description"`
+	OldText     string `json:"old_text"`
+	NewText     string `json:"new_text"`
+	Applied     bool   `json:"applied"`
+}
+
+type EvolveHistory struct {
+	Timestamp   time.Time `json:"timestamp"`
+	GitHash     string    `json:"git_hash"`
+	PatchCount  int       `json:"patch_count"`
+	TestsPassed bool      `json:"tests_passed"`
+	Reason      string    `json:"reason"`
+	Success     bool      `json:"success"`
+}
+
+var evolveState *EvolveState
+var evolveMu sync.Mutex
+
+// detectSourceDir finds the siki source directory by looking for main.go + go.mod
+func detectSourceDir() string {
+	candidates := []string{"/mnt/siki"}
+	if exe, err := os.Executable(); err == nil {
+		candidates = append([]string{filepath.Dir(exe)}, candidates...)
+	}
+	for _, dir := range candidates {
+		mainGo := filepath.Join(dir, "main.go")
+		goMod := filepath.Join(dir, "go.mod")
+		if _, err := os.Stat(mainGo); err == nil {
+			if _, err := os.Stat(goMod); err == nil {
+				return dir
+			}
+		}
+	}
+	return ""
+}
+
+func (a *Agent) selfEvolve(args map[string]interface{}) (string, error) {
+	action, _ := args["action"].(string)
+	switch action {
+	case "view_source":
+		return a.evolveViewSource(args)
+	case "patch":
+		return a.evolvePatch(args)
+	case "build_test":
+		return a.evolveBuildTest()
+	case "deploy":
+		return a.evolveDeploy(args)
+	case "status":
+		return a.evolveStatus()
+	case "abort":
+		return a.evolveAbort()
+	default:
+		return "", fmt.Errorf("unknown action: %s (valid: view_source, patch, build_test, deploy, status, abort)", action)
+	}
+}
+
+func (a *Agent) evolveViewSource(args map[string]interface{}) (string, error) {
+	sourceDir := detectSourceDir()
+	if sourceDir == "" {
+		return "", fmt.Errorf("source directory not found (need main.go + go.mod)")
+	}
+
+	startLine := 1
+	endLine := 50
+	if s, ok := args["start_line"].(float64); ok {
+		startLine = int(s)
+	}
+	if e, ok := args["end_line"].(float64); ok {
+		endLine = int(e)
+	}
+
+	data, err := os.ReadFile(filepath.Join(sourceDir, "main.go"))
+	if err != nil {
+		return "", err
+	}
+
+	lines := strings.Split(string(data), "\n")
+	if startLine < 1 {
+		startLine = 1
+	}
+	if endLine > len(lines) {
+		endLine = len(lines)
+	}
+	if endLine-startLine > 200 {
+		endLine = startLine + 200
+	}
+
+	var result strings.Builder
+	result.WriteString(fmt.Sprintf("Source: %s/main.go (lines %d-%d of %d)\n\n", sourceDir, startLine, endLine, len(lines)))
+	for i := startLine - 1; i < endLine && i < len(lines); i++ {
+		result.WriteString(fmt.Sprintf("%5d | %s\n", i+1, lines[i]))
+	}
+	return result.String(), nil
+}
+
+func (a *Agent) evolvePatch(args map[string]interface{}) (string, error) {
+	evolveMu.Lock()
+	defer evolveMu.Unlock()
+
+	sourceDir := detectSourceDir()
+	if sourceDir == "" {
+		return "", fmt.Errorf("source directory not found")
+	}
+
+	oldText, _ := args["old_text"].(string)
+	newText, _ := args["new_text"].(string)
+	description, _ := args["description"].(string)
+
+	if oldText == "" || newText == "" {
+		return "", fmt.Errorf("old_text and new_text are required")
+	}
+	if description == "" {
+		description = "unnamed patch"
+	}
+
+	// Initialize evolve state on first patch
+	if evolveState == nil {
+		data, err := os.ReadFile(filepath.Join(sourceDir, "main.go"))
+		if err != nil {
+			return "", err
+		}
+		evolveState = &EvolveState{
+			SourceDir:  sourceDir,
+			OrigSource: string(data),
+			StartedAt:  time.Now(),
+		}
+	}
+
+	// Read current source (may already have prior patches applied)
+	data, err := os.ReadFile(filepath.Join(sourceDir, "main.go"))
+	if err != nil {
+		return "", err
+	}
+	source := string(data)
+
+	if !strings.Contains(source, oldText) {
+		return "", fmt.Errorf("old_text not found in source. Make sure it matches exactly (including whitespace)")
+	}
+	if strings.Count(source, oldText) > 1 {
+		return "", fmt.Errorf("old_text appears %d times. Provide more surrounding context to make it unique", strings.Count(source, oldText))
+	}
+
+	// Apply patch
+	newSource := strings.Replace(source, oldText, newText, 1)
+	if err := os.WriteFile(filepath.Join(sourceDir, "main.go"), []byte(newSource), 0644); err != nil {
+		return "", err
+	}
+
+	patch := EvolvePatch{
+		Description: description,
+		OldText:     oldText,
+		NewText:     newText,
+		Applied:     true,
+	}
+	evolveState.Patches = append(evolveState.Patches, patch)
+	evolveState.BuildStatus = ""
+	evolveState.TestStatus = ""
+
+	return fmt.Sprintf("Patch #%d applied: %s\nTotal patches staged: %d\nNext: use action=build_test to compile and run tests.", len(evolveState.Patches), description, len(evolveState.Patches)), nil
+}
+
+func (a *Agent) evolveBuildTest() (string, error) {
+	evolveMu.Lock()
+	defer evolveMu.Unlock()
+
+	if evolveState == nil || len(evolveState.Patches) == 0 {
+		return "", fmt.Errorf("no patches staged. Use action=patch first")
+	}
+
+	sourceDir := evolveState.SourceDir
+	goPath := "/usr/local/go/bin/go"
+	if _, err := os.Stat(goPath); err != nil {
+		// Fallback
+		if p, err := exec.LookPath("go"); err == nil {
+			goPath = p
+		} else {
+			return "", fmt.Errorf("Go compiler not found")
+		}
+	}
+
+	var result strings.Builder
+
+	// Build
+	result.WriteString("=== Building ===\n")
+	tempBinary := filepath.Join(os.TempDir(), fmt.Sprintf("siki-evolve-%d", time.Now().UnixMilli()))
+
+	cmd := exec.Command(goPath, "build", "-o", tempBinary, ".")
+	cmd.Dir = sourceDir
+	cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
+	buildOut, err := cmd.CombinedOutput()
+	evolveState.BuildOutput = string(buildOut)
+
+	if err != nil {
+		evolveState.BuildStatus = "failed"
+		result.WriteString(fmt.Sprintf("BUILD FAILED:\n%s\n", string(buildOut)))
+		result.WriteString("\nFix the issue with another patch, or use action=abort to restore original source.")
+		return result.String(), nil
+	}
+
+	evolveState.BuildStatus = "success"
+	evolveState.TempBinary = tempBinary
+
+	// Get binary size
+	if info, err := os.Stat(tempBinary); err == nil {
+		result.WriteString(fmt.Sprintf("BUILD OK (%d bytes)\n\n", info.Size()))
+	} else {
+		result.WriteString("BUILD OK\n\n")
+	}
+
+	// Test
+	result.WriteString("=== Testing ===\n")
+	cmd = exec.Command(goPath, "test", "-count=1", "-timeout=180s", "./...")
+	cmd.Dir = sourceDir
+	cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
+	testOut, err := cmd.CombinedOutput()
+	evolveState.TestOutput = string(testOut)
+
+	if err != nil {
+		evolveState.TestStatus = "failed"
+		// Show last 30 lines of test output
+		testLines := strings.Split(string(testOut), "\n")
+		start := 0
+		if len(testLines) > 30 {
+			start = len(testLines) - 30
+		}
+		for i := start; i < len(testLines); i++ {
+			result.WriteString(testLines[i] + "\n")
+		}
+		result.WriteString("\nTESTS FAILED. Fix and retry, or use action=abort to restore.")
+		return result.String(), nil
+	}
+
+	evolveState.TestStatus = "success"
+
+	// Show summary lines from test output
+	testLines := strings.Split(string(testOut), "\n")
+	for _, line := range testLines {
+		if strings.Contains(line, "PASS") || strings.Contains(line, "ok ") || strings.Contains(line, "---") {
+			result.WriteString(line + "\n")
+		}
+	}
+
+	result.WriteString(fmt.Sprintf("\nALL TESTS PASSED\nNew binary: %s\n", tempBinary))
+	result.WriteString("\nReady to deploy. Use action=deploy with description to deploy and restart the process.")
+
+	return result.String(), nil
+}
+
+func (a *Agent) evolveDeploy(args map[string]interface{}) (string, error) {
+	evolveMu.Lock()
+	defer evolveMu.Unlock()
+
+	if evolveState == nil {
+		return "", fmt.Errorf("no evolution in progress")
+	}
+	if evolveState.BuildStatus != "success" || evolveState.TestStatus != "success" {
+		return "", fmt.Errorf("build and tests must both pass before deploying (build=%s, test=%s)", evolveState.BuildStatus, evolveState.TestStatus)
+	}
+
+	reason, _ := args["description"].(string)
+	if reason == "" {
+		reason = "self-evolution"
+	}
+
+	// Get current executable path
+	currentExe, err := os.Executable()
+	if err != nil {
+		return "", fmt.Errorf("cannot determine current executable: %w", err)
+	}
+	currentExe, _ = filepath.EvalSymlinks(currentExe)
+
+	// Backup current binary
+	backupPath := currentExe + ".pre-evolve"
+	if data, err := os.ReadFile(currentExe); err == nil {
+		if err := os.WriteFile(backupPath, data, 0755); err != nil {
+			fmt.Printf("[siki] Warning: failed to backup binary: %v\n", err)
+		}
+	}
+
+	// Copy new binary over current
+	newData, err := os.ReadFile(evolveState.TempBinary)
+	if err != nil {
+		return "", fmt.Errorf("cannot read new binary: %w", err)
+	}
+	if err := os.WriteFile(currentExe, newData, 0755); err != nil {
+		return "", fmt.Errorf("cannot deploy new binary (try stopping the process first): %w", err)
+	}
+
+	// Git commit the source changes
+	sourceDir := evolveState.SourceDir
+	gitCommit := func() string {
+		cmd := exec.Command("git", "add", "main.go")
+		cmd.Dir = sourceDir
+		cmd.Run()
+
+		commitMsg := fmt.Sprintf("self-evolve: %s\n\nPatches applied:\n", reason)
+		for i, p := range evolveState.Patches {
+			commitMsg += fmt.Sprintf("  %d. %s\n", i+1, p.Description)
+		}
+
+		cmd = exec.Command("git", "commit", "-m", commitMsg)
+		cmd.Dir = sourceDir
+		cmd.Run()
+
+		cmd = exec.Command("git", "rev-parse", "--short", "HEAD")
+		cmd.Dir = sourceDir
+		if out, err := cmd.Output(); err == nil {
+			return strings.TrimSpace(string(out))
+		}
+		return "unknown"
+	}
+	gitHash := gitCommit()
+
+	// Log evolution history
+	if selfDir != "" {
+		histDir := filepath.Join(selfDir, "evolve")
+		os.MkdirAll(histDir, 0755)
+
+		history := EvolveHistory{
+			Timestamp:   time.Now(),
+			GitHash:     gitHash,
+			PatchCount:  len(evolveState.Patches),
+			TestsPassed: true,
+			Reason:      reason,
+			Success:     true,
+		}
+		histData, _ := json.Marshal(history)
+		if f, err := os.OpenFile(filepath.Join(histDir, "history.jsonl"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644); err == nil {
+			fmt.Fprintln(f, string(histData))
+			f.Close()
+		}
+	}
+
+	// Clean up
+	os.Remove(evolveState.TempBinary)
+	patchCount := len(evolveState.Patches)
+	evolveState = nil
+
+	fmt.Printf("[siki] Self-evolution deployed: %s (commit %s, %d patches). Restarting...\n", reason, gitHash, patchCount)
+
+	// Schedule graceful restart
+	go func() {
+		time.Sleep(1 * time.Second) // Let HTTP response be sent
+		fmt.Println("[siki] Executing new binary via syscall.Exec...")
+		err := syscall.Exec(currentExe, os.Args, os.Environ())
+		if err != nil {
+			fmt.Printf("[siki] syscall.Exec failed: %v (manual restart required)\n", err)
+		}
+	}()
+
+	return fmt.Sprintf("Evolution deployed successfully!\n- Git commit: %s\n- Patches applied: %d\n- Reason: %s\n- Backup: %s\n\nProcess will restart in ~1 second. Connections will reconnect automatically.", gitHash, patchCount, reason, backupPath), nil
+}
+
+func (a *Agent) evolveStatus() (string, error) {
+	evolveMu.Lock()
+	defer evolveMu.Unlock()
+
+	sourceDir := detectSourceDir()
+
+	if evolveState == nil {
+		var sb strings.Builder
+		sb.WriteString("No evolution in progress.\n")
+		if sourceDir != "" {
+			if data, err := os.ReadFile(filepath.Join(sourceDir, "main.go")); err == nil {
+				lines := strings.Count(string(data), "\n") + 1
+				sb.WriteString(fmt.Sprintf("Source: %s/main.go (%d lines)\n", sourceDir, lines))
+			}
+		}
+
+		// Show evolution history
+		if selfDir != "" {
+			histPath := filepath.Join(selfDir, "evolve", "history.jsonl")
+			if data, err := os.ReadFile(histPath); err == nil {
+				lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+				if len(lines) > 0 && lines[0] != "" {
+					sb.WriteString(fmt.Sprintf("\nEvolution history (%d entries):\n", len(lines)))
+					// Show last 5
+					start := 0
+					if len(lines) > 5 {
+						start = len(lines) - 5
+					}
+					for i := start; i < len(lines); i++ {
+						var h EvolveHistory
+						if json.Unmarshal([]byte(lines[i]), &h) == nil {
+							status := "OK"
+							if !h.Success {
+								status = "FAILED"
+							}
+							sb.WriteString(fmt.Sprintf("  [%s] %s - %s (%d patches, commit %s)\n",
+								status, h.Timestamp.Format("01/02 15:04"), h.Reason, h.PatchCount, h.GitHash))
+						}
+					}
+				}
+			}
+		}
+
+		sb.WriteString("\nUse action=view_source to examine code, then action=patch to propose changes.")
+		return sb.String(), nil
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Evolution in progress (started: %s)\n", evolveState.StartedAt.Format("15:04:05")))
+	sb.WriteString(fmt.Sprintf("Source: %s\n", evolveState.SourceDir))
+	sb.WriteString(fmt.Sprintf("Patches: %d\n", len(evolveState.Patches)))
+	for i, p := range evolveState.Patches {
+		sb.WriteString(fmt.Sprintf("  %d. %s (applied=%v)\n", i+1, p.Description, p.Applied))
+	}
+	sb.WriteString(fmt.Sprintf("Build: %s\n", evolveState.BuildStatus))
+	sb.WriteString(fmt.Sprintf("Tests: %s\n", evolveState.TestStatus))
+
+	if evolveState.BuildStatus == "success" && evolveState.TestStatus == "success" {
+		sb.WriteString("\nReady to deploy! Use action=deploy with description.")
+	}
+
+	return sb.String(), nil
+}
+
+func (a *Agent) evolveAbort() (string, error) {
+	evolveMu.Lock()
+	defer evolveMu.Unlock()
+
+	if evolveState == nil {
+		return "No evolution in progress.", nil
+	}
+
+	// Restore original source
+	if evolveState.OrigSource != "" && evolveState.SourceDir != "" {
+		if err := os.WriteFile(filepath.Join(evolveState.SourceDir, "main.go"), []byte(evolveState.OrigSource), 0644); err != nil {
+			return "", fmt.Errorf("failed to restore original source: %w", err)
+		}
+	}
+
+	// Clean up temp binary
+	if evolveState.TempBinary != "" {
+		os.Remove(evolveState.TempBinary)
+	}
+
+	patchCount := len(evolveState.Patches)
+	evolveState = nil
+
+	return fmt.Sprintf("Evolution aborted. %d patches reverted. Source restored to original.", patchCount), nil
+}
+
+// ============================================================================
 // Docker GPU Container Management
 // ============================================================================
 
@@ -5783,11 +6280,26 @@ You can modify your own behavior:
 - self_rollback: Revert to a previous version (version 0 = factory default)
 - self_benchmark: Run self-evaluation benchmarks
 
+## Self-Evolution (自己進化)
+You can modify your own Go source code:
+- self_evolve action=view_source: Read your own source code
+- self_evolve action=patch: Apply code changes (old_text → new_text replacement)
+- self_evolve action=build_test: Compile and run all tests
+- self_evolve action=deploy: Deploy tested binary and restart process
+- self_evolve action=abort: Revert all patches
+
+Evolution workflow:
+1. view_source to understand the code
+2. patch to apply changes (one at a time, small and focused)
+3. build_test to verify (MUST pass all tests)
+4. deploy to restart with new code
+
 When modifying yourself:
 1. Run self_benchmark BEFORE and AFTER changes
 2. If score drops, consider rollback
 3. Document your reason for every change
 4. Prefer small, incremental changes
+5. For code evolution: always build_test before deploy
 `)
 
 	// Inject ACE playbook context
