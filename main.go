@@ -111,13 +111,13 @@ func defaultConfig() *Config {
 	}
 	return &Config{
 		ModelPath:   filepath.Join(home, ".siki", "models"),
-		ModelName:   "gpt-oss:20b",
+		ModelName:   "lfm2.5-thinking:latest",
 		Backend:     backend,
 		APIEndpoint: endpoint,
 		Workspace:   ".",
 		MaxTurns:    MaxTurns,
 		VisionModel: "moondream",
-		SubModel:    "lfm2.5-thinking:latest",
+		SubModel:    "gpt-oss:20b",
 		SystemPrompt: `You are 式神 (Shikigami), a helpful AI assistant with access to powerful tools.
 
 ## Available Tools
