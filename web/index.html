@@ -300,6 +300,12 @@
             color: var(--text-secondary);
             padding: 0.5rem 1rem;
             max-width: 90%;
+            animation: thinking-pulse 2s ease-in-out infinite;
+        }
+
+        @keyframes thinking-pulse {
+            0%, 100% { border-color: rgba(233, 69, 96, 0.2); }
+            50% { border-color: rgba(233, 69, 96, 0.6); }
         }
 
         .message.thinking .thinking-header {
@@ -1844,7 +1850,7 @@
         function createThinkingMessage() {
             const div = document.createElement('div');
             div.className = 'message thinking';
-            div.innerHTML = `<div class="thinking-header" onclick="this.parentElement.classList.toggle('collapsed')"><span class="toggle-icon">&#9660;</span> Thinking...</div><div class="thinking-body"><span class="streaming-cursor"></span></div>`;
+            div.innerHTML = `<div class="thinking-header" onclick="this.parentElement.classList.toggle('collapsed')"><span class="toggle-icon">&#9660;</span> 考え中...</div><div class="thinking-body"><span class="streaming-cursor"></span></div>`;
             chatContainer.appendChild(div);
             chatContainer.scrollTop = chatContainer.scrollHeight;
             return div;

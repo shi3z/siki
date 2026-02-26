@@ -2530,33 +2530,36 @@ type OrchestratorDecision struct {
 
 // quickAck generates a fast 1-sentence acknowledgment using lfm (primary model).
 // Gives the user immediate feedback while gpt-oss processes the real request.
+// quickAck generates an instant acknowledgment based on keyword matching.
+// No model call — deterministic, always Japanese, zero latency.
 func quickAck(userMsg string, config *Config) string {
-	prompt := fmt.Sprintf(`ユーザーのメッセージに1文だけで応答しろ。何をするか短く宣言しろ。
+	lower := strings.ToLower(userMsg)
 
-例:
-- 「AIニュース教えて」→「最新のAIニュースを検索しますね！」
-- 「マンデルブロ集合書いて」→「マンデルブロ集合を描画しますね！」
-- 「こんにちは」→「こんにちは！何かお手伝いしましょうか？」
+	type ackRule struct {
+		keywords []string
+		response string
+	}
+	rules := []ackRule{
+		{[]string{"ニュース", "news", "最新", "速報", "トレンド"}, "最新の情報を検索しますね！"},
+		{[]string{"描いて", "書いて", "フラクタル", "マンデルブロ", "ゲーム", "アニメーション", "可視化", "シミュレーション"}, "描画しますね！サブモデルでコード生成中..."},
+		{[]string{"http://", "https://", "url", "サイト"}, "URLの内容を取得しますね！"},
+		{[]string{"調べて", "検索", "教えて", "について"}, "調べますね！"},
+		{[]string{"ファイル", "読んで", "開いて"}, "ファイルを確認しますね！"},
+		{[]string{"コマンド", "実行", "install", "apt", "pip"}, "コマンドを実行しますね！"},
+		{[]string{"図", "ダイアグラム", "アーキテクチャ", "関係図"}, "図を生成しますね！"},
+		{[]string{"こんにちは", "おはよう", "こんばんは", "やあ", "hello", "hi"}, "こんにちは！何かお手伝いしましょうか？"},
+		{[]string{"ありがとう", "thanks"}, "どういたしまして！"},
+	}
 
-ユーザー: %s
-応答:`, userMsg)
+	for _, rule := range rules {
+		for _, kw := range rule.keywords {
+			if strings.Contains(lower, kw) {
+				return rule.response
+			}
+		}
+	}
 
-	ack, err := callOllamaGenerate(config.primaryProvider().Model, prompt, 80, 15*time.Second, config)
-	if err != nil {
-		fmt.Printf("[siki] Quick ack failed: %v\n", err)
-		return ""
-	}
-	ack = strings.TrimSpace(ack)
-	ack = strings.Trim(ack, "\"「」")
-	// Limit to first line, max 100 runes
-	if nl := strings.IndexByte(ack, '\n'); nl >= 0 {
-		ack = ack[:nl]
-	}
-	runes := []rune(ack)
-	if len(runes) > 100 {
-		ack = string(runes[:100])
-	}
-	return ack
+	return "考え中..."
 }
 
 // subModelOrchestrate asks gpt-oss to analyze the user's request and decide which tool to call.
@@ -2702,15 +2705,17 @@ func (ws *WebServer) dualModelPipeline(ctx context.Context, agent *Agent, userMs
 		orchCh <- orchResult{d, err}
 	}()
 
-	// Show lfm ack immediately (it's fast)
+	// Show ack immediately (keyword-based, instant)
 	select {
 	case ack := <-ackCh:
 		if ack != "" {
 			sendEvent(StreamEvent{Type: "content", Content: ack + "\n\n"})
 		}
-	case <-time.After(20 * time.Second):
-		// lfm took too long, skip
+	case <-time.After(1 * time.Second):
 	}
+
+	// Show thinking indicator while waiting for gpt-oss
+	sendEvent(StreamEvent{Type: "thinking", Content: "サブモデルで処理中..."})
 
 	// Wait for gpt-oss decision
 	var decision *OrchestratorDecision
@@ -2808,7 +2813,7 @@ func (ws *WebServer) dualModelPipeline(ctx context.Context, agent *Agent, userMs
 	}
 
 	// Phase 3: gpt-oss summarizes tool results
-	sendEvent(StreamEvent{Type: "content", Content: "\n\n"})
+	sendEvent(StreamEvent{Type: "thinking", Content: "回答を生成中..."})
 	finalResponse, err := subModelSummarize(userMsg, toolName, result, ws.config)
 	if err != nil {
 		fmt.Printf("[siki] Summarization failed: %v\n", err)
