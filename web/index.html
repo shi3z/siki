@@ -355,6 +355,22 @@
             overflow-y: auto;
         }
 
+        .tool-spinner {
+            display: inline-block;
+            width: 14px;
+            height: 14px;
+            border: 2px solid rgba(233, 69, 96, 0.3);
+            border-top-color: var(--accent);
+            border-radius: 50%;
+            animation: tool-spin 0.8s linear infinite;
+            vertical-align: middle;
+            margin-right: 6px;
+        }
+
+        @keyframes tool-spin {
+            to { transform: rotate(360deg); }
+        }
+
         .message.tool.diagram-result .tool-result {
             max-height: none;
             overflow: visible;
@@ -2239,6 +2255,7 @@
                 let thinkingContent = '';
                 let buffer = '';
                 let hasToolCalls = false;
+                let pendingToolDiv = null; // For tool_start → tool_call replacement
 
                 while (true) {
                     const { done, value } = await reader.read();
@@ -2264,16 +2281,14 @@
                                 }
                                 thinkingContent += event.content;
                                 updateStreamingMessage(thinkingDiv, thinkingContent);
-                            } else if (event.type === 'tool_call') {
-                                // Hide typing indicator on first event
+                            } else if (event.type === 'tool_start') {
+                                // Tool execution starting — show spinner
                                 typing.classList.remove('show');
-                                // Finalize any thinking bubble
                                 if (thinkingDiv && thinkingContent) {
                                     finalizeStreamingMessage(thinkingDiv, thinkingContent);
                                     thinkingDiv = null;
                                     thinkingContent = '';
                                 }
-                                // If there was streaming content before tool calls, finalize as "thinking"
                                 if (streamingDiv && fullContent) {
                                     finalizeStreamingMessage(streamingDiv, fullContent);
                                     streamingDiv.classList.remove('assistant');
@@ -2282,8 +2297,29 @@
                                     fullContent = '';
                                 }
                                 hasToolCalls = true;
-                                // Show tool call
-                                addMessage('tool', event.result || 'Executing...', event.name);
+                                pendingToolDiv = addMessage('tool', `<span class="tool-spinner"></span> ${event.name} 実行中...`, event.name);
+                            } else if (event.type === 'tool_call') {
+                                // Tool execution complete — replace spinner with result
+                                typing.classList.remove('show');
+                                if (thinkingDiv && thinkingContent) {
+                                    finalizeStreamingMessage(thinkingDiv, thinkingContent);
+                                    thinkingDiv = null;
+                                    thinkingContent = '';
+                                }
+                                if (streamingDiv && fullContent) {
+                                    finalizeStreamingMessage(streamingDiv, fullContent);
+                                    streamingDiv.classList.remove('assistant');
+                                    streamingDiv.classList.add('thinking');
+                                    streamingDiv = null;
+                                    fullContent = '';
+                                }
+                                hasToolCalls = true;
+                                // Replace pending tool div if it matches
+                                if (pendingToolDiv) {
+                                    pendingToolDiv.remove();
+                                    pendingToolDiv = null;
+                                }
+                                addMessage('tool', event.result || 'Done', event.name);
                             } else if (event.type === 'content') {
                                 // Hide typing indicator on first content
                                 typing.classList.remove('show');

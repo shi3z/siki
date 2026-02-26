@@ -937,7 +937,6 @@ func autoToolFallback(agent *Agent, userMsg string, modelResponse string, sendEv
 			tool:     "run_code",
 			argsFn: func() map[string]interface{} {
 				// Delegate code generation to the sub-model (gpt-oss:20b)
-				sendEvent(StreamEvent{Type: "content", Content: "\n\n🔧 run_code — サブモデルでコード生成中...\n"})
 				html, err := generateCodeWithSubModel(userMsg, agent.config)
 				if err != nil {
 					fmt.Printf("[siki] Sub-model code gen failed: %v, trying model response\n", err)
@@ -985,6 +984,7 @@ func autoToolFallback(agent *Agent, userMsg string, modelResponse string, sendEv
 		}
 
 		fmt.Printf("[siki] Auto-fallback: model didn't call %s, executing automatically\n", fb.tool)
+		sendEvent(StreamEvent{Type: "tool_start", Name: fb.tool})
 
 		result, err := agent.executeTool(fb.tool, args)
 		if err != nil {
@@ -7627,10 +7627,8 @@ func (ws *WebServer) handleChatStream(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 
-			// Announce tool call to user (only if model didn't already say something)
-			if response.Content == "" {
-				sendEvent(StreamEvent{Type: "content", Content: fmt.Sprintf("\n🔧 %s を呼びます...\n", toolName)})
-			}
+			// Send tool_start event so frontend shows spinner
+			sendEvent(StreamEvent{Type: "tool_start", Name: toolName})
 
 			var args map[string]interface{}
 			if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
@@ -7648,7 +7646,6 @@ func (ws *WebServer) handleChatStream(w http.ResponseWriter, r *http.Request) {
 
 			// For code generation tools, delegate to sub-model for higher quality
 			if toolName == "run_code" {
-				sendEvent(StreamEvent{Type: "content", Content: "サブモデルでコード生成中...\n"})
 				userReq := agent.lastUserMessage()
 				if html, genErr := generateCodeWithSubModel(userReq, ws.config); genErr == nil {
 					args["html"] = html
