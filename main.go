@@ -118,116 +118,66 @@ func defaultConfig() *Config {
 		MaxTurns:    MaxTurns,
 		VisionModel: "moondream",
 		SubModel:    "gpt-oss:20b",
-		SystemPrompt: `You are 式神 (Shikigami), a helpful AI assistant with access to powerful tools.
+		SystemPrompt: `あなたは式神(Shikigami)。ツールを持つAIアシスタント。
 
-## Available Tools
-- read_file, write_file, list_files: File operations
-- execute_command: Run shell commands
-- search_files, grep: Search code and files
-- web_search: Search the internet
-- web_fetch: Get text content from a URL
-- web_images: Extract images from a URL
-- diagram: Generate Graphviz diagrams
-- run_code: **Execute HTML/JavaScript in browser iframe**
-- blog_person_search: **ブログの最新記事を巡回し、言及されている人物名を抽出する**。人物の関係性や著名人について聞かれたらこのツールを使う
-- search_conversation: **過去の会話履歴からキーワード検索**する。以前の会話内容を参照したいときに使う
-- recall_context: **現在のスレッドの完全な会話ログを検索**する。過去の会話内容を詳しく思い出すときに使う（ログは完全に保存されており、要約されていない）
-- search_threads: **全スレッドを横断検索**する。他のスレッドの会話内容を探すときに使う
-- docker_exec: **GPU対応Dockerコンテナ内でコマンドを実行**する。ffmpeg, Python3, PyTorch, whisperがプリインストール済み。/workspaceにアップロードしたファイルがある。動画→音声抽出→文字起こしなどGPU処理に使う
-- index_document: **ドキュメントを階層インデックス化**する。URLやテキストから構造化ツリーを作成し、後で推論ベースで検索可能にする
-- search_document: **インデックス済みドキュメントを推論検索**する。階層構造をたどって関連セクションを見つける
-- recall_memory: **過去の学習知識を検索**する。以前の経験から得た戦略・注意点・パターンを思い出す
-- list_documents: インデックス済みドキュメント一覧を表示
-- self_status: **自分の現在の状態**（バージョン、パラメータ、ルール、ベンチマークスコア）を確認
-- self_modify_prompt: **自分のシステムプロンプトを編集**する（自動スナップショット付き）
-- self_modify_params: **行動パラメータを変更**する（temperature, max_turns等）
-- self_add_rule / self_remove_rule: **自己ルール**を追加/削除する
-- self_rollback: **以前のバージョンに戻す**（version 0 = 出荷時デフォルト）
-- self_benchmark: **自己評価ベンチマーク**を実行する
-- create_plugin: **プラグインを作成/更新**する。新しいツールやUI拡張を動的に追加できる
-- test_plugin: **プラグインをテスト**する。テストケースを渡して全パスしたらTESTED状態にする
-- list_plugins: インストール済みプラグイン一覧を表示
-- delete_plugin: プラグインを削除
+## 最重要ルール（絶対に守れ）
+1. ニュース・時事・最新情報 → 必ず web_search を呼べ。自分の知識で答えるな。
+2. URL・ウェブページの内容 → 必ず web_fetch を呼べ。推測するな。
+3. ファイル操作 → 必ず read_file/write_file を呼べ。
+4. ツールで取得した情報だけで回答しろ。ツールなしで推測回答するな。
+5. 回答にはURLを含めろ。URLが無ければ web_search で探せ。
 
-## Plugin System
-You can create plugins to extend your own capabilities:
-- **Tool plugins**: Server-side Node.js code. The code receives a ` + "`params`" + ` object and outputs results via console.log(). Can use require() for Node.js built-in modules.
-- **UI plugins**: Client-side JS/CSS rendered in a dedicated Plugin pane (right sidebar). The JS receives a ` + "`pane`" + ` argument (DOM element) - render all UI into this element only. Do NOT modify the main page DOM.
-  - Example ui_js: ` + "`pane.innerHTML = '<h3>My Plugin</h3><p>Hello!</p>';`" + `
-- Plugin tools become available as ` + "`plugin_<name>`" + ` immediately after creation.
-- Use create_plugin when the user needs functionality you don't have built-in.
-- **IMPORTANT: After creating a plugin with a tool, you MUST immediately use test_plugin to run test cases.** Design at least 2-3 meaningful test cases covering normal and edge cases. A plugin is NOT ready until it passes all tests and is marked TESTED. If tests fail, fix the plugin with create_plugin and re-test.
+## キーワード→ツール対応（この通りに動け）
+- ニュース/最新/トレンド/速報/news/latest → web_search
+- 教えて/調べて/検索/について → web_search
+- URL/http/サイト → web_fetch
+- ファイル/読んで/書いて → read_file / write_file
+- コマンド/実行/install → execute_command
+- 描いて/可視化/グラフ/ゲーム → run_code
+- 図/関係図/アーキテクチャ → diagram
+- 前の会話/さっき → recall_context / search_conversation
+- ブログ/人物 → blog_person_search
 
-## run_code Tool Specification
-When user asks to draw, visualize, calculate, simulate, or create anything visual:
+## ツール一覧
+- read_file, write_file, list_files: ファイル操作
+- execute_command: シェルコマンド実行
+- search_files, grep: ファイル検索
+- web_search: インターネット検索
+- web_fetch: URL内容取得
+- web_images: URL画像抽出
+- diagram: Graphviz図生成
+- run_code: HTML/JS実行（ブラウザiframe）
+- blog_person_search: ブログ巡回・人物抽出
+- search_conversation: 会話履歴検索
+- recall_context: 現スレッド会話ログ検索
+- search_threads: 全スレッド横断検索
+- docker_exec: GPUコンテナ内コマンド実行
+- index_document: ドキュメント階層インデックス化
+- search_document: インデックス済みドキュメント検索
+- recall_memory: 学習知識検索
+- list_documents: ドキュメント一覧
+- self_status, self_modify_prompt, self_modify_params: 自己状態管理
+- self_add_rule, self_remove_rule, self_rollback, self_benchmark: 自己改変
+- self_evolve: ソースコード自己進化
+- create_plugin, test_plugin, list_plugins, delete_plugin: プラグイン管理
+- query_model: 他モデルに問い合わせ
 
-1. **ALWAYS use run_code** - do not show code examples, execute them
-2. **HTML format must be complete and self-contained:**
+## run_code
+描画・可視化・ゲーム → 必ず run_code で実行。コード例を見せるな。
+完全なHTML（<html><head><style>...</style></head><body>...</body></html>）を渡せ。
 
-<html>
-<head>
-<style>body{margin:0;background:#1a1a2e;}</style>
-</head>
-<body>
-<canvas id="c" width="800" height="600"></canvas>
-<script>
-// Your JavaScript code here
-const canvas = document.getElementById('c');
-const ctx = canvas.getContext('2d');
-// Draw something...
-</script>
-</body>
-</html>
+## プラグイン
+create_pluginで作成後、必ずtest_pluginでテストせよ。
 
-3. **After run_code succeeds, respond briefly** like "マンデルブロ集合を描画しました。クリックでズームできます。"
+## 主語省略の解決
+日本語ユーザーは主語を省略する。直前の文脈から推測して対応しろ。「何についてですか？」と聞き返すな。
 
-4. **Do NOT:**
-   - Show code blocks as examples
-   - Explain how to write the code
-   - Ask if the user wants to see code
+## 回答パターン
+1. まずツールを呼ぶ（情報収集）
+2. 結果を確認
+3. 結果に基づいて回答
 
-5. **DO:**
-   - Immediately call run_code with working HTML
-   - Make it interactive when possible (mouse events, animations)
-   - Use Canvas for graphics, SVG for diagrams
-
-## Examples of when to use run_code:
-- "フラクタルを描いて" → run_code with Mandelbrot/Julia set
-- "ソートを可視化して" → run_code with sorting animation
-- "素数を表示して" → run_code with prime number visualization
-- "ゲームを作って" → run_code with interactive game
-- "グラフを描いて" → run_code with chart
-
-## Resolving Ambiguous / Subject-less Instructions
-Japanese users frequently omit the subject (主語) from follow-up messages.
-When a user's instruction lacks an explicit subject or object:
-1. **First, check your own immediately preceding response** — the subject is very likely something you just mentioned or produced (e.g., "もっと詳しく" → elaborate on what you just said; "日本語にして" → translate what you just output).
-2. **If not found there, check the user's previous message** — the topic they introduced earlier is probably still the subject (e.g., User: "Rustについて教えて" → You answer → User: "他の言語と比較して" → compare Rust).
-3. **If still unclear, look further back** using recall_context or search_conversation to find the ongoing topic.
-4. **Never ask "何についてですか？" when the context makes the subject obvious.** Resolve it yourself from the conversation flow and proceed.
-
-Examples:
-- You output code → User: "テストして" → run/test the code you just wrote
-- You explain X → User: "要約して" → summarize your explanation of X
-- User asks about topic A → You answer → User: "もっと" → give more detail on A
-- User uploads a file → User: "これを処理して" → process that file
-
-## Orchestration Pattern (重要)
-あなたはオーケストレーターとして動作する。ユーザーの質問を受けたら:
-1. **まず情報収集**: 必要なツールを呼び出して情報を集める。回答を書き始めるな。
-2. **すべての結果を確認**: ツール実行結果がすべて揃うまで最終回答を生成しない。
-3. **統合して回答**: 収集した情報をすべて踏まえて、正確で包括的な回答を提示する。
-
-ツールを使うべき場面では、必ずツールを先に呼び出してから回答すること。
-ツール結果なしに推測で回答してはならない。
-
-## Other Rules
-- For news/current events: use web_search
-- For relationships/architecture: use diagram
-- Respond in user's language
-- IMPORTANT: Always include at least one relevant URL in your response. Use web_search to find URLs if needed.
-- For questions about people related to a person/blogger: use blog_person_search to read their blog articles and extract person names. Do NOT just do a web_search - actually read the articles.
-- To recall earlier conversation: use search_conversation or recall_context`,
+ユーザーの言語で回答せよ。`,
 	}
 }
 
@@ -866,6 +816,78 @@ func getAllTools() []Tool {
 	return all
 }
 
+// coreToolNames are always included (small models choke on 30+ tool definitions)
+var coreToolNames = map[string]bool{
+	"web_search": true, "web_fetch": true, "read_file": true,
+	"write_file": true, "list_files": true, "execute_command": true,
+	"search_files": true, "grep": true, "diagram": true, "run_code": true,
+}
+
+// toolTriggers maps keywords in user messages to additional tool names
+var toolTriggers = map[string][]string{
+	"ブログ": {"blog_person_search"}, "人物": {"blog_person_search"},
+	"前の会話": {"search_conversation", "recall_context"}, "さっき": {"search_conversation", "recall_context"},
+	"会話": {"search_conversation", "recall_context", "search_threads"}, "思い出": {"recall_context", "recall_memory"},
+	"スレッド": {"search_threads"}, "docker": {"docker_exec"}, "コンテナ": {"docker_exec"},
+	"gpu": {"docker_exec"}, "ffmpeg": {"docker_exec"}, "whisper": {"docker_exec"},
+	"インデックス": {"index_document", "search_document", "list_documents"},
+	"ドキュメント": {"index_document", "search_document", "list_documents"},
+	"document": {"index_document", "search_document", "list_documents"},
+	"self": {"self_status", "self_modify_prompt", "self_modify_params", "self_add_rule", "self_remove_rule", "self_rollback", "self_benchmark", "self_evolve"},
+	"自分": {"self_status", "self_modify_prompt", "self_modify_params", "self_add_rule", "self_remove_rule", "self_rollback", "self_benchmark", "self_evolve"},
+	"改変": {"self_modify_prompt", "self_modify_params", "self_evolve"},
+	"プラグイン": {"create_plugin", "test_plugin", "list_plugins", "delete_plugin"},
+	"plugin": {"create_plugin", "test_plugin", "list_plugins", "delete_plugin"},
+	"query_model": {"query_model"}, "他のモデル": {"query_model"},
+	"画像": {"web_images"}, "image": {"web_images"},
+}
+
+// selectToolsForContext returns a filtered set of tools based on conversation context
+func selectToolsForContext(messages []Message) []Tool {
+	allTools := getAllTools()
+
+	// Build a set of tool names to include
+	include := make(map[string]bool)
+	for name := range coreToolNames {
+		include[name] = true
+	}
+
+	// Scan last few user messages for trigger keywords
+	scanCount := 3
+	for i := len(messages) - 1; i >= 0 && scanCount > 0; i-- {
+		msg := messages[i]
+		if msg.Role != "user" {
+			continue
+		}
+		scanCount--
+		lower := strings.ToLower(msg.Content)
+		for keyword, toolNames := range toolTriggers {
+			if strings.Contains(lower, keyword) {
+				for _, tn := range toolNames {
+					include[tn] = true
+				}
+			}
+		}
+	}
+
+	// Also include any tool that was already called in this conversation
+	for _, msg := range messages {
+		for _, tc := range msg.ToolCalls {
+			include[tc.Function.Name] = true
+		}
+	}
+
+	// Filter
+	var selected []Tool
+	for _, t := range allTools {
+		if include[t.Name] {
+			selected = append(selected, t)
+		}
+	}
+
+	return selected
+}
+
 // ============================================================================
 // Tool Execution
 // ============================================================================
@@ -1367,7 +1389,7 @@ func (a *Agent) queryModel(providerName, message, systemPrompt string) (string, 
 	req := ChatRequest{
 		Model:       p.Model,
 		Messages:    messages,
-		MaxTokens:   4096,
+		MaxTokens:   8192,
 		Temperature: 0.7,
 		Stream:      false,
 	}
@@ -5698,9 +5720,12 @@ func (a *Agent) chatStream(ctx context.Context, cb StreamCallbacks) (*Message, e
 	// in handleChatStream, before the agent loop starts. This prevents context
 	// loss during multi-turn tool-calling loops.
 
+	// Select relevant tools based on conversation context (small models choke on 30+ tools)
+	selectedTools := selectToolsForContext(a.messages)
+
 	// Convert tools to OpenAI format
 	var toolDefs []map[string]interface{}
-	for _, tool := range getAllTools() {
+	for _, tool := range selectedTools {
 		toolDefs = append(toolDefs, map[string]interface{}{
 			"type": "function",
 			"function": map[string]interface{}{
@@ -5724,7 +5749,7 @@ func (a *Agent) chatStream(ctx context.Context, cb StreamCallbacks) (*Message, e
 		Messages:    a.messages,
 		Tools:       toolDefs,
 		ToolChoice:  "auto",
-		MaxTokens:   4096,
+		MaxTokens:   8192,
 		Temperature: temp,
 		Stream:      streaming,
 	}
