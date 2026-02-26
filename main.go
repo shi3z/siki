@@ -909,6 +909,82 @@ func needsRunCode(userMsg string) bool {
 	return false
 }
 
+// overrideToolArgs replaces unreliable tool arguments from the small orchestrator model
+// with sensible defaults based on the user's actual message. The 1.2B model's job is
+// to choose WHICH tool to call — argument generation is handled here.
+func overrideToolArgs(toolName, userMsg string, originalArgs map[string]interface{}, config *Config, sendEvent func(StreamEvent)) map[string]interface{} {
+	switch toolName {
+	case "web_search":
+		// Always use user's message as search query — 1.2B model generates garbage queries
+		if userMsg != "" {
+			if q, ok := originalArgs["query"].(string); ok && q != userMsg {
+				fmt.Printf("[siki] Overriding web_search query: %q → %q\n", q, userMsg)
+			}
+			originalArgs["query"] = userMsg
+		}
+
+	case "web_fetch":
+		// Extract URL from user message if model didn't provide a valid one
+		url, _ := originalArgs["url"].(string)
+		if url == "" || !strings.HasPrefix(url, "http") {
+			// Try to find URL in user message
+			for _, word := range strings.Fields(userMsg) {
+				if strings.HasPrefix(word, "http://") || strings.HasPrefix(word, "https://") {
+					originalArgs["url"] = word
+					break
+				}
+			}
+		}
+
+	case "run_code":
+		// Delegate code generation to sub-model
+		html, err := generateCodeWithSubModel(userMsg, config)
+		if err != nil {
+			fmt.Printf("[siki] Sub-model code gen failed: %v, using orchestrator HTML\n", err)
+		} else {
+			originalArgs["html"] = html
+		}
+
+	case "diagram":
+		// For diagrams, delegate DOT generation to sub-model
+		if config.SubModel != "" {
+			prompt := fmt.Sprintf("以下のリクエストに対して、Graphviz DOTコードのみ出力せよ（説明不要）。\nリクエスト: %s", userMsg)
+			_, dotCode, err := callSubModel(prompt, config)
+			if err == nil && len(dotCode) > 10 {
+				// Extract DOT code from response
+				dot := dotCode
+				if idx := strings.Index(dot, "```dot"); idx >= 0 {
+					dot = dot[idx+6:]
+					if end := strings.Index(dot, "```"); end >= 0 {
+						dot = dot[:end]
+					}
+				} else if idx := strings.Index(dot, "```"); idx >= 0 {
+					dot = dot[idx+3:]
+					if nl := strings.Index(dot, "\n"); nl >= 0 {
+						dot = dot[nl+1:]
+					}
+					if end := strings.Index(dot, "```"); end >= 0 {
+						dot = dot[:end]
+					}
+				}
+				dot = strings.TrimSpace(dot)
+				if strings.Contains(dot, "digraph") || strings.Contains(dot, "graph") {
+					originalArgs["dot_source"] = dot
+				}
+			}
+		}
+
+	case "execute_command":
+		// Keep model's command but validate it's not dangerous
+		// (executeTool already has safety checks, so just pass through)
+
+	case "read_file", "write_file", "search_files", "grep":
+		// File operations: trust model's args (path/content from user context)
+	}
+
+	return originalArgs
+}
+
 // autoToolFallback detects when the model should have called a tool but didn't,
 // and automatically executes the appropriate tool. Returns the tool result if
 // a fallback was triggered, empty string otherwise.
@@ -7419,15 +7495,9 @@ func (ws *WebServer) handleChat(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 
-			// For code generation tools, delegate to sub-model
-			if toolName == "run_code" {
-				userReq := agent.lastUserMessage()
-				if html, genErr := generateCodeWithSubModel(userReq, ws.config); genErr == nil {
-					args["html"] = html
-				} else {
-					fmt.Printf("[siki] Sub-model code gen failed: %v, using orchestrator HTML\n", genErr)
-				}
-			}
+			// Override args for small orchestrator models
+			userReq := agent.lastUserMessage()
+			args = overrideToolArgs(toolName, userReq, args, ws.config, nil)
 
 			result, err := agent.executeTool(toolName, args)
 			if err != nil {
@@ -7644,15 +7714,10 @@ func (ws *WebServer) handleChatStream(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 
-			// For code generation tools, delegate to sub-model for higher quality
-			if toolName == "run_code" {
-				userReq := agent.lastUserMessage()
-				if html, genErr := generateCodeWithSubModel(userReq, ws.config); genErr == nil {
-					args["html"] = html
-				} else {
-					fmt.Printf("[siki] Sub-model code gen failed: %v, using orchestrator HTML\n", genErr)
-				}
-			}
+			// Small orchestrator models (1.2B) can't generate reliable tool arguments.
+			// Override args with sensible defaults based on user's actual message.
+			userReq := agent.lastUserMessage()
+			args = overrideToolArgs(toolName, userReq, args, ws.config, sendEvent)
 
 			result, err := agent.executeTool(toolName, args)
 			if err != nil {
