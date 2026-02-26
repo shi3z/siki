@@ -61,6 +61,7 @@ type Config struct {
 	MaxTurns     int        `json:"max_turns"`
 	SystemPrompt string     `json:"system_prompt"`
 	VisionModel  string     `json:"vision_model"`
+	SubModel     string     `json:"sub_model"`
 }
 
 // primaryProvider returns the first provider, or builds one from legacy config fields
@@ -116,6 +117,7 @@ func defaultConfig() *Config {
 		Workspace:   ".",
 		MaxTurns:    MaxTurns,
 		VisionModel: "moondream",
+		SubModel:    "lfm2.5-thinking:latest",
 		SystemPrompt: `You are 式神 (Shikigami), a helpful AI assistant with access to powerful tools.
 
 ## Available Tools
@@ -132,6 +134,10 @@ func defaultConfig() *Config {
 - recall_context: **現在のスレッドの完全な会話ログを検索**する。過去の会話内容を詳しく思い出すときに使う（ログは完全に保存されており、要約されていない）
 - search_threads: **全スレッドを横断検索**する。他のスレッドの会話内容を探すときに使う
 - docker_exec: **GPU対応Dockerコンテナ内でコマンドを実行**する。ffmpeg, Python3, PyTorch, whisperがプリインストール済み。/workspaceにアップロードしたファイルがある。動画→音声抽出→文字起こしなどGPU処理に使う
+- index_document: **ドキュメントを階層インデックス化**する。URLやテキストから構造化ツリーを作成し、後で推論ベースで検索可能にする
+- search_document: **インデックス済みドキュメントを推論検索**する。階層構造をたどって関連セクションを見つける
+- recall_memory: **過去の学習知識を検索**する。以前の経験から得た戦略・注意点・パターンを思い出す
+- list_documents: インデックス済みドキュメント一覧を表示
 - create_plugin: **プラグインを作成/更新**する。新しいツールやUI拡張を動的に追加できる
 - test_plugin: **プラグインをテスト**する。テストケースを渡して全パスしたらTESTED状態にする
 - list_plugins: インストール済みプラグイン一覧を表示
@@ -536,6 +542,68 @@ var tools = []Tool{
 			"required": []string{"command"},
 		},
 	},
+	{
+		Name:        "index_document",
+		Description: "URLやテキストからドキュメントの階層インデックスを作成する。長文ドキュメントを構造化して後で検索可能にする",
+		Parameters: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"url": map[string]interface{}{
+					"type":        "string",
+					"description": "URL to fetch and index (optional if content is provided)",
+				},
+				"title": map[string]interface{}{
+					"type":        "string",
+					"description": "Document title",
+				},
+				"content": map[string]interface{}{
+					"type":        "string",
+					"description": "Text content to index (optional if url is provided)",
+				},
+			},
+			"required": []string{"title"},
+		},
+	},
+	{
+		Name:        "search_document",
+		Description: "インデックス済みドキュメントを推論ベースで検索する。ドキュメントの階層構造をたどって関連セクションを見つける",
+		Parameters: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"query": map[string]interface{}{
+					"type":        "string",
+					"description": "Search query",
+				},
+				"doc_id": map[string]interface{}{
+					"type":        "string",
+					"description": "Document ID to search (optional, searches all if omitted)",
+				},
+			},
+			"required": []string{"query"},
+		},
+	},
+	{
+		Name:        "recall_memory",
+		Description: "学習済みの知識（playbook）からキーワード検索する。過去の経験から得た戦略・注意点・パターンを思い出す",
+		Parameters: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"query": map[string]interface{}{
+					"type":        "string",
+					"description": "Search keyword or topic",
+				},
+			},
+			"required": []string{"query"},
+		},
+	},
+	{
+		Name:        "list_documents",
+		Description: "インデックス済みドキュメント一覧を表示する",
+		Parameters: map[string]interface{}{
+			"type":       "object",
+			"properties": map[string]interface{}{},
+		},
+	},
 }
 
 var pluginManagementTools = []Tool{
@@ -772,6 +840,112 @@ func (a *Agent) executeTool(name string, args map[string]interface{}) (string, e
 	case "query_model":
 		systemPrompt, _ := args["system"].(string)
 		return a.queryModel(args["provider"].(string), args["message"].(string), systemPrompt)
+	case "index_document":
+		title, _ := args["title"].(string)
+		docURL, _ := args["url"].(string)
+		content, _ := args["content"].(string)
+		if content == "" && docURL != "" {
+			// Fetch content from URL
+			fetched, err := a.webFetch(docURL)
+			if err != nil {
+				return "", fmt.Errorf("failed to fetch URL: %w", err)
+			}
+			content = fetched
+		}
+		if content == "" {
+			return "", fmt.Errorf("either url or content is required")
+		}
+		doc, err := indexDocument(a.config, title, content, docURL)
+		if err != nil {
+			return "", err
+		}
+		var sb strings.Builder
+		sb.WriteString(fmt.Sprintf("ドキュメント「%s」をインデックスしました (ID: %s)\n\n", doc.Title, doc.ID))
+		sb.WriteString("## 構造:\n")
+		var showTree func(sections []DocSection, depth int)
+		showTree = func(sections []DocSection, depth int) {
+			for _, s := range sections {
+				indent := strings.Repeat("  ", depth)
+				sb.WriteString(fmt.Sprintf("%s- [%s] %s: %s\n", indent, s.ID, s.Title, s.Summary))
+				if len(s.Children) > 0 {
+					showTree(s.Children, depth+1)
+				}
+			}
+		}
+		showTree(doc.Sections, 0)
+		return sb.String(), nil
+	case "search_document":
+		query, _ := args["query"].(string)
+		docID, _ := args["doc_id"].(string)
+		if docID != "" {
+			doc, err := loadDocumentIndex(docID)
+			if err != nil {
+				return "", fmt.Errorf("document not found: %s", docID)
+			}
+			return searchDocumentTree(a.config, doc, query)
+		}
+		// Search all documents
+		docs, err := listDocuments()
+		if err != nil || len(docs) == 0 {
+			return "インデックス済みドキュメントがありません。index_documentツールで先にインデックスしてください。", nil
+		}
+		var results strings.Builder
+		for _, doc := range docs {
+			result, err := searchDocumentTree(a.config, &doc, query)
+			if err != nil {
+				continue
+			}
+			results.WriteString(result + "\n---\n")
+		}
+		if results.Len() == 0 {
+			return "関連するセクションが見つかりませんでした。", nil
+		}
+		return results.String(), nil
+	case "recall_memory":
+		query, _ := args["query"].(string)
+		bullets, err := loadPlaybook()
+		if err != nil || len(bullets) == 0 {
+			return "学習済みの知識はまだありません。", nil
+		}
+		queryLower := strings.ToLower(query)
+		keywords := strings.Fields(queryLower)
+		var matches []PlaybookBullet
+		for _, b := range bullets {
+			contentLower := strings.ToLower(b.Content)
+			for _, kw := range keywords {
+				if strings.Contains(contentLower, kw) {
+					matches = append(matches, b)
+					break
+				}
+			}
+		}
+		if len(matches) == 0 {
+			return fmt.Sprintf("「%s」に関連する知識は見つかりませんでした。\n\n全%d件のbulletが保存されています。", query, len(bullets)), nil
+		}
+		var sb strings.Builder
+		sb.WriteString(fmt.Sprintf("「%s」に関連する知識 (%d件):\n\n", query, len(matches)))
+		for _, m := range matches {
+			sb.WriteString(fmt.Sprintf("- [%s] %s (確認×%d)\n", m.Type, m.Content, m.Hits))
+		}
+		return sb.String(), nil
+	case "list_documents":
+		docs, err := listDocuments()
+		if err != nil {
+			return "", err
+		}
+		if len(docs) == 0 {
+			return "インデックス済みドキュメントはありません。", nil
+		}
+		var sb strings.Builder
+		sb.WriteString(fmt.Sprintf("インデックス済みドキュメント (%d件):\n\n", len(docs)))
+		for _, doc := range docs {
+			sb.WriteString(fmt.Sprintf("- **%s** (ID: %s)", doc.Title, doc.ID))
+			if doc.URL != "" {
+				sb.WriteString(fmt.Sprintf(" [%s]", doc.URL))
+			}
+			sb.WriteString(fmt.Sprintf(" - %d sections\n", len(doc.Sections)))
+		}
+		return sb.String(), nil
 	default:
 		// Check if this is a plugin tool
 		if strings.HasPrefix(name, "plugin_") {
@@ -1694,6 +1868,57 @@ func describeImages(images []string, visionModel string, ollamaEndpoint string) 
 	return strings.Join(descriptions, "\n")
 }
 
+// callSubModel calls a lightweight sub-model (e.g. lfm2.5-thinking) via Ollama native /api/generate.
+// It handles <think></think> tag extraction, returning (thinking, response).
+// Used for fast tasks like reflection, summarization, and document tree search.
+func callSubModel(prompt string, config *Config) (thinking string, response string, err error) {
+	if config.SubModel == "" {
+		return "", "", fmt.Errorf("no sub-model configured")
+	}
+
+	endpoint := strings.TrimSuffix(config.primaryProvider().Endpoint, "/v1")
+
+	reqBody := map[string]interface{}{
+		"model":  config.SubModel,
+		"prompt": prompt,
+		"stream": false,
+		"options": map[string]interface{}{
+			"num_predict": 2048,
+		},
+	}
+
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", "", fmt.Errorf("marshal error: %w", err)
+	}
+
+	client := &http.Client{Timeout: 120 * time.Second}
+	resp, err := client.Post(endpoint+"/api/generate", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return "", "", fmt.Errorf("sub-model request error: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var genResp struct {
+		Response string `json:"response"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&genResp); err != nil {
+		return "", "", fmt.Errorf("sub-model decode error: %w", err)
+	}
+
+	content := genResp.Response
+
+	// Extract <think>...</think> tags
+	if ti := strings.Index(content, "<think>"); ti >= 0 {
+		if te := strings.Index(content, "</think>"); te > ti {
+			thinking = strings.TrimSpace(content[ti+7 : te])
+			content = strings.TrimSpace(content[:ti] + content[te+8:])
+		}
+	}
+
+	return thinking, content, nil
+}
+
 func (a *Agent) webImages(targetURL string) (string, error) {
 	// Fetch the HTML
 	client := &http.Client{
@@ -1909,6 +2134,654 @@ var pluginMu sync.RWMutex
 
 // Thread system
 var threadDir string
+
+// ============================================================================
+// ACE Playbook System (Agentic Context Engineering)
+// ============================================================================
+
+// playbookDir stores the evolving knowledge playbook
+var playbookDir string
+var documentDir string
+
+// PlaybookBullet represents a structured unit of knowledge (ACE-style)
+type PlaybookBullet struct {
+	ID        string `json:"id"`
+	Type      string `json:"type"`    // strategy, pitfall, tool_pattern, code_snippet, preference
+	Content   string `json:"content"`
+	Hits      int    `json:"hits"`    // times this was useful
+	Misses    int    `json:"misses"`  // times this was wrong/unhelpful
+	CreatedAt int64  `json:"created_at"`
+	UpdatedAt int64  `json:"updated_at"`
+}
+
+// DocumentIndex represents a hierarchical document tree (PageIndex-style)
+type DocumentIndex struct {
+	ID        string         `json:"id"`
+	Title     string         `json:"title"`
+	URL       string         `json:"url,omitempty"`
+	CreatedAt int64          `json:"created_at"`
+	Sections  []DocSection   `json:"sections"`
+}
+
+type DocSection struct {
+	ID       string       `json:"id"`
+	Title    string       `json:"title"`
+	Summary  string       `json:"summary"`
+	Content  string       `json:"content,omitempty"` // actual text (stored in memory during search)
+	Children []DocSection `json:"children,omitempty"`
+}
+
+func initPlaybookDir() error {
+	if playbookDir != "" {
+		return nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	playbookDir = filepath.Join(home, ".siki", "playbook")
+	if err := os.MkdirAll(playbookDir, 0755); err != nil {
+		return err
+	}
+	documentDir = filepath.Join(home, ".siki", "documents")
+	return os.MkdirAll(documentDir, 0755)
+}
+
+func loadPlaybook() ([]PlaybookBullet, error) {
+	if err := initPlaybookDir(); err != nil {
+		return nil, err
+	}
+	path := filepath.Join(playbookDir, "playbook.jsonl")
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer f.Close()
+
+	var bullets []PlaybookBullet
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 256*1024), 256*1024)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var b PlaybookBullet
+		if err := json.Unmarshal([]byte(line), &b); err != nil {
+			continue
+		}
+		bullets = append(bullets, b)
+	}
+	return bullets, nil
+}
+
+func savePlaybook(bullets []PlaybookBullet) error {
+	if err := initPlaybookDir(); err != nil {
+		return err
+	}
+	path := filepath.Join(playbookDir, "playbook.jsonl")
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	for _, b := range bullets {
+		data, err := json.Marshal(b)
+		if err != nil {
+			continue
+		}
+		fmt.Fprintln(f, string(data))
+	}
+	return nil
+}
+
+func appendBullet(bullet PlaybookBullet) error {
+	if err := initPlaybookDir(); err != nil {
+		return err
+	}
+	path := filepath.Join(playbookDir, "playbook.jsonl")
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	data, err := json.Marshal(bullet)
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintln(f, string(data))
+	return err
+}
+
+// curateBullets merges new insights into existing playbook (ACE Curator)
+// Rule-based: deduplicates by content similarity, updates hit/miss counters
+func curateBullets(existing []PlaybookBullet, newBullets []PlaybookBullet) []PlaybookBullet {
+	result := make([]PlaybookBullet, len(existing))
+	copy(result, existing)
+
+	for _, nb := range newBullets {
+		found := false
+		nbLower := strings.ToLower(nb.Content)
+		for i, eb := range result {
+			ebLower := strings.ToLower(eb.Content)
+			// Simple dedup: if >60% of words overlap, consider it duplicate
+			nbWords := strings.Fields(nbLower)
+			overlap := 0
+			for _, w := range nbWords {
+				if strings.Contains(ebLower, w) {
+					overlap++
+				}
+			}
+			if len(nbWords) > 0 && float64(overlap)/float64(len(nbWords)) > 0.6 {
+				// Update existing bullet
+				result[i].Hits += nb.Hits
+				result[i].UpdatedAt = time.Now().Unix()
+				if len(nb.Content) > len(eb.Content) {
+					result[i].Content = nb.Content // keep more detailed version
+				}
+				found = true
+				break
+			}
+		}
+		if !found {
+			nb.CreatedAt = time.Now().Unix()
+			nb.UpdatedAt = time.Now().Unix()
+			result = append(result, nb)
+		}
+	}
+
+	// Prune: remove bullets with too many misses relative to hits
+	var pruned []PlaybookBullet
+	for _, b := range result {
+		if b.Misses > 3 && b.Misses > b.Hits*2 {
+			continue // too unreliable
+		}
+		pruned = append(pruned, b)
+	}
+
+	// Limit to 100 most useful bullets
+	if len(pruned) > 100 {
+		// Sort by hits descending (simple bubble for small N)
+		for i := 0; i < len(pruned); i++ {
+			for j := i + 1; j < len(pruned); j++ {
+				if pruned[j].Hits > pruned[i].Hits {
+					pruned[i], pruned[j] = pruned[j], pruned[i]
+				}
+			}
+		}
+		pruned = pruned[:100]
+	}
+
+	return pruned
+}
+
+// reflectOnExecution uses the sub-model to extract insights from tool execution results
+func reflectOnExecution(config *Config, toolName string, toolArgs string, toolResult string, userQuery string) []PlaybookBullet {
+	if config.SubModel == "" {
+		return nil
+	}
+
+	// Only reflect on meaningful tool results
+	if len(toolResult) < 20 || strings.HasPrefix(toolResult, "Error") {
+		return nil
+	}
+
+	// Truncate long results
+	result := toolResult
+	if len(result) > 2000 {
+		result = result[:2000] + "..."
+	}
+
+	prompt := fmt.Sprintf(`Analyze this tool execution and extract reusable insights.
+
+User query: %s
+Tool: %s
+Arguments: %s
+Result: %s
+
+Extract 0-3 reusable bullets. Each bullet should be a concrete, actionable insight.
+Output JSON array only. Format:
+[{"type":"strategy|pitfall|tool_pattern","content":"..."}]
+
+If nothing is worth remembering, output: []`, userQuery, toolName, toolArgs, result)
+
+	_, response, err := callSubModel(prompt, config)
+	if err != nil {
+		return nil
+	}
+
+	// Parse JSON array from response
+	response = strings.TrimSpace(response)
+	// Find JSON array in response
+	start := strings.Index(response, "[")
+	end := strings.LastIndex(response, "]")
+	if start < 0 || end < 0 || end <= start {
+		return nil
+	}
+	jsonStr := response[start : end+1]
+
+	var rawBullets []struct {
+		Type    string `json:"type"`
+		Content string `json:"content"`
+	}
+	if err := json.Unmarshal([]byte(jsonStr), &rawBullets); err != nil {
+		return nil
+	}
+
+	var bullets []PlaybookBullet
+	for i, rb := range rawBullets {
+		if rb.Content == "" {
+			continue
+		}
+		bullets = append(bullets, PlaybookBullet{
+			ID:   fmt.Sprintf("%s-%d-%d", rb.Type, time.Now().Unix(), i),
+			Type: rb.Type,
+			Content: rb.Content,
+			Hits: 1,
+		})
+	}
+	return bullets
+}
+
+// reflectOnConversation extracts insights from conversation history before compression
+func reflectOnConversation(config *Config, messages []Message) []PlaybookBullet {
+	if config.SubModel == "" {
+		return nil
+	}
+
+	var history strings.Builder
+	for _, m := range messages {
+		if m.Role == "system" {
+			continue
+		}
+		content := m.Content
+		if len(content) > 500 {
+			content = content[:500] + "..."
+		}
+		if content != "" {
+			history.WriteString(fmt.Sprintf("[%s]: %s\n", m.Role, content))
+		}
+	}
+
+	if history.Len() < 50 {
+		return nil
+	}
+
+	historyStr := history.String()
+	if len(historyStr) > 6000 {
+		historyStr = historyStr[:6000]
+	}
+
+	prompt := fmt.Sprintf(`Analyze this conversation and extract reusable knowledge bullets.
+
+%s
+
+Extract key insights as structured bullets. Categories:
+- strategy: effective approaches, user preferences, system configurations
+- pitfall: common errors, things to avoid, workarounds
+- tool_pattern: useful tool usage patterns, command templates
+- preference: user communication style, language preferences
+
+Output JSON array only:
+[{"type":"strategy|pitfall|tool_pattern|preference","content":"..."}]
+
+Extract 0-5 bullets. If nothing worth remembering, output: []`, historyStr)
+
+	_, response, err := callSubModel(prompt, config)
+	if err != nil {
+		return nil
+	}
+
+	response = strings.TrimSpace(response)
+	start := strings.Index(response, "[")
+	end := strings.LastIndex(response, "]")
+	if start < 0 || end < 0 || end <= start {
+		return nil
+	}
+
+	var rawBullets []struct {
+		Type    string `json:"type"`
+		Content string `json:"content"`
+	}
+	if err := json.Unmarshal([]byte(response[start:end+1]), &rawBullets); err != nil {
+		return nil
+	}
+
+	var bullets []PlaybookBullet
+	for i, rb := range rawBullets {
+		if rb.Content == "" {
+			continue
+		}
+		bullets = append(bullets, PlaybookBullet{
+			ID:   fmt.Sprintf("%s-%d-%d", rb.Type, time.Now().Unix(), i),
+			Type: rb.Type,
+			Content: rb.Content,
+			Hits: 1,
+		})
+	}
+	return bullets
+}
+
+// buildPlaybookContext returns formatted playbook bullets for system prompt injection
+func buildPlaybookContext() string {
+	bullets, err := loadPlaybook()
+	if err != nil || len(bullets) == 0 {
+		return ""
+	}
+
+	var sb strings.Builder
+	sb.WriteString("\n\n## Memory Playbook (学習済み知識)\n")
+	sb.WriteString("以下は過去の経験から学習した知識です。関連するものがあれば活用してください。\n\n")
+
+	typeLabels := map[string]string{
+		"strategy":     "戦略",
+		"pitfall":      "注意点",
+		"tool_pattern": "ツールパターン",
+		"code_snippet": "コードスニペット",
+		"preference":   "ユーザー設定",
+	}
+
+	for _, b := range bullets {
+		label := typeLabels[b.Type]
+		if label == "" {
+			label = b.Type
+		}
+		sb.WriteString(fmt.Sprintf("- [%s] %s", label, b.Content))
+		if b.Hits > 1 {
+			sb.WriteString(fmt.Sprintf(" (確認済み×%d)", b.Hits))
+		}
+		sb.WriteString("\n")
+	}
+
+	return sb.String()
+}
+
+// ============================================================================
+// PageIndex-style Document Tree System
+// ============================================================================
+
+func saveDocumentIndex(doc DocumentIndex) error {
+	if err := initPlaybookDir(); err != nil {
+		return err
+	}
+	docDir := filepath.Join(documentDir, doc.ID)
+	if err := os.MkdirAll(docDir, 0755); err != nil {
+		return err
+	}
+
+	// Save tree index
+	data, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(docDir, "index.json"), data, 0644)
+}
+
+func loadDocumentIndex(docID string) (*DocumentIndex, error) {
+	if err := initPlaybookDir(); err != nil {
+		return nil, err
+	}
+	path := filepath.Join(documentDir, docID, "index.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var doc DocumentIndex
+	if err := json.Unmarshal(data, &doc); err != nil {
+		return nil, err
+	}
+	return &doc, nil
+}
+
+func listDocuments() ([]DocumentIndex, error) {
+	if err := initPlaybookDir(); err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(documentDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	var docs []DocumentIndex
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		doc, err := loadDocumentIndex(e.Name())
+		if err != nil {
+			continue
+		}
+		docs = append(docs, *doc)
+	}
+	return docs, nil
+}
+
+// saveDocSection saves section content to a text file
+func saveDocSection(docID string, sectionID string, content string) error {
+	chunkDir := filepath.Join(documentDir, docID, "chunks")
+	if err := os.MkdirAll(chunkDir, 0755); err != nil {
+		return err
+	}
+	safeName := strings.ReplaceAll(sectionID, "/", "_")
+	return os.WriteFile(filepath.Join(chunkDir, safeName+".txt"), []byte(content), 0644)
+}
+
+// loadDocSection loads section content from a text file
+func loadDocSection(docID string, sectionID string) (string, error) {
+	safeName := strings.ReplaceAll(sectionID, "/", "_")
+	path := filepath.Join(documentDir, docID, "chunks", safeName+".txt")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+// indexDocument creates a hierarchical tree index from text content using the sub-model
+func indexDocument(config *Config, title string, content string, sourceURL string) (*DocumentIndex, error) {
+	if config.SubModel == "" {
+		return nil, fmt.Errorf("sub-model not configured; required for document indexing")
+	}
+
+	docID := fmt.Sprintf("doc-%d", time.Now().UnixMilli())
+
+	// Truncate for sub-model context
+	indexContent := content
+	if len(indexContent) > 12000 {
+		indexContent = indexContent[:12000] + "\n...(truncated)"
+	}
+
+	prompt := fmt.Sprintf(`Analyze this document and create a hierarchical table-of-contents tree index.
+
+Document title: %s
+
+Content:
+%s
+
+Create a JSON tree structure with sections and subsections. For each section, provide:
+- id: section number (e.g. "1", "1.1", "2")
+- title: section title
+- summary: 1-2 sentence summary of the section content
+
+Output ONLY valid JSON in this format:
+{"sections":[{"id":"1","title":"...","summary":"...","children":[{"id":"1.1","title":"...","summary":"..."}]}]}`, title, indexContent)
+
+	_, response, err := callSubModel(prompt, config)
+	if err != nil {
+		return nil, fmt.Errorf("sub-model indexing failed: %w", err)
+	}
+
+	// Parse JSON from response
+	response = strings.TrimSpace(response)
+	start := strings.Index(response, "{")
+	end := strings.LastIndex(response, "}")
+	if start < 0 || end < 0 {
+		// Fallback: create a single-section index
+		doc := &DocumentIndex{
+			ID:        docID,
+			Title:     title,
+			URL:       sourceURL,
+			CreatedAt: time.Now().Unix(),
+			Sections: []DocSection{
+				{ID: "1", Title: title, Summary: "Full document content"},
+			},
+		}
+		saveDocSection(docID, "1", content)
+		saveDocumentIndex(*doc)
+		return doc, nil
+	}
+
+	var treeResp struct {
+		Sections []DocSection `json:"sections"`
+	}
+	if err := json.Unmarshal([]byte(response[start:end+1]), &treeResp); err != nil {
+		// Fallback
+		doc := &DocumentIndex{
+			ID:        docID,
+			Title:     title,
+			URL:       sourceURL,
+			CreatedAt: time.Now().Unix(),
+			Sections: []DocSection{
+				{ID: "1", Title: title, Summary: "Full document content"},
+			},
+		}
+		saveDocSection(docID, "1", content)
+		saveDocumentIndex(*doc)
+		return doc, nil
+	}
+
+	doc := &DocumentIndex{
+		ID:        docID,
+		Title:     title,
+		URL:       sourceURL,
+		CreatedAt: time.Now().Unix(),
+		Sections:  treeResp.Sections,
+	}
+
+	// Split content into sections based on tree structure and save chunks
+	// For now, save the full content as the root section
+	saveDocSection(docID, "full", content)
+
+	// Try to split by section headers
+	lines := strings.Split(content, "\n")
+	var currentSection string
+	var currentContent strings.Builder
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		// Detect section headers (markdown style or numbered)
+		isHeader := strings.HasPrefix(trimmed, "# ") || strings.HasPrefix(trimmed, "## ") ||
+			strings.HasPrefix(trimmed, "### ") ||
+			(len(trimmed) > 2 && trimmed[0] >= '1' && trimmed[0] <= '9' && (trimmed[1] == '.' || trimmed[1] == ' '))
+		if isHeader && currentSection != "" {
+			saveDocSection(docID, currentSection, currentContent.String())
+			currentContent.Reset()
+		}
+		if isHeader {
+			currentSection = strings.ReplaceAll(trimmed, " ", "_")
+			if len(currentSection) > 50 {
+				currentSection = currentSection[:50]
+			}
+		}
+		currentContent.WriteString(line + "\n")
+	}
+	if currentSection != "" && currentContent.Len() > 0 {
+		saveDocSection(docID, currentSection, currentContent.String())
+	}
+
+	saveDocumentIndex(*doc)
+	return doc, nil
+}
+
+// searchDocumentTree uses the sub-model to reason through a document tree and find relevant sections
+func searchDocumentTree(config *Config, doc *DocumentIndex, query string) (string, error) {
+	if config.SubModel == "" {
+		return "", fmt.Errorf("sub-model not configured")
+	}
+
+	// Build tree representation
+	var tree strings.Builder
+	var buildTree func(sections []DocSection, depth int)
+	buildTree = func(sections []DocSection, depth int) {
+		for _, s := range sections {
+			indent := strings.Repeat("  ", depth)
+			tree.WriteString(fmt.Sprintf("%s[%s] %s: %s\n", indent, s.ID, s.Title, s.Summary))
+			if len(s.Children) > 0 {
+				buildTree(s.Children, depth+1)
+			}
+		}
+	}
+	buildTree(doc.Sections, 0)
+
+	prompt := fmt.Sprintf(`You are searching a document to answer a query.
+
+Document: %s
+Query: %s
+
+Document tree:
+%s
+
+Which section IDs are most relevant to the query? List the top 1-3 section IDs.
+Output ONLY a JSON array of section IDs, e.g.: ["1", "2.1"]`, doc.Title, query, tree.String())
+
+	_, response, err := callSubModel(prompt, config)
+	if err != nil {
+		return "", err
+	}
+
+	// Parse section IDs
+	response = strings.TrimSpace(response)
+	start := strings.Index(response, "[")
+	end := strings.LastIndex(response, "]")
+	if start < 0 || end < 0 {
+		// Fallback: return full content
+		content, err := loadDocSection(doc.ID, "full")
+		if err != nil {
+			return "No content found", nil
+		}
+		if len(content) > 4000 {
+			content = content[:4000] + "..."
+		}
+		return content, nil
+	}
+
+	var sectionIDs []string
+	json.Unmarshal([]byte(response[start:end+1]), &sectionIDs)
+
+	// Load and concatenate relevant sections
+	var result strings.Builder
+	result.WriteString(fmt.Sprintf("## Search results from: %s\n\n", doc.Title))
+
+	for _, sid := range sectionIDs {
+		content, err := loadDocSection(doc.ID, sid)
+		if err != nil {
+			// Try loading full content and extracting
+			continue
+		}
+		result.WriteString(fmt.Sprintf("### Section %s\n%s\n\n", sid, content))
+	}
+
+	// If no sections found, fallback to full
+	if result.Len() < 50 {
+		content, err := loadDocSection(doc.ID, "full")
+		if err != nil {
+			return "No content found", nil
+		}
+		if len(content) > 4000 {
+			content = content[:4000] + "..."
+		}
+		return content, nil
+	}
+
+	return result.String(), nil
+}
 
 // ============================================================================
 // Docker GPU Container Management
@@ -2904,6 +3777,20 @@ func (a *Agent) compressConversation(ctx context.Context) {
 	summary := chatResp.Choices[0].Message.Content
 	fmt.Printf("[siki] Compressed %d messages into summary (%d chars)\n", compressEnd-1, len(summary))
 
+	// ACE Reflector: extract insights before discarding old messages
+	go func(msgs []Message, cfg *Config) {
+		newBullets := reflectOnConversation(cfg, msgs)
+		if len(newBullets) > 0 {
+			existing, _ := loadPlaybook()
+			merged := curateBullets(existing, newBullets)
+			if err := savePlaybook(merged); err != nil {
+				fmt.Printf("[siki] Failed to save playbook: %v\n", err)
+			} else {
+				fmt.Printf("[siki] Playbook updated on compression: %d bullets\n", len(merged))
+			}
+		}
+	}(a.messages[1:compressEnd], a.config)
+
 	// Rebuild messages: system + summary + recent messages
 	newMessages := []Message{a.messages[0]}
 	newMessages = append(newMessages, Message{
@@ -3849,6 +4736,18 @@ func buildSystemPrompt(config *Config) string {
 	sb.WriteString(dateStr)
 	sb.WriteString("\n\n")
 	sb.WriteString(config.SystemPrompt)
+
+	// Inject ACE playbook context
+	sb.WriteString(buildPlaybookContext())
+
+	// Inject indexed documents summary
+	if docs, err := listDocuments(); err == nil && len(docs) > 0 {
+		sb.WriteString("\n\n## Indexed Documents\n")
+		sb.WriteString("search_documentツールで検索可能なドキュメント:\n")
+		for _, doc := range docs {
+			sb.WriteString(fmt.Sprintf("- %s (ID: %s)\n", doc.Title, doc.ID))
+		}
+	}
 
 	// Inject installed plugins into system prompt
 	pluginMu.RLock()
@@ -4819,6 +5718,20 @@ func (ws *WebServer) handleChatStream(w http.ResponseWriter, r *http.Request) {
 			}
 			agent.messages = append(agent.messages, toolMsg)
 			saveMsg(toolMsg, tc.Function.Name)
+
+			// ACE Reflector: extract insights from tool execution (async, non-blocking)
+			go func(toolName, toolArgs, toolResult, userQuery string, cfg *Config) {
+				newBullets := reflectOnExecution(cfg, toolName, toolArgs, toolResult, userQuery)
+				if len(newBullets) > 0 {
+					existing, _ := loadPlaybook()
+					merged := curateBullets(existing, newBullets)
+					if err := savePlaybook(merged); err != nil {
+						fmt.Printf("[siki] Failed to save playbook: %v\n", err)
+					} else {
+						fmt.Printf("[siki] Playbook updated: %d bullets (added %d new)\n", len(merged), len(newBullets))
+					}
+				}
+			}(tc.Function.Name, tc.Function.Arguments, result, req.Message, ws.config)
 		}
 	}
 	cancel()
@@ -5009,12 +5922,18 @@ func runWeb(config *Config, host string, port int) error {
 	if err := initDockerWorkspace(); err != nil {
 		fmt.Printf("Warning: failed to initialize docker workspace: %v\n", err)
 	}
+	if err := initPlaybookDir(); err != nil {
+		fmt.Printf("Warning: failed to initialize playbook dir: %v\n", err)
+	}
 
 	fmt.Printf("siki v%s - 式神 Web GUI\n", Version)
 	pp := config.primaryProvider()
 	fmt.Printf("Backend: %s, Model: %s\n", pp.Backend, pp.Model)
 	if config.VisionModel != "" {
 		fmt.Printf("Vision Model: %s\n", config.VisionModel)
+	}
+	if config.SubModel != "" {
+		fmt.Printf("Sub Model: %s\n", config.SubModel)
 	}
 	fmt.Printf("API Endpoint: %s\n", pp.Endpoint)
 	if len(config.Providers) > 1 {
@@ -5202,6 +6121,12 @@ func main() {
 		case "--vision-model":
 			if i+1 < len(args) {
 				config.VisionModel = args[i+1]
+				i += 2
+				continue
+			}
+		case "--sub-model":
+			if i+1 < len(args) {
+				config.SubModel = args[i+1]
 				i += 2
 				continue
 			}
