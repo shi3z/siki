@@ -915,8 +915,8 @@ func needsRunCode(userMsg string) bool {
 func overrideToolArgs(toolName, userMsg string, originalArgs map[string]interface{}, config *Config, sendEvent func(StreamEvent)) map[string]interface{} {
 	switch toolName {
 	case "web_search":
-		// Always use user's message as search query — 1.2B model generates garbage queries
-		if userMsg != "" {
+		// Override query with userMsg only for first-time queries (not follow-ups)
+		if userMsg != "" && !isFollowUpQuery(userMsg) {
 			if q, ok := originalArgs["query"].(string); ok && q != userMsg {
 				fmt.Printf("[siki] Overriding web_search query: %q → %q\n", q, userMsg)
 			}
@@ -1924,7 +1924,18 @@ func (a *Agent) webSearch(query string) (string, error) {
 		snippet = cleanHTMLEntities(snippet)
 
 		if title != "" || url != "" {
-			result := fmt.Sprintf("**%s**\n%s\n%s\n", title, url, snippet)
+			// Short display: extract domain, truncate to ~10 chars
+			shortURL := url
+			if idx := strings.Index(url, "://"); idx >= 0 {
+				shortURL = url[idx+3:]
+				if slashIdx := strings.Index(shortURL, "/"); slashIdx >= 0 {
+					shortURL = shortURL[:slashIdx]
+				}
+			}
+			if len(shortURL) > 15 {
+				shortURL = shortURL[:12] + "..."
+			}
+			result := fmt.Sprintf("**%s**\n[%s](%s)\n%s\n", title, shortURL, url, snippet)
 			results = append(results, result)
 		}
 	}
@@ -1949,6 +1960,40 @@ func cleanHTMLEntities(s string) string {
 	s = strings.ReplaceAll(s, "&nbsp;", " ")
 	s = strings.TrimSpace(s)
 	return s
+}
+
+// webFetchQuick is a faster version of webFetch with 10s timeout for auto-fetch.
+func (a *Agent) webFetchQuick(targetURL string) (string, error) {
+	// URL-decode percent-encoded characters in the URL
+	if decoded, err := url.QueryUnescape(targetURL); err == nil {
+		targetURL = decoded
+	}
+	fmt.Printf("[siki] webFetchQuick: %s\n", targetURL)
+	client := &http.Client{Timeout: 10 * time.Second}
+	req, err := http.NewRequest("GET", targetURL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("fetch failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Read max 100KB to avoid slow transfers
+	limited := io.LimitReader(resp.Body, 100*1024)
+	body, err := io.ReadAll(limited)
+	if err != nil {
+		return "", err
+	}
+
+	text := extractTextFromHTML(string(body))
+	if len(text) > 5000 {
+		text = text[:5000]
+	}
+	return text, nil
 }
 
 func (a *Agent) webFetch(url string) (string, error) {
@@ -2333,11 +2378,12 @@ func callSubModel(prompt string, config *Config) (thinking string, response stri
 	endpoint := strings.TrimSuffix(config.primaryProvider().Endpoint, "/v1")
 
 	reqBody := map[string]interface{}{
-		"model":  config.SubModel,
-		"prompt": prompt,
-		"stream": false,
+		"model":      config.SubModel,
+		"prompt":     prompt,
+		"stream":     false,
+		"keep_alive": -1,
 		"options": map[string]interface{}{
-			"num_predict": 2048,
+			"num_predict": 32768,
 		},
 	}
 
@@ -2363,6 +2409,12 @@ func callSubModel(prompt string, config *Config) (thinking string, response stri
 
 	content := genResp.Response
 	thinking = genResp.Thinking
+
+	// Thinking models put content in "thinking" field with empty "response"
+	if content == "" && thinking != "" {
+		content = thinking
+		thinking = ""
+	}
 
 	// Strip inline <think> tags (some models embed them in response)
 	if ti := strings.Index(content, "<think>"); ti >= 0 {
@@ -2398,11 +2450,12 @@ func generateCodeWithSubModel(userRequest string, config *Config) (string, error
 	endpoint := strings.TrimSuffix(config.primaryProvider().Endpoint, "/v1")
 
 	reqBody := map[string]interface{}{
-		"model":  config.SubModel,
-		"prompt": prompt,
-		"stream": false,
+		"model":      config.SubModel,
+		"prompt":     prompt,
+		"stream":     false,
+		"keep_alive": -1,
 		"options": map[string]interface{}{
-			"num_predict": 4096,
+			"num_predict": 32768,
 		},
 	}
 
@@ -2427,7 +2480,11 @@ func generateCodeWithSubModel(userRequest string, config *Config) (string, error
 		return "", fmt.Errorf("sub-model decode error: %w", err)
 	}
 
+	// Thinking models put content in "thinking" field with empty "response"
 	content := genResp.Response
+	if content == "" && genResp.Thinking != "" {
+		content = genResp.Thinking
+	}
 
 	// Strip <think>...</think> tags
 	if ti := strings.Index(content, "<think>"); ti >= 0 {
@@ -2489,9 +2546,10 @@ func generateCodeWithSubModel(userRequest string, config *Config) (string, error
 func callOllamaGenerate(model, prompt string, maxTokens int, timeout time.Duration, config *Config) (string, error) {
 	endpoint := strings.TrimSuffix(config.primaryProvider().Endpoint, "/v1")
 	reqBody := map[string]interface{}{
-		"model":  model,
-		"prompt": prompt,
-		"stream": false,
+		"model":      model,
+		"prompt":     prompt,
+		"stream":     false,
+		"keep_alive": -1,
 		"options": map[string]interface{}{
 			"num_predict": maxTokens,
 		},
@@ -2516,7 +2574,11 @@ func callOllamaGenerate(model, prompt string, maxTokens int, timeout time.Durati
 		return "", fmt.Errorf("decode error: %w", err)
 	}
 
+	// Thinking models put content in "thinking" field with empty "response"
 	content := genResp.Response
+	if content == "" && genResp.Thinking != "" {
+		content = genResp.Thinking
+	}
 
 	// Strip inline <think> tags (some models embed them in response)
 	if ti := strings.Index(content, "<think>"); ti >= 0 {
@@ -2653,17 +2715,242 @@ func subModelOrchestrate(userMsg string, messages []Message, config *Config) (*O
 			}
 		}
 		if err2 := json.Unmarshal([]byte(jsonStr), &decision); err2 != nil {
-			// Last resort: treat entire response as direct answer
-			fmt.Printf("[siki] Could not parse orchestrator JSON, using as direct response\n")
+			// JSON parse failed — do NOT use raw text (may contain hallucinations).
+			// Return empty decision; dualModelPipeline will fall back to keyword detection.
+			fmt.Printf("[siki] Could not parse orchestrator JSON, falling back to keyword detection\n")
 			decision = OrchestratorDecision{
-				Tool:     "none",
-				Response: response,
+				Tool: "",
 			}
 		}
 	}
 
 	fmt.Printf("[siki] Orchestrator decision: tool=%s\n", decision.Tool)
 	return &decision, nil
+}
+
+// isFollowUpQuery detects if the user message is a follow-up to a previous result.
+func isFollowUpQuery(userMsg string) bool {
+	lower := strings.ToLower(userMsg)
+	followUpKeywords := []string{
+		"深掘り", "詳しく", "もっと", "それぞれ", "各", "具体的",
+		"詳細", "掘り下げ", "続き", "さらに", "展開",
+	}
+	for _, kw := range followUpKeywords {
+		if strings.Contains(lower, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+// extractURLsFromConversation extracts URLs from recent tool results in conversation.
+func extractURLsFromConversation(messages []Message) []string {
+	var urls []string
+	// Look at recent messages (last 10) for tool results containing URLs
+	start := 0
+	if len(messages) > 10 {
+		start = len(messages) - 10
+	}
+	for _, m := range messages[start:] {
+		if m.Role == "tool" || (m.Role == "assistant" && len(m.ToolCalls) == 0) {
+			for _, line := range strings.Split(m.Content, "\n") {
+				line = strings.TrimSpace(line)
+				// Markdown link
+				if idx := strings.Index(line, "]("); idx >= 0 {
+					u := line[idx+2:]
+					if end := strings.Index(u, ")"); end >= 0 {
+						u = u[:end]
+						if strings.HasPrefix(u, "http") {
+							urls = append(urls, u)
+						}
+					}
+				} else if strings.HasPrefix(line, "http://") || strings.HasPrefix(line, "https://") {
+					urls = append(urls, line)
+				}
+			}
+		}
+	}
+	return urls
+}
+
+// needsToolButDidnt checks if a direct response looks hallucinated when the user
+// clearly needed tool-based information (news, search, real-time data).
+func needsToolButDidnt(userMsg, response string) bool {
+	lower := strings.ToLower(userMsg)
+	// Topics that require real-time data
+	realTimeKeywords := []string{
+		"ニュース", "最新", "速報", "news", "latest", "トレンド",
+		"今日", "今週", "今月", "現在",
+	}
+	needsRealTime := false
+	for _, kw := range realTimeKeywords {
+		if strings.Contains(lower, kw) {
+			needsRealTime = true
+			break
+		}
+	}
+	if !needsRealTime {
+		return false
+	}
+	// If response doesn't contain any real URLs, it's likely hallucinated
+	hasURL := strings.Contains(response, "http://") || strings.Contains(response, "https://")
+	if !hasURL && len(response) > 100 {
+		return true
+	}
+	return false
+}
+
+// executeToolAndSummarize is a helper for retry: execute a tool and stream the summary.
+func (ws *WebServer) executeToolAndSummarize(agent *Agent, userMsg, toolName string, sendEvent func(StreamEvent), saveMsg func(Message, string)) string {
+	args := map[string]interface{}{}
+	if toolName == "web_search" {
+		args["query"] = userMsg
+	}
+
+	sendEvent(StreamEvent{Type: "tool_start", Name: toolName})
+	result, err := agent.executeTool(toolName, args)
+	if err != nil {
+		fmt.Printf("[siki] Retry tool execution failed: %v\n", err)
+		return ""
+	}
+
+	displayResult := result
+	if len(displayResult) > 2000 {
+		displayResult = displayResult[:2000] + "\n... (truncated)"
+	}
+	sendEvent(StreamEvent{Type: "tool_call", Name: toolName, Result: displayResult})
+
+	// Save tool call
+	toolCallID := fmt.Sprintf("retry-%d", time.Now().UnixMilli())
+	argsJSON, _ := json.Marshal(args)
+	assistantMsg := Message{
+		Role: "assistant",
+		ToolCalls: []ToolCall{{
+			ID:   toolCallID,
+			Type: "function",
+			Function: struct {
+				Name      string `json:"name"`
+				Arguments string `json:"arguments"`
+			}{Name: toolName, Arguments: string(argsJSON)},
+		}},
+	}
+	agent.messages = append(agent.messages, assistantMsg)
+	saveMsg(assistantMsg, "")
+
+	toolMsg := Message{Role: "tool", Content: result, ToolCallID: toolCallID}
+	agent.messages = append(agent.messages, toolMsg)
+	saveMsg(toolMsg, toolName)
+
+	// For web_search, also fetch top pages
+	if toolName == "web_search" {
+		urls := extractURLsFromSearchResults(result)
+		if len(urls) > 5 {
+			urls = urls[:5]
+		}
+		if len(urls) > 0 {
+			sendEvent(StreamEvent{Type: "thinking", Content: "ページを取得中..."})
+			type fetchResult struct {
+				url     string
+				content string
+			}
+			ch := make(chan fetchResult, len(urls))
+			for _, u := range urls {
+				go func(fetchURL string) {
+					pageContent, fetchErr := agent.webFetchQuick(fetchURL)
+					if fetchErr != nil {
+						ch <- fetchResult{fetchURL, ""}
+						return
+					}
+					if len(pageContent) > 3000 {
+						pageContent = pageContent[:3000]
+					}
+					ch <- fetchResult{fetchURL, pageContent}
+				}(u)
+			}
+			var fetchedContent strings.Builder
+			fetchedContent.WriteString(result)
+			fetchedContent.WriteString("\n\n--- ページ本文 ---\n")
+			ticker := time.NewTicker(2 * time.Second)
+			collected := 0
+			for collected < len(urls) {
+				select {
+				case fr := <-ch:
+					collected++
+					sendEvent(StreamEvent{Type: "thinking", Content: fmt.Sprintf("取得完了 (%d/%d)", collected, len(urls))})
+					if fr.content != "" {
+						fetchedContent.WriteString(fmt.Sprintf("\n## %s\n%s\n", fr.url, fr.content))
+					}
+				case <-ticker.C:
+					sendEvent(StreamEvent{Type: "thinking", Content: "取得中..."})
+				}
+			}
+			ticker.Stop()
+			result = fetchedContent.String()
+		}
+	}
+
+	sendEvent(StreamEvent{Type: "thinking", Content: "再回答を生成中..."})
+	finalResponse, err := streamSubModelSummarize(userMsg, toolName, result, ws.config, sendEvent)
+	if err != nil || finalResponse == "" {
+		return ""
+	}
+
+	finalMsg := Message{Role: "assistant", Content: finalResponse}
+	agent.messages = append(agent.messages, finalMsg)
+	saveMsg(finalMsg, "")
+	return finalResponse
+}
+
+// extractURLsFromSearchResults extracts URLs from web_search result text.
+// Handles both plain URLs and markdown links [text](url).
+func extractURLsFromSearchResults(searchResult string) []string {
+	var urls []string
+	for _, line := range strings.Split(searchResult, "\n") {
+		line = strings.TrimSpace(line)
+		// Markdown link: [text](url)
+		if idx := strings.Index(line, "]("); idx >= 0 {
+			u := line[idx+2:]
+			if end := strings.Index(u, ")"); end >= 0 {
+				u = u[:end]
+				if strings.HasPrefix(u, "http") {
+					urls = append(urls, u)
+				}
+			}
+		} else if strings.HasPrefix(line, "http://") || strings.HasPrefix(line, "https://") {
+			urls = append(urls, line)
+		}
+	}
+	return urls
+}
+
+// detectToolFromKeywords determines which tool to use based on keyword matching.
+// Instant, deterministic fallback when gpt-oss orchestration fails.
+func detectToolFromKeywords(userMsg string) string {
+	lower := strings.ToLower(userMsg)
+
+	type toolRule struct {
+		keywords []string
+		tool     string
+	}
+	rules := []toolRule{
+		{[]string{"ニュース", "news", "最新", "速報", "トレンド"}, "web_search"},
+		{[]string{"調べて", "検索", "教えて", "について", "とは"}, "web_search"},
+		{[]string{"http://", "https://"}, "web_fetch"},
+		{[]string{"描いて", "書いて", "可視化", "グラフ描", "ゲーム作", "フラクタル", "マンデルブロ", "シミュレーション", "アニメーション"}, "run_code"},
+		{[]string{"図", "ダイアグラム", "アーキテクチャ", "関係図", "構成図"}, "diagram"},
+		{[]string{"ファイル", "読んで", "開いて"}, "read_file"},
+		{[]string{"コマンド", "実行して", "install", "apt ", "pip "}, "execute_command"},
+	}
+
+	for _, rule := range rules {
+		for _, kw := range rule.keywords {
+			if strings.Contains(lower, kw) {
+				fmt.Printf("[siki] Keyword fallback: '%s' → %s\n", kw, rule.tool)
+				return rule.tool
+			}
+		}
+	}
+	return ""
 }
 
 // subModelSummarize asks gpt-oss to generate a final response based on tool results.
@@ -2673,22 +2960,364 @@ func subModelSummarize(userMsg, toolName, toolResult string, config *Config) (st
 		result = result[:4000] + "\n... (以下省略)"
 	}
 
-	prompt := fmt.Sprintf(`ユーザーのリクエスト: %s
+	prompt := fmt.Sprintf(`## 絶対ルール
+- 以下のツール結果だけを使って回答しろ。自分の知識で補完するな。
+- ツール結果に無い情報は絶対に書くな。URLを捏造するな。
+- ツール結果のURLをそのまま引用しろ。
 
-実行したツール: %s
-ツール結果:
+## 回答品質の要件
+- 各トピックについて、背景・詳細・影響を具体的に書け。見出しだけの羅列は禁止。
+- ページ本文から得た具体的な数字・人名・技術名・引用を含めろ。
+- 「〇〇が発表」だけでなく「何を、なぜ、どういう影響があるか」まで書け。
+- 情報量が多い場合は、各ニュースをセクション（##）に分けて詳述せよ。
+
+## ユーザーのリクエスト
 %s
 
-上記のツール結果に基づいて、ユーザーに日本語で回答せよ。
-- 重要な情報を分かりやすく整理して伝えろ
-- URLがあれば含めろ
-- 簡潔かつ有用に`, userMsg, toolName, result)
+## 実行したツール: %s
+## ツール結果（この情報だけで回答せよ）:
+%s
 
-	response, err := callOllamaGenerate(config.SubModel, prompt, 2048, 300*time.Second, config)
+上記のツール結果のみに基づいて、日本語で詳しく回答せよ。`, userMsg, toolName, result)
+
+	response, err := callOllamaGenerate(config.SubModel, prompt, 32768, 300*time.Second, config)
 	if err != nil {
 		return "", fmt.Errorf("summarization failed: %w", err)
 	}
 	return response, nil
+}
+
+// validateURLsInResponse extracts URLs from the response and verifies them in parallel.
+// URLs are decoded before checking (e.g. %2D → -).
+// Total timeout: 5 seconds for all URL checks combined.
+// Returns a list of bad URLs (original form) and a cleaned response.
+func validateURLsInResponse(response string) (badURLs []string, cleanedResponse string) {
+	urlRegex := regexp.MustCompile(`https?://[^\s\)\]>"]+`)
+	allURLs := urlRegex.FindAllString(response, -1)
+	if len(allURLs) == 0 {
+		return nil, response
+	}
+
+	// Deduplicate and decode
+	seen := map[string]bool{}
+	type urlPair struct {
+		original string
+		decoded  string
+	}
+	var uniqueURLs []urlPair
+	for _, u := range allURLs {
+		u = strings.TrimRight(u, ".,;:!?\"')")
+		if seen[u] {
+			continue
+		}
+		seen[u] = true
+		decoded := u
+		if d, err := url.QueryUnescape(u); err == nil {
+			decoded = d
+		}
+		uniqueURLs = append(uniqueURLs, urlPair{u, decoded})
+	}
+
+	// Parallel HEAD checks with 5s global deadline
+	type checkResult struct {
+		original string
+		bad      bool
+	}
+	ch := make(chan checkResult, len(uniqueURLs))
+	client := &http.Client{
+		Timeout: 3 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 3 {
+				return fmt.Errorf("too many redirects")
+			}
+			return nil
+		},
+	}
+	for _, pair := range uniqueURLs {
+		go func(orig, decoded string) {
+			req, err := http.NewRequest("HEAD", decoded, nil)
+			if err != nil {
+				ch <- checkResult{orig, true}
+				return
+			}
+			req.Header.Set("User-Agent", "Mozilla/5.0")
+			resp, err := client.Do(req)
+			if err != nil {
+				// Network error — don't mark as bad (might be timeout/DNS)
+				ch <- checkResult{orig, false}
+				return
+			}
+			resp.Body.Close()
+			isBad := resp.StatusCode == 404 || resp.StatusCode == 410
+			ch <- checkResult{orig, isBad}
+		}(pair.original, pair.decoded)
+	}
+
+	badSet := map[string]bool{}
+	deadline := time.After(5 * time.Second)
+	collected := 0
+	for collected < len(uniqueURLs) {
+		select {
+		case r := <-ch:
+			collected++
+			if r.bad {
+				badSet[r.original] = true
+			}
+		case <-deadline:
+			goto done
+		}
+	}
+done:
+
+	for u := range badSet {
+		badURLs = append(badURLs, u)
+	}
+
+	// Remove lines containing bad URLs
+	lines := strings.Split(response, "\n")
+	var cleaned []string
+	for _, line := range lines {
+		hasBad := false
+		for _, u := range urlRegex.FindAllString(line, -1) {
+			u = strings.TrimRight(u, ".,;:!?\"')")
+			if badSet[u] {
+				hasBad = true
+				break
+			}
+		}
+		if !hasBad {
+			cleaned = append(cleaned, line)
+		}
+	}
+
+	if len(badURLs) > 0 {
+		fmt.Printf("[siki] URL validation: %d bad URLs found: %v\n", len(badURLs), badURLs)
+	}
+	return badURLs, strings.Join(cleaned, "\n")
+}
+
+// validateResponse performs multi-layer validation (all programmatic, no LLM):
+// 1. Length check (instant)
+// 2. URL accessibility check (parallel HEAD, max 5s)
+// 3. Content relevance check (keyword overlap between question/tool results/response)
+// Returns (isValid, feedback, cleanedResponse).
+// NOTE: Does NOT send SSE events itself — caller handles UI updates.
+func validateResponse(userMsg, response, toolResult string, config *Config) (bool, string, string) {
+	startTime := time.Now()
+
+	// Layer 1: Length check
+	if len(strings.TrimSpace(response)) < 30 {
+		fmt.Printf("[siki] Validation: response too short (%d chars) (%.1fs)\n", len(response), time.Since(startTime).Seconds())
+		return false, "回答が短すぎる", response
+	}
+
+	// Layer 2: URL validation (parallel, 5s max)
+	badURLs, cleanedResponse := validateURLsInResponse(response)
+	hasBadURLs := len(badURLs) > 0
+	if hasBadURLs {
+		allURLs := regexp.MustCompile(`https?://[^\s\)\]>"]+`).FindAllString(response, -1)
+		fmt.Printf("[siki] Validation: %d/%d bad URLs (%.1fs)\n", len(badURLs), len(allURLs), time.Since(startTime).Seconds())
+		if len(badURLs) > len(allURLs)/2 && len(allURLs) > 0 {
+			return false, fmt.Sprintf("回答中のURLが%d/%d件無効（捏造の疑い）", len(badURLs), len(allURLs)), cleanedResponse
+		}
+		response = cleanedResponse
+	}
+
+	// Layer 3: Programmatic content relevance check (Japanese-aware)
+	// Check if the response references data from tool results using substring matching
+	if toolResult != "" && len(toolResult) > 100 {
+		responseLower := strings.ToLower(response)
+		// Extract distinctive terms from tool results (URLs, proper nouns, numbers)
+		termRegex := regexp.MustCompile(`(?i)(?:https?://[^\s]+|[A-Z][a-zA-Z]{3,}|[0-9]{4}年|[0-9]+月[0-9]+日)`)
+		terms := termRegex.FindAllString(toolResult, 50)
+		overlapCount := 0
+		for _, term := range terms {
+			if strings.Contains(responseLower, strings.ToLower(term)) {
+				overlapCount++
+			}
+		}
+		// Also check for Japanese keyword overlap
+		jaKeywords := []string{}
+		for _, word := range strings.Fields(toolResult) {
+			if len(word) >= 6 && len(word) <= 30 { // Multi-byte Japanese words
+				jaKeywords = append(jaKeywords, word)
+			}
+		}
+		for _, kw := range jaKeywords {
+			if strings.Contains(response, kw) {
+				overlapCount++
+			}
+		}
+		if overlapCount == 0 {
+			fmt.Printf("[siki] Validation: zero overlap with tool results — rejecting (%.1fs)\n", time.Since(startTime).Seconds())
+			return false, "回答がツール結果に基づいていない（一般論の疑い）", response
+		}
+		fmt.Printf("[siki] Validation: tool result overlap=%d terms\n", overlapCount)
+	}
+
+	fmt.Printf("[siki] Validation: passed (badURLs=%d, %.1fs)\n", len(badURLs), time.Since(startTime).Seconds())
+	return true, "", response
+}
+
+// generateSuggestions generates 3 follow-up question suggestions based on the topic.
+// Uses keyword extraction (no LLM call) for instant results.
+func generateSuggestions(userMsg, response, toolName string) []string {
+	lower := strings.ToLower(userMsg)
+
+	// Topic-specific suggestions
+	if strings.Contains(lower, "ニュース") || strings.Contains(lower, "news") || strings.Contains(lower, "最新") {
+		// Extract key topics from the response for targeted suggestions
+		topics := []string{}
+		topicKeywords := []string{
+			"openai", "anthropic", "google", "microsoft", "meta",
+			"claude", "gpt", "gemini", "llama", "grok",
+			"セキュリティ", "ロボット", "自動運転", "医療", "教育",
+			"規制", "オープンソース", "API", "価格",
+		}
+		responseLower := strings.ToLower(response)
+		for _, kw := range topicKeywords {
+			if strings.Contains(responseLower, strings.ToLower(kw)) {
+				topics = append(topics, kw)
+			}
+		}
+
+		suggestions := []string{}
+		if len(topics) >= 2 {
+			suggestions = append(suggestions, fmt.Sprintf("%sについて詳しく教えて", topics[0]))
+			suggestions = append(suggestions, fmt.Sprintf("%sと%sの関連性は？", topics[0], topics[1]))
+		}
+		if len(topics) >= 3 {
+			suggestions = append(suggestions, fmt.Sprintf("%sの最新動向を深掘りして", topics[2]))
+		}
+
+		// Fill remaining slots with generic follow-ups
+		defaults := []string{
+			"それぞれのニュースを深掘りして",
+			"日本への影響は？",
+			"今後の展望を教えて",
+		}
+		for _, d := range defaults {
+			if len(suggestions) >= 3 {
+				break
+			}
+			suggestions = append(suggestions, d)
+		}
+		return suggestions[:3]
+	}
+
+	if strings.Contains(lower, "http") || toolName == "web_fetch" {
+		return []string{
+			"要約して",
+			"重要なポイントを箇条書きにして",
+			"関連する情報を検索して",
+		}
+	}
+
+	if toolName == "run_code" || toolName == "diagram" {
+		return []string{
+			"もっとかっこよくして",
+			"色やデザインを変えて",
+			"機能を追加して",
+		}
+	}
+
+	// Generic follow-ups
+	return []string{
+		"もっと詳しく教えて",
+		"具体例を挙げて",
+		"関連する情報を調べて",
+	}
+}
+
+// streamSubModelSummarize streams gpt-oss's summary response token-by-token via SSE.
+func streamSubModelSummarize(userMsg, toolName, toolResult string, config *Config, sendEvent func(StreamEvent)) (string, error) {
+	result := toolResult
+	if len(result) > 20000 {
+		result = result[:20000] + "\n... (以下省略)"
+	}
+
+	prompt := fmt.Sprintf(`## 絶対ルール
+- 以下のツール結果だけを使って回答しろ。自分の知識で補完するな。
+- ツール結果に無い情報は絶対に書くな。URLを捏造するな。
+- ツール結果のURLをそのまま引用しろ。
+
+## 回答品質の要件
+- 各トピックについて、背景・詳細・影響を具体的に書け。見出しだけの羅列は禁止。
+- ページ本文から得た具体的な数字・人名・技術名・引用を含めろ。
+- 「〇〇が発表」だけでなく「何を、なぜ、どういう影響があるか」まで書け。
+- 情報量が多い場合は、各ニュースをセクション（##）に分けて詳述せよ。
+
+## ユーザーのリクエスト
+%s
+
+## 実行したツール: %s
+## ツール結果（この情報だけで回答せよ）:
+%s
+
+上記のツール結果のみに基づいて、日本語で詳しく回答せよ。`, userMsg, toolName, result)
+
+	endpoint := strings.TrimSuffix(config.primaryProvider().Endpoint, "/v1")
+
+	reqBody := map[string]interface{}{
+		"model":      config.SubModel,
+		"prompt":     prompt,
+		"stream":     true,
+		"keep_alive": -1,
+		"options": map[string]interface{}{
+			"num_predict": 32768,
+		},
+	}
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", fmt.Errorf("marshal error: %w", err)
+	}
+
+	client := &http.Client{Timeout: 300 * time.Second}
+	resp, err := client.Post(endpoint+"/api/generate", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return "", fmt.Errorf("stream request error: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var fullResponse strings.Builder
+	inThinking := false
+	decoder := json.NewDecoder(resp.Body)
+
+	for decoder.More() {
+		var chunk struct {
+			Response string `json:"response"`
+			Thinking string `json:"thinking"`
+			Done     bool   `json:"done"`
+		}
+		if err := decoder.Decode(&chunk); err != nil {
+			break
+		}
+
+		// Skip thinking tokens (chain-of-thought)
+		if chunk.Thinking != "" {
+			inThinking = true
+			continue
+		}
+		if inThinking && chunk.Response != "" {
+			inThinking = false
+		}
+
+		if chunk.Response != "" {
+			// Strip <think> tags from streamed content
+			text := chunk.Response
+			if strings.Contains(text, "<think>") || strings.Contains(text, "</think>") {
+				continue
+			}
+			fullResponse.WriteString(text)
+			sendEvent(StreamEvent{Type: "content", Content: text})
+		}
+
+		if chunk.Done {
+			break
+		}
+	}
+
+	return fullResponse.String(), nil
 }
 
 // dualModelPipeline coordinates lfm (fast ack) and gpt-oss (real orchestration).
@@ -2720,30 +3349,168 @@ func (ws *WebServer) dualModelPipeline(ctx context.Context, agent *Agent, userMs
 	case <-time.After(1 * time.Second):
 	}
 
-	// Show thinking indicator while waiting for gpt-oss
+	// Show thinking indicator while waiting for gpt-oss (with keepalive)
 	sendEvent(StreamEvent{Type: "thinking", Content: "サブモデルで処理中..."})
 
-	// Wait for gpt-oss decision
+	// Wait for gpt-oss decision with periodic keepalive
 	var decision *OrchestratorDecision
-	select {
-	case r := <-orchCh:
-		if r.err != nil {
-			sendEvent(StreamEvent{Type: "error", Error: fmt.Sprintf("Orchestration error: %v", r.err)})
+	orchTicker := time.NewTicker(2 * time.Second)
+	orchDone := false
+	for !orchDone {
+		select {
+		case r := <-orchCh:
+			orchDone = true
+			if r.err != nil {
+				orchTicker.Stop()
+				sendEvent(StreamEvent{Type: "error", Error: fmt.Sprintf("Orchestration error: %v", r.err)})
+				return ""
+			}
+			decision = r.decision
+		case <-orchTicker.C:
+			sendEvent(StreamEvent{Type: "thinking", Content: "処理中..."})
+		case <-ctx.Done():
+			orchTicker.Stop()
 			return ""
 		}
-		decision = r.decision
-	case <-ctx.Done():
-		return ""
+	}
+	orchTicker.Stop()
+
+	// FIRST: Check for follow-up questions BEFORE any tool/none branching.
+	// Follow-ups like "深掘りして" "詳しく" should fetch previous URLs, not hallucinate.
+	if isFollowUpQuery(userMsg) {
+		prevURLs := extractURLsFromConversation(agent.messages)
+		if len(prevURLs) > 0 {
+			fmt.Printf("[siki] Follow-up detected, fetching %d previous URLs\n", len(prevURLs))
+			if len(prevURLs) > 5 {
+				prevURLs = prevURLs[:5]
+			}
+			sendEvent(StreamEvent{Type: "tool_start", Name: "web_fetch"})
+			type fetchResult struct {
+				url     string
+				content string
+			}
+			ch := make(chan fetchResult, len(prevURLs))
+			for _, u := range prevURLs {
+				go func(fetchURL string) {
+					pageContent, err := agent.webFetchQuick(fetchURL)
+					if err != nil {
+						fmt.Printf("[siki] Failed to fetch %s: %v\n", fetchURL, err)
+						ch <- fetchResult{fetchURL, ""}
+						return
+					}
+					if len(pageContent) > 3000 {
+						pageContent = pageContent[:3000] + "\n...(省略)"
+					}
+					ch <- fetchResult{fetchURL, pageContent}
+				}(u)
+			}
+			var fetchedContent strings.Builder
+			ticker := time.NewTicker(2 * time.Second)
+			collected := 0
+			for collected < len(prevURLs) {
+				select {
+				case fr := <-ch:
+					collected++
+					sendEvent(StreamEvent{Type: "thinking", Content: fmt.Sprintf("ページ取得完了 (%d/%d)", collected, len(prevURLs))})
+					if fr.content != "" {
+						fetchedContent.WriteString(fmt.Sprintf("\n## %s\n%s\n", fr.url, fr.content))
+					}
+				case <-ticker.C:
+					sendEvent(StreamEvent{Type: "thinking", Content: "ページ取得中..."})
+				}
+			}
+			ticker.Stop()
+			sendEvent(StreamEvent{Type: "tool_call", Name: "web_fetch", Result: fmt.Sprintf("%d件のページを取得しました", len(prevURLs))})
+
+			sendEvent(StreamEvent{Type: "thinking", Content: "回答を生成中..."})
+			fetchedStr := fetchedContent.String()
+			finalResponse, err := streamSubModelSummarize(userMsg, "web_fetch", fetchedStr, ws.config, sendEvent)
+			if err != nil || finalResponse == "" {
+				finalResponse = "ページの取得に失敗しました。"
+				sendEvent(StreamEvent{Type: "content", Content: finalResponse})
+			} else {
+				// Validate the follow-up response
+				isValid, reason, cleaned := validateResponse(userMsg, finalResponse, fetchedStr, ws.config)
+				if !isValid {
+					fmt.Printf("[siki] Follow-up validation failed: %s — retrying\n", reason)
+					sendEvent(StreamEvent{Type: "thinking", Content: fmt.Sprintf("回答品質チェック不合格: %s — 再生成します", reason)})
+					retryResponse, retryErr := streamSubModelSummarize(userMsg, "web_fetch", fetchedStr+"\n\n## 前回の回答が不合格だった理由:\n"+reason, ws.config, sendEvent)
+					if retryErr == nil && retryResponse != "" {
+						finalResponse = retryResponse
+					}
+				} else {
+					finalResponse = cleaned
+				}
+			}
+			finalMsg := Message{Role: "assistant", Content: finalResponse}
+			agent.messages = append(agent.messages, finalMsg)
+			saveMsg(finalMsg, "")
+			suggestions := generateSuggestions(userMsg, finalResponse, "web_fetch")
+			sendEvent(StreamEvent{Type: "suggestions", Suggestions: suggestions})
+			return finalResponse
+		}
 	}
 
-	// No tool needed — direct response from gpt-oss
-	if decision.Tool == "" || decision.Tool == "none" {
-		resp := decision.Response
-		sendEvent(StreamEvent{Type: "content", Content: resp})
-		assistantMsg := Message{Role: "assistant", Content: resp}
-		agent.messages = append(agent.messages, assistantMsg)
-		saveMsg(assistantMsg, "")
-		return resp
+	// If orchestration failed to produce a decision, fall back to keyword detection
+	if decision.Tool == "" {
+		fmt.Printf("[siki] Orchestration returned no tool, using keyword fallback\n")
+		detected := detectToolFromKeywords(userMsg)
+		if detected != "" {
+			decision.Tool = detected
+			decision.Args = nil
+		}
+	}
+
+	// No tool needed — but verify: should a tool have been called?
+	if decision.Tool == "none" || decision.Tool == "" {
+		// Self-check: re-evaluate with keyword detection before committing to no-tool answer
+		requiredTool := detectToolFromKeywords(userMsg)
+		if requiredTool != "" {
+			fmt.Printf("[siki] Self-check: orchestrator said no tool, but keyword detected '%s' — overriding\n", requiredTool)
+			decision.Tool = requiredTool
+			decision.Args = nil
+			// Fall through to tool execution below
+		} else {
+			fmt.Printf("[siki] No tool, streaming direct answer from gpt-oss\n")
+			resp, _ := streamSubModelSummarize(userMsg, "none", "", ws.config, sendEvent)
+			if resp == "" {
+				resp = "すみません、うまく処理できませんでした。もう一度お試しください。"
+				sendEvent(StreamEvent{Type: "content", Content: resp})
+			}
+			// Post-response validation: check if the answer looks hallucinated
+			if needsToolButDidnt(userMsg, resp) {
+				fmt.Printf("[siki] Post-response validation failed: response looks hallucinated, retrying with tool\n")
+				retryTool := detectToolFromKeywords(userMsg)
+				if retryTool == "" {
+					retryTool = "web_search"
+				}
+				sendEvent(StreamEvent{Type: "thinking", Content: "回答を検証中...ツールで再確認します"})
+				retryResult := ws.executeToolAndSummarize(agent, userMsg, retryTool, sendEvent, saveMsg)
+				if retryResult != "" {
+					return retryResult
+				}
+			}
+			// Validate content quality (URL check + sub-model judgment)
+			isValid, reason, cleaned := validateResponse(userMsg, resp, "", ws.config)
+			if !isValid {
+				fmt.Printf("[siki] Direct answer validation failed: %s\n", reason)
+				// Try with a tool as fallback
+				retryTool := "web_search"
+				sendEvent(StreamEvent{Type: "thinking", Content: fmt.Sprintf("回答品質チェック不合格: %s — ツールで再検索します", reason)})
+				retryResult := ws.executeToolAndSummarize(agent, userMsg, retryTool, sendEvent, saveMsg)
+				if retryResult != "" {
+					return retryResult
+				}
+			} else {
+				resp = cleaned
+			}
+			assistantMsg := Message{Role: "assistant", Content: resp}
+			agent.messages = append(agent.messages, assistantMsg)
+			saveMsg(assistantMsg, "")
+			suggestions := generateSuggestions(userMsg, resp, "none")
+			sendEvent(StreamEvent{Type: "suggestions", Suggestions: suggestions})
+			return resp
+		}
 	}
 
 	// Tool execution
@@ -2761,6 +3528,23 @@ func (ws *WebServer) dualModelPipeline(ctx context.Context, agent *Agent, userMs
 	args := decision.Args
 	if args == nil {
 		args = map[string]interface{}{}
+	}
+
+	// Set default args for keyword-detected tools
+	if toolName == "web_search" {
+		if _, ok := args["query"]; !ok {
+			args["query"] = userMsg
+		}
+	} else if toolName == "web_fetch" {
+		if _, ok := args["url"]; !ok {
+			// Extract URL from user message
+			for _, word := range strings.Fields(userMsg) {
+				if strings.HasPrefix(word, "http://") || strings.HasPrefix(word, "https://") {
+					args["url"] = word
+					break
+				}
+			}
+		}
 	}
 
 	// Validate run_code HTML — regenerate if too short
@@ -2818,15 +3602,98 @@ func (ws *WebServer) dualModelPipeline(ctx context.Context, agent *Agent, userMs
 		return result
 	}
 
-	// Phase 3: gpt-oss summarizes tool results
-	sendEvent(StreamEvent{Type: "thinking", Content: "回答を生成中..."})
-	finalResponse, err := subModelSummarize(userMsg, toolName, result, ws.config)
-	if err != nil {
-		fmt.Printf("[siki] Summarization failed: %v\n", err)
-		finalResponse = displayResult // Fall back to raw tool result
+	// For web_search, fetch top pages in parallel to get actual content
+	if toolName == "web_search" {
+		urls := extractURLsFromSearchResults(result)
+		if len(urls) > 5 {
+			urls = urls[:5]
+		}
+		if len(urls) > 0 {
+			sendEvent(StreamEvent{Type: "thinking", Content: fmt.Sprintf("上位%d件のページを取得中...", len(urls))})
+			type fetchResult struct {
+				url     string
+				content string
+			}
+			ch := make(chan fetchResult, len(urls))
+			for _, u := range urls {
+				go func(fetchURL string) {
+					pageContent, err := agent.webFetchQuick(fetchURL)
+					if err != nil {
+						fmt.Printf("[siki] Failed to fetch %s: %v\n", fetchURL, err)
+						ch <- fetchResult{fetchURL, ""}
+						return
+					}
+					if len(pageContent) > 3000 {
+						pageContent = pageContent[:3000] + "\n...(省略)"
+					}
+					ch <- fetchResult{fetchURL, pageContent}
+				}(u)
+			}
+			var fetchedContent strings.Builder
+			fetchedContent.WriteString(result)
+			fetchedContent.WriteString("\n\n--- 以下はページ本文 ---\n")
+			// Collect results with keepalive heartbeat
+			ticker := time.NewTicker(2 * time.Second)
+			collected := 0
+			for collected < len(urls) {
+				select {
+				case fr := <-ch:
+					collected++
+					sendEvent(StreamEvent{Type: "thinking", Content: fmt.Sprintf("ページ取得完了 (%d/%d)", collected, len(urls))})
+					if fr.content != "" {
+						fetchedContent.WriteString(fmt.Sprintf("\n## %s\n%s\n", fr.url, fr.content))
+					}
+				case <-ticker.C:
+					sendEvent(StreamEvent{Type: "thinking", Content: "ページ取得中..."})
+				}
+			}
+			ticker.Stop()
+			result = fetchedContent.String()
+		}
 	}
 
-	sendEvent(StreamEvent{Type: "content", Content: finalResponse})
+	// Phase 3: gpt-oss summarizes tool results (streaming)
+	sendEvent(StreamEvent{Type: "thinking", Content: "回答を生成中..."})
+
+	finalResponse, err := streamSubModelSummarize(userMsg, toolName, result, ws.config, sendEvent)
+	if err != nil {
+		fmt.Printf("[siki] Summarization failed: %v\n", err)
+		finalResponse = displayResult
+		sendEvent(StreamEvent{Type: "content", Content: finalResponse})
+	}
+
+	// Phase 4: Validate the response (programmatic, fast)
+	isValid, reason, cleaned := validateResponse(userMsg, finalResponse, result, ws.config)
+
+	if !isValid {
+		// Validation failed — notify user and regenerate
+		sendEvent(StreamEvent{Type: "content", Content: fmt.Sprintf("\n\n---\n**検証不合格: %s**\n回答を再生成します...\n\n", reason)})
+		fmt.Printf("[siki] Validation failed: %s — regenerating\n", reason)
+
+		retryResponse, retryErr := streamSubModelSummarize(
+			userMsg, toolName,
+			result+"\n\n## 重要な注意（前回の回答に問題があった）:\n"+reason+"\nこの問題を修正して回答せよ。URLはツール結果のものだけを使え。",
+			ws.config, sendEvent,
+		)
+		if retryErr == nil && len(strings.TrimSpace(retryResponse)) > 20 {
+			finalResponse = retryResponse
+		} else {
+			finalResponse = cleaned
+		}
+	} else if cleaned != finalResponse {
+		finalResponse = cleaned
+	}
+
+	// Send follow-up suggestions
+	suggestions := generateSuggestions(userMsg, finalResponse, toolName)
+	sendEvent(StreamEvent{Type: "suggestions", Suggestions: suggestions})
+
+	// Final fallback: if response is still too short
+	if len(strings.TrimSpace(finalResponse)) < 20 && len(result) > 100 {
+		fmt.Printf("[siki] Response too short (%d chars), falling back to raw result\n", len(finalResponse))
+		finalResponse = displayResult
+		sendEvent(StreamEvent{Type: "content", Content: "\n\n" + finalResponse})
+	}
 
 	finalMsg := Message{Role: "assistant", Content: finalResponse}
 	agent.messages = append(agent.messages, finalMsg)
@@ -7905,11 +8772,12 @@ func (ws *WebServer) handleChat(w http.ResponseWriter, r *http.Request) {
 
 // StreamEvent represents a server-sent event
 type StreamEvent struct {
-	Type    string `json:"type"`
-	Content string `json:"content,omitempty"`
-	Name    string `json:"name,omitempty"`
-	Result  string `json:"result,omitempty"`
-	Error   string `json:"error,omitempty"`
+	Type        string   `json:"type"`
+	Content     string   `json:"content,omitempty"`
+	Name        string   `json:"name,omitempty"`
+	Result      string   `json:"result,omitempty"`
+	Error       string   `json:"error,omitempty"`
+	Suggestions []string `json:"suggestions,omitempty"`
 }
 
 func (ws *WebServer) handleChatStream(w http.ResponseWriter, r *http.Request) {
@@ -7939,7 +8807,11 @@ func (ws *WebServer) handleChatStream(w http.ResponseWriter, r *http.Request) {
 
 	sendEvent := func(event StreamEvent) {
 		data, _ := json.Marshal(event)
-		fmt.Fprintf(w, "data: %s\n\n", data)
+		_, err := fmt.Fprintf(w, "data: %s\n\n", data)
+		if err != nil {
+			fmt.Printf("[siki] SSE write error: %v\n", err)
+			return
+		}
 		flusher.Flush()
 	}
 
