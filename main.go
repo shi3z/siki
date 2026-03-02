@@ -3202,6 +3202,44 @@ func createPlan(userMsg string, messages []Message, config *Config) (*Plan, erro
 		return nil, fmt.Errorf("plan has no tasks")
 	}
 
+	// Post-process: if user wants image generation, ensure generate_image is in the plan
+	if needsImageGeneration(userMsg) {
+		hasImageTask := false
+		for _, t := range planData.Tasks {
+			if t.Tool == "generate_image" {
+				hasImageTask = true
+				break
+			}
+		}
+		if !hasImageTask {
+			// Replace last run_code/diagram task with generate_image, or append one
+			replaced := false
+			for i := len(planData.Tasks) - 1; i >= 0; i-- {
+				if planData.Tasks[i].Tool == "run_code" || planData.Tasks[i].Tool == "diagram" {
+					fmt.Printf("[siki] Plan post-process: replacing task %d (%s → generate_image)\n", planData.Tasks[i].ID, planData.Tasks[i].Tool)
+					planData.Tasks[i].Tool = "generate_image"
+					planData.Tasks[i].Description = "調査結果をもとにAI画像（インフォグラフィック）を生成する"
+					replaced = true
+					break
+				}
+			}
+			if !replaced {
+				// Append a generate_image task
+				newID := planData.Tasks[len(planData.Tasks)-1].ID + 1
+				planData.Tasks = append(planData.Tasks, struct {
+					ID          int    `json:"id"`
+					Description string `json:"description"`
+					Tool        string `json:"tool"`
+				}{
+					ID:          newID,
+					Description: "調査結果をもとにAI画像（インフォグラフィック）を生成する",
+					Tool:        "generate_image",
+				})
+				fmt.Printf("[siki] Plan post-process: appended generate_image task (id=%d)\n", newID)
+			}
+		}
+	}
+
 	plan := &Plan{
 		Goal:      userMsg,
 		CreatedAt: time.Now().Format(time.RFC3339),
