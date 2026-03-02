@@ -944,6 +944,21 @@ func needsImageGeneration(userMsg string) bool {
 	return false
 }
 
+// containsResearchKeywords detects if user wants to search/investigate something
+func containsResearchKeywords(userMsg string) bool {
+	lower := strings.ToLower(userMsg)
+	keywords := []string{
+		"調べ", "検索", "調査", "ニュース", "最新", "について",
+		"まとめ", "にまつわる", "に関する", "search", "research", "investigate",
+	}
+	for _, kw := range keywords {
+		if strings.Contains(lower, kw) {
+			return true
+		}
+	}
+	return false
+}
+
 func needsRunCode(userMsg string) bool {
 	lower := strings.ToLower(userMsg)
 	keywords := []string{
@@ -4581,6 +4596,13 @@ func (ws *WebServer) dualModelPipeline(ctx context.Context, agent *Agent, userMs
 		}
 	}
 
+	// Force plan mode for complex requests needing research + specific output (image/code)
+	// The orchestrator often fails to detect multi-step requirements.
+	if decision.Tool != "plan" && needsImageGeneration(userMsg) && containsResearchKeywords(userMsg) {
+		fmt.Printf("[siki] Forcing plan mode: research + image generation detected\n")
+		decision.Tool = "plan"
+	}
+
 	// No tool needed — but verify: should a tool have been called?
 	if decision.Tool == "none" || decision.Tool == "" {
 		// Self-check: re-evaluate with keyword detection before committing to no-tool answer
@@ -7488,20 +7510,38 @@ func detectVRAM() int {
 	if len(lines) == 0 {
 		return 0
 	}
-	mb, err := strconv.Atoi(strings.TrimSpace(lines[0]))
+	val := strings.TrimSpace(lines[0])
+	// Some GPUs (Jetson/GB10) return "[N/A]" or "Not Supported"
+	if strings.Contains(val, "N/A") || strings.Contains(val, "Not") {
+		// GPU exists but can't report free memory — try total memory
+		cmd2 := exec.Command("nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits")
+		out2, err2 := cmd2.Output()
+		if err2 == nil {
+			val2 := strings.TrimSpace(strings.Split(string(out2), "\n")[0])
+			if mb2, err3 := strconv.Atoi(val2); err3 == nil {
+				return mb2
+			}
+		}
+		// Can't query total either (shared memory GPU like Jetson) — assume capable
+		return 16000
+	}
+	mb, err := strconv.Atoi(val)
 	if err != nil {
 		return 0
 	}
 	return mb
 }
 
-// canRunImageServer checks if VRAM >= 8GB and python3 exists
+// canRunImageServer checks if GPU exists and python3 is available
 func canRunImageServer() bool {
 	if _, err := exec.LookPath("python3"); err != nil {
 		return false
 	}
-	vram := detectVRAM()
-	return vram >= 8000
+	// Check if nvidia-smi exists (GPU present)
+	if _, err := exec.LookPath("nvidia-smi"); err != nil {
+		return false
+	}
+	return true
 }
 
 // initImageServerDir creates ~/.siki/image_server/ and writes server.py
@@ -7552,7 +7592,31 @@ func startImageServer(config *Config) error {
 		modelName = "black-forest-labs/FLUX.2-klein-4B"
 	}
 
-	cmd := exec.Command("python3", scriptPath)
+	// Setup venv if it doesn't exist
+	venvDir := filepath.Join(imageServerDir, "venv")
+	venvPython := filepath.Join(venvDir, "bin", "python3")
+	if _, err := os.Stat(venvPython); os.IsNotExist(err) {
+		fmt.Println("[siki] Creating Python venv for image server...")
+		venvCmd := exec.Command("python3", "-m", "venv", venvDir)
+		venvCmd.Stdout = os.Stdout
+		venvCmd.Stderr = os.Stderr
+		if err := venvCmd.Run(); err != nil {
+			return fmt.Errorf("failed to create venv: %w", err)
+		}
+		// Install dependencies
+		fmt.Println("[siki] Installing image server dependencies (this may take a few minutes)...")
+		pipCmd := exec.Command(filepath.Join(venvDir, "bin", "pip"), "install",
+			"diffusers", "transformers", "accelerate", "torch",
+			"fastapi", "uvicorn", "Pillow", "sentencepiece", "protobuf")
+		pipCmd.Stdout = os.Stdout
+		pipCmd.Stderr = os.Stderr
+		if err := pipCmd.Run(); err != nil {
+			return fmt.Errorf("failed to install image server dependencies: %w", err)
+		}
+		fmt.Println("[siki] Image server dependencies installed")
+	}
+
+	cmd := exec.Command(venvPython, scriptPath)
 	cmd.Env = append(os.Environ(),
 		"IMAGE_PORT="+port,
 		"FLUX_MODEL="+modelName,
