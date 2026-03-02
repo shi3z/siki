@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"context"
 	"embed"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -23,6 +24,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -64,6 +66,9 @@ type Config struct {
 	SubModel        string     `json:"sub_model"`
 	SubModelBackend string     `json:"sub_model_backend"` // "ollama" (default) or "vllm"
 	SubModelEndpoint string    `json:"sub_model_endpoint"` // optional separate endpoint for sub-model
+	ImageModel      string     `json:"image_model"`      // default: "black-forest-labs/FLUX.2-klein-4B"
+	ImageEndpoint   string     `json:"image_endpoint"`   // default: "http://localhost:8100"
+	ImageEnabled    bool       `json:"image_enabled"`    // default: true
 }
 
 // primaryProvider returns the first provider, or builds one from legacy config fields
@@ -121,6 +126,9 @@ func defaultConfig() *Config {
 		VisionModel: "moondream",
 		SubModel:        "gpt-oss:20b",
 		SubModelBackend: "ollama",
+		ImageModel:   "black-forest-labs/FLUX.2-klein-4B",
+		ImageEndpoint: "http://localhost:8100",
+		ImageEnabled:  true,
 		SystemPrompt: `あなたは式神(Shikigami)。ツールを持つAIアシスタント。
 
 ## 最重要ルール（絶対に守れ）
@@ -693,6 +701,28 @@ var tools = []Tool{
 			"properties": map[string]interface{}{},
 		},
 	},
+	{
+		Name:        "generate_image",
+		Description: "Generate an image using Flux Klein 4B AI model. Creates PNG images from text prompts. Use for infographics, illustrations, concept art, and visual content. Prompts should be in English and detailed.",
+		Parameters: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"prompt": map[string]interface{}{
+					"type":        "string",
+					"description": "Detailed English prompt describing the image to generate",
+				},
+				"width": map[string]interface{}{
+					"type":        "integer",
+					"description": "Image width in pixels (256-1024, default 512)",
+				},
+				"height": map[string]interface{}{
+					"type":        "integer",
+					"description": "Image height in pixels (256-1024, default 512)",
+				},
+			},
+			"required": []string{"prompt"},
+		},
+	},
 }
 
 var pluginManagementTools = []Tool{
@@ -983,6 +1013,28 @@ func overrideToolArgs(toolName, userMsg string, originalArgs map[string]interfac
 
 	case "read_file", "write_file", "search_files", "grep":
 		// File operations: trust model's args (path/content from user context)
+
+	case "generate_image":
+		// Enhance prompt: convert user's Japanese request to detailed English prompt via sub-model
+		if config.SubModel != "" {
+			enhancePrompt := fmt.Sprintf(`以下のユーザーリクエストから、画像生成AI用の英語プロンプトを生成せよ。
+詳細で描写的な英語プロンプトのみを出力し、他の文章は書くな。
+スタイル指定（digital art, infographic, illustration等）を含めること。
+
+ユーザーリクエスト: %s`, userMsg)
+			_, enhanced, err := callSubModel(enhancePrompt, config)
+			if err == nil && len(enhanced) > 10 {
+				enhanced = strings.TrimSpace(enhanced)
+				// Remove markdown code blocks if present
+				enhanced = strings.TrimPrefix(enhanced, "```")
+				enhanced = strings.TrimSuffix(enhanced, "```")
+				enhanced = strings.TrimSpace(enhanced)
+				if sendEvent != nil {
+					sendEvent(StreamEvent{Type: "thinking", Content: fmt.Sprintf("プロンプト強化: %s", enhanced)})
+				}
+				originalArgs["prompt"] = enhanced
+			}
+		}
 	}
 
 	return originalArgs
@@ -1241,6 +1293,24 @@ func (a *Agent) executeTool(name string, args map[string]interface{}) (result st
 			timeout = int(t)
 		}
 		return dockerExec(args["command"].(string), timeout)
+	case "generate_image":
+		prompt, _ := args["prompt"].(string)
+		if prompt == "" {
+			return "", fmt.Errorf("prompt is required for generate_image")
+		}
+		width := 512
+		height := 512
+		if w, ok := args["width"].(float64); ok && w > 0 {
+			width = int(w)
+		}
+		if h, ok := args["height"].(float64); ok && h > 0 {
+			height = int(h)
+		}
+		urlPath, err := generateImage(prompt, width, height, a.config)
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("Image generated successfully: ![Generated Image](%s)\n\nURL: %s", urlPath, urlPath), nil
 	case "create_plugin":
 		return a.createPlugin(args)
 	case "list_plugins":
@@ -3283,6 +3353,33 @@ func (ws *WebServer) executePlan(ctx context.Context, plan *Plan, planID string,
 		}
 	}
 
+	// Auto-generate infographic if image server is available
+	if imageServerReady && ws.config.ImageEnabled {
+		sendEvent(StreamEvent{Type: "thinking", Content: "インフォグラフィックを生成中..."})
+		// Generate English image prompt from summary using sub-model
+		if ws.config.SubModel != "" {
+			imgPromptReq := fmt.Sprintf(`以下のまとめ内容を表現するインフォグラフィック画像の英語プロンプトを生成せよ。
+プロンプトのみ出力し、他の文章は書くな。
+スタイル: modern infographic, clean design, data visualization, professional
+
+まとめ内容: %s
+
+目標: %s`, summary[:min(len(summary), 2000)], plan.Goal)
+			_, imgPrompt, err := callSubModel(imgPromptReq, ws.config)
+			if err == nil && len(imgPrompt) > 10 {
+				imgPrompt = strings.TrimSpace(imgPrompt)
+				urlPath, err := generateImage(imgPrompt, 768, 768, ws.config)
+				if err == nil {
+					imgMarkdown := fmt.Sprintf("\n\n![Infographic](%s)", urlPath)
+					summary += imgMarkdown
+					sendEvent(StreamEvent{Type: "content", Content: imgMarkdown})
+				} else {
+					fmt.Printf("[siki] Auto infographic generation failed: %v\n", err)
+				}
+			}
+		}
+	}
+
 	return summary
 }
 
@@ -3298,6 +3395,7 @@ func quickAck(userMsg string, config *Config) string {
 		response string
 	}
 	rules := []ackRule{
+		{[]string{"画像生成", "イラスト描", "インフォグラフィック", "画像を生成", "画像を作"}, "画像を生成しますね！Flux Klein 4Bを準備中..."},
 		{[]string{"ニュース", "news", "最新", "速報", "トレンド"}, "最新の情報を検索しますね！"},
 		{[]string{"描いて", "書いて", "フラクタル", "マンデルブロ", "ゲーム", "アニメーション", "可視化", "シミュレーション"}, "描画しますね！サブモデルでコード生成中..."},
 		{[]string{"http://", "https://", "url", "サイト"}, "URLの内容を取得しますね！"},
@@ -3360,6 +3458,7 @@ func subModelOrchestrate(userMsg string, messages []Message, config *Config) (*O
 - execute_command: シェルコマンド。引数: {"command": "コマンド"}
 - read_file: ファイル読込。引数: {"path": "ファイルパス"}
 - write_file: ファイル書込。引数: {"path": "パス", "content": "内容"}
+- generate_image: AI画像生成（Flux Klein 4B）。インフォグラフィック・イラスト・コンセプトアート。引数: {"prompt": "英語の詳細プロンプト"}
 - plan: 複雑なタスクを複数ステップに分解して順次実行。引数: {"goal": "達成したい目標"}
 
 ## 会話履歴
@@ -3374,6 +3473,7 @@ func subModelOrchestrate(userMsg string, messages []Message, config *Config) (*O
 - 複数のツールを組み合わせる必要がある複雑なリクエスト（調査→分析→可視化など）には plan を使え
 - 「〇〇を調べて図にして」「〇〇について調査してまとめて」のような複合タスクには plan を使え
 - 単純な1ステップの作業にはplanを使うな
+- generate_imageの場合、英語で詳細な画像プロンプトを指定。「画像生成して」「イラスト描いて」「インフォグラフィック」等のリクエストに使え
 - ツール不要（挨拶・計算・知識質問）なら直接回答
 
 以下のJSON形式のみ出力せよ（他の文章は絶対に書くな）:
@@ -3652,6 +3752,7 @@ func detectToolFromKeywords(userMsg string) string {
 		tool     string
 	}
 	rules := []toolRule{
+		{[]string{"画像生成", "イラスト描", "インフォグラフィック", "image generat", "generate image", "画像を生成", "画像を作"}, "generate_image"},
 		{[]string{"ニュース", "news", "最新", "速報", "トレンド"}, "web_search"},
 		{[]string{"調べて", "検索", "教えて", "について", "とは"}, "web_search"},
 		{[]string{"http://", "https://"}, "web_fetch"},
@@ -6924,6 +7025,340 @@ func stopDockerContainer() {
 	exec.Command("docker", "rm", dockerContainerName).Run()
 }
 
+// ============================================================================
+// Flux Image Generation Server Management
+// ============================================================================
+
+const imageServerScript = `#!/usr/bin/env python3
+"""Flux Klein 4B Image Generation Server for siki"""
+import os, sys, io, base64, json, time, signal
+from contextlib import asynccontextmanager
+
+try:
+    from fastapi import FastAPI
+    from fastapi.responses import JSONResponse
+    from pydantic import BaseModel
+    import uvicorn
+except ImportError:
+    print("Installing dependencies...")
+    import subprocess
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "fastapi", "uvicorn[standard]", "pydantic"])
+    from fastapi import FastAPI
+    from fastapi.responses import JSONResponse
+    from pydantic import BaseModel
+    import uvicorn
+
+pipe = None
+model_loaded = False
+
+class GenerateRequest(BaseModel):
+    prompt: str
+    width: int = 512
+    height: int = 512
+    num_steps: int = 4
+    guidance_scale: float = 3.5
+
+@asynccontextmanager
+async def lifespan(app):
+    yield
+    print("Shutting down image server...")
+
+app = FastAPI(lifespan=lifespan)
+
+def load_model():
+    global pipe, model_loaded
+    if model_loaded:
+        return
+    import torch
+    from diffusers import FluxPipeline
+    model_id = os.environ.get("FLUX_MODEL", "black-forest-labs/FLUX.2-klein-4B")
+    print(f"Loading {model_id}...")
+    dtype = torch.bfloat16
+    use_fp8 = os.environ.get("FLUX_FP8", "0") == "1"
+    if use_fp8:
+        try:
+            from torchao.quantization import float8_weight_only, quantize_
+            pipe = FluxPipeline.from_pretrained(model_id, torch_dtype=dtype)
+            quantize_(pipe.transformer, float8_weight_only())
+            print("Using FP8 quantization")
+        except ImportError:
+            print("torchao not available, using bfloat16")
+            pipe = FluxPipeline.from_pretrained(model_id, torch_dtype=dtype)
+    else:
+        pipe = FluxPipeline.from_pretrained(model_id, torch_dtype=dtype)
+    pipe = pipe.to("cuda")
+    pipe.set_progress_bar_config(disable=True)
+    model_loaded = True
+    print(f"Model loaded: {model_id}")
+
+@app.get("/health")
+async def health():
+    return {"status": "ready" if model_loaded else "loading", "model_loaded": model_loaded}
+
+@app.post("/generate")
+async def generate(req: GenerateRequest):
+    if not model_loaded:
+        try:
+            load_model()
+        except Exception as e:
+            return JSONResponse(status_code=503, content={"error": f"Model not loaded: {e}"})
+    try:
+        w = max(256, min(1024, (req.width // 8) * 8))
+        h = max(256, min(1024, (req.height // 8) * 8))
+        image = pipe(
+            prompt=req.prompt,
+            width=w,
+            height=h,
+            num_inference_steps=req.num_steps,
+            guidance_scale=req.guidance_scale,
+        ).images[0]
+        buf = io.BytesIO()
+        image.save(buf, format="PNG")
+        b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+        return {"image_base64": b64, "width": w, "height": h}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.post("/load")
+async def load():
+    """Eagerly load model"""
+    try:
+        load_model()
+        return {"status": "loaded"}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+if __name__ == "__main__":
+    port = int(os.environ.get("IMAGE_PORT", "8100"))
+    if "--preload" in sys.argv:
+        load_model()
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
+`
+
+var (
+	imageServerProcess *exec.Cmd
+	imageServerReady   bool
+	imageServerMu      sync.Mutex
+	imageServerDir     string
+)
+
+// detectVRAM returns free VRAM in MB using nvidia-smi
+func detectVRAM() int {
+	cmd := exec.Command("nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits")
+	out, err := cmd.Output()
+	if err != nil {
+		return 0
+	}
+	// Take first GPU's free memory
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) == 0 {
+		return 0
+	}
+	mb, err := strconv.Atoi(strings.TrimSpace(lines[0]))
+	if err != nil {
+		return 0
+	}
+	return mb
+}
+
+// canRunImageServer checks if VRAM >= 8GB and python3 exists
+func canRunImageServer() bool {
+	if _, err := exec.LookPath("python3"); err != nil {
+		return false
+	}
+	vram := detectVRAM()
+	return vram >= 8000
+}
+
+// initImageServerDir creates ~/.siki/image_server/ and writes server.py
+func initImageServerDir() error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	imageServerDir = filepath.Join(home, ".siki", "image_server")
+	if err := os.MkdirAll(imageServerDir, 0755); err != nil {
+		return err
+	}
+	// Also create output directory for generated images
+	outputDir := filepath.Join(home, ".siki", "image_server", "output")
+	if err := os.MkdirAll(outputDir, 0755); err != nil {
+		return err
+	}
+	scriptPath := filepath.Join(imageServerDir, "server.py")
+	return os.WriteFile(scriptPath, []byte(imageServerScript), 0644)
+}
+
+// startImageServer launches the Python subprocess and waits for health
+func startImageServer(config *Config) error {
+	imageServerMu.Lock()
+	defer imageServerMu.Unlock()
+
+	if imageServerReady {
+		return nil
+	}
+
+	if err := initImageServerDir(); err != nil {
+		return fmt.Errorf("failed to init image server dir: %w", err)
+	}
+
+	scriptPath := filepath.Join(imageServerDir, "server.py")
+	endpoint := config.ImageEndpoint
+	if endpoint == "" {
+		endpoint = "http://localhost:8100"
+	}
+	// Extract port from endpoint
+	port := "8100"
+	if idx := strings.LastIndex(endpoint, ":"); idx >= 0 {
+		port = endpoint[idx+1:]
+	}
+
+	modelName := config.ImageModel
+	if modelName == "" {
+		modelName = "black-forest-labs/FLUX.2-klein-4B"
+	}
+
+	cmd := exec.Command("python3", scriptPath)
+	cmd.Env = append(os.Environ(),
+		"IMAGE_PORT="+port,
+		"FLUX_MODEL="+modelName,
+	)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	// Set process group so we can kill children
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("failed to start image server: %w", err)
+	}
+	imageServerProcess = cmd
+
+	// Poll for health with timeout
+	healthURL := endpoint + "/health"
+	deadline := time.Now().Add(120 * time.Second)
+	for time.Now().Before(deadline) {
+		time.Sleep(2 * time.Second)
+		resp, err := http.Get(healthURL)
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode == 200 {
+				imageServerReady = true
+				fmt.Println("[siki] Image server is ready")
+				return nil
+			}
+		}
+	}
+
+	// Timed out - kill the process
+	stopImageServer()
+	return fmt.Errorf("image server failed to start within 120 seconds")
+}
+
+// ensureImageServer performs lazy startup on first use
+func ensureImageServer(config *Config) error {
+	if imageServerReady {
+		return nil
+	}
+
+	// Check if server is already running (external process)
+	endpoint := config.ImageEndpoint
+	if endpoint == "" {
+		endpoint = "http://localhost:8100"
+	}
+	resp, err := http.Get(endpoint + "/health")
+	if err == nil {
+		resp.Body.Close()
+		if resp.StatusCode == 200 {
+			imageServerReady = true
+			return nil
+		}
+	}
+
+	fmt.Println("[siki] Starting Flux image server (first use, this may take a while)...")
+	return startImageServer(config)
+}
+
+// stopImageServer sends SIGTERM then SIGKILL
+func stopImageServer() {
+	imageServerMu.Lock()
+	defer imageServerMu.Unlock()
+
+	if imageServerProcess == nil {
+		return
+	}
+
+	fmt.Println("[siki] Stopping image server...")
+	// Send SIGTERM to process group
+	if imageServerProcess.Process != nil {
+		syscall.Kill(-imageServerProcess.Process.Pid, syscall.SIGTERM)
+		done := make(chan error, 1)
+		go func() { done <- imageServerProcess.Wait() }()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			syscall.Kill(-imageServerProcess.Process.Pid, syscall.SIGKILL)
+			<-done
+		}
+	}
+	imageServerProcess = nil
+	imageServerReady = false
+}
+
+// generateImage calls the image server API and saves the PNG
+func generateImage(prompt string, width, height int, config *Config) (string, error) {
+	if err := ensureImageServer(config); err != nil {
+		return "", fmt.Errorf("image server not available: %w", err)
+	}
+
+	endpoint := config.ImageEndpoint
+	if endpoint == "" {
+		endpoint = "http://localhost:8100"
+	}
+
+	reqBody, _ := json.Marshal(map[string]interface{}{
+		"prompt": prompt,
+		"width":  width,
+		"height": height,
+	})
+
+	client := &http.Client{Timeout: 120 * time.Second}
+	resp, err := client.Post(endpoint+"/generate", "application/json", bytes.NewReader(reqBody))
+	if err != nil {
+		return "", fmt.Errorf("image generation request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("image generation failed (status %d): %s", resp.StatusCode, string(body))
+	}
+
+	var result struct {
+		ImageBase64 string `json:"image_base64"`
+		Width       int    `json:"width"`
+		Height      int    `json:"height"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", fmt.Errorf("failed to decode image response: %w", err)
+	}
+
+	// Decode base64 and save to playground directory
+	imgData, err := base64.StdEncoding.DecodeString(result.ImageBase64)
+	if err != nil {
+		return "", fmt.Errorf("failed to decode image base64: %w", err)
+	}
+
+	// Save to playground dir with unique name
+	filename := fmt.Sprintf("image_%d.png", time.Now().UnixNano())
+	filePath := filepath.Join(playgroundDir, filename)
+	if err := os.WriteFile(filePath, imgData, 0644); err != nil {
+		return "", fmt.Errorf("failed to save image: %w", err)
+	}
+
+	urlPath := "/playground/" + filename
+	return urlPath, nil
+}
+
 type Thread struct {
 	ID           string          `json:"id"`
 	Title        string          `json:"title"`
@@ -9074,8 +9509,18 @@ func (ws *WebServer) handlePlayground(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Only allow .html files
-	if !strings.HasSuffix(filename, ".html") {
+	// Allow .html, .png, .jpg, .jpeg, .gif, .svg files
+	ext := strings.ToLower(filepath.Ext(filename))
+	allowedExts := map[string]string{
+		".html": "text/html; charset=utf-8",
+		".png":  "image/png",
+		".jpg":  "image/jpeg",
+		".jpeg": "image/jpeg",
+		".gif":  "image/gif",
+		".svg":  "image/svg+xml",
+	}
+	contentType, ok := allowedExts[ext]
+	if !ok {
 		http.Error(w, "Invalid file type", http.StatusBadRequest)
 		return
 	}
@@ -9087,7 +9532,7 @@ func (ws *WebServer) handlePlayground(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(data)))
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Write(data)
@@ -10076,6 +10521,12 @@ func runWeb(config *Config, host string, port int) error {
 	if err := initDockerWorkspace(); err != nil {
 		fmt.Printf("Warning: failed to initialize docker workspace: %v\n", err)
 	}
+	// Initialize image server directory (write server.py)
+	if config.ImageEnabled {
+		if err := initImageServerDir(); err != nil {
+			fmt.Printf("Warning: failed to initialize image server dir: %v\n", err)
+		}
+	}
 	if err := initPlaybookDir(); err != nil {
 		fmt.Printf("Warning: failed to initialize playbook dir: %v\n", err)
 	}
@@ -10105,6 +10556,21 @@ func runWeb(config *Config, host string, port int) error {
 	}
 	if config.SubModel != "" {
 		fmt.Printf("Sub Model: %s\n", config.SubModel)
+	}
+	// Image generation status
+	if config.ImageEnabled {
+		vram := detectVRAM()
+		imgModel := config.ImageModel
+		if imgModel == "" {
+			imgModel = "Flux Klein 4B"
+		}
+		if canRunImageServer() {
+			fmt.Printf("Image Generation: %s (available, lazy load, VRAM: %dMB free)\n", imgModel, vram)
+		} else if vram > 0 {
+			fmt.Printf("Image Generation: %s (insufficient VRAM: %dMB free, need 8000MB)\n", imgModel, vram)
+		} else {
+			fmt.Printf("Image Generation: disabled (no GPU or python3 not found)\n")
+		}
 	}
 	fmt.Printf("API Endpoint: %s\n", pp.Endpoint)
 	if len(config.Providers) > 1 {
@@ -10151,6 +10617,7 @@ func runWeb(config *Config, host string, port int) error {
 	go func() {
 		<-sigCh
 		fmt.Println("\nShutting down...")
+		stopImageServer()
 		stopDockerContainer()
 		server.Close()
 	}()
@@ -10205,6 +10672,7 @@ func runChat(config *Config) error {
 	go func() {
 		<-sigCh
 		fmt.Println("\nGoodbye!")
+		stopImageServer()
 		stopDockerContainer()
 		cancel()
 		os.Exit(0)

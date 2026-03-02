@@ -618,6 +618,53 @@
             object-fit: contain;
         }
 
+        /* AI Generated Image styles */
+        .generated-image-container {
+            display: inline-block;
+            position: relative;
+            margin: 0.5rem 0;
+            border-radius: 12px;
+            overflow: hidden;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.4);
+            transition: transform 0.2s, box-shadow 0.2s;
+            cursor: pointer;
+        }
+
+        .generated-image-container:hover {
+            transform: scale(1.02);
+            box-shadow: 0 8px 30px rgba(233,69,96,0.3);
+        }
+
+        .generated-image-container img {
+            display: block;
+            max-width: 100%;
+            max-height: 512px;
+            border-radius: 12px;
+        }
+
+        .generated-image-container .image-expand-btn {
+            position: absolute;
+            top: 8px;
+            right: 8px;
+            background: rgba(0,0,0,0.6);
+            color: #fff;
+            border: none;
+            border-radius: 6px;
+            padding: 4px 10px;
+            font-size: 0.8rem;
+            cursor: pointer;
+            opacity: 0;
+            transition: opacity 0.2s;
+        }
+
+        .generated-image-container:hover .image-expand-btn {
+            opacity: 1;
+        }
+
+        .generated-image-container .image-expand-btn:hover {
+            background: var(--accent);
+        }
+
         .input-container {
             padding: 1rem 2rem;
             background: var(--bg-secondary);
@@ -1893,6 +1940,11 @@
                     replacement = `<div class="diagram-inline">${iframe}<br><button class="popout-btn" onclick="window.open('${srcMatch[1]}', '_blank', 'width=1200,height=800')">↗ Pop out</button></div>`;
                 }
                 html = html.replace(`SIKIFRAME${index}ENDFRAME`, replacement);
+            });
+
+            // Wrap playground images with expand container
+            html = html.replace(/<img\s+src="(\/playground\/[^"]+\.(?:png|jpg|jpeg|gif))"([^>]*)>/gi, (match, src, rest) => {
+                return `<div class="generated-image-container" onclick="showImageModal('${src}')"><img src="${src}"${rest}><button class="image-expand-btn" onclick="event.stopPropagation(); window.open('${src}', '_blank', 'width=1024,height=1024')">↗ Pop out</button></div>`;
             });
 
             // Open all links in new tab
