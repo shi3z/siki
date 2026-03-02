@@ -923,6 +923,24 @@ func selectToolsForContext(messages []Message) []Tool {
 
 // needsRunCode checks if a user request requires run_code (Canvas/JS) rather than diagram (Graphviz).
 // Used to redirect when the model picks the wrong tool.
+// needsImageGeneration detects if user wants AI image generation (not code/diagram)
+func needsImageGeneration(userMsg string) bool {
+	lower := strings.ToLower(userMsg)
+	keywords := []string{
+		"画像生成", "画像を生成", "画像を作", "イラスト描", "イラストを描",
+		"インフォグラフィック", "インフォグラフィクス",
+		"image generat", "generate image", "generate an image",
+		"写真を生成", "写真を作", "絵を描いて", "絵を生成",
+		"コンセプトアート", "concept art",
+	}
+	for _, kw := range keywords {
+		if strings.Contains(lower, kw) {
+			return true
+		}
+	}
+	return false
+}
+
 func needsRunCode(userMsg string) bool {
 	lower := strings.ToLower(userMsg)
 	keywords := []string{
@@ -4389,6 +4407,13 @@ func (ws *WebServer) dualModelPipeline(ctx context.Context, agent *Agent, userMs
 	// Tool execution
 	toolName := decision.Tool
 
+	// Redirect to generate_image if user clearly wants AI image generation
+	// (orchestrator may misroute to diagram/run_code)
+	if toolName != "generate_image" && needsImageGeneration(userMsg) {
+		fmt.Printf("[siki] Redirecting %s → generate_image (image generation keywords detected)\n", toolName)
+		toolName = "generate_image"
+	}
+
 	// Redirect diagram → run_code for complex visualizations
 	if toolName == "diagram" && needsRunCode(userMsg) {
 		fmt.Printf("[siki] Redirecting diagram → run_code\n")
@@ -4427,6 +4452,39 @@ func (ws *WebServer) dualModelPipeline(ctx context.Context, agent *Agent, userMs
 			fmt.Printf("[siki] run_code HTML too short (%d), regenerating\n", len(html))
 			if newHTML, err := generateCodeWithSubModel(userMsg, ws.config); err == nil {
 				args["html"] = newHTML
+			}
+		}
+	}
+
+	// Generate image: ensure prompt exists, enhance if needed
+	if toolName == "generate_image" {
+		prompt, _ := args["prompt"].(string)
+		if prompt == "" {
+			// Auto-enhance user's message to English image prompt via sub-model
+			if ws.config.SubModel != "" {
+				sendEvent(StreamEvent{Type: "thinking", Content: "画像プロンプトを生成中..."})
+				enhanceReq := fmt.Sprintf(`以下のユーザーリクエストから、画像生成AI用の英語プロンプトを生成せよ。
+詳細で描写的な英語プロンプトのみを出力し、他の文章は書くな。
+スタイル指定（digital art, infographic, illustration等）を含めること。
+
+ユーザーリクエスト: %s`, userMsg)
+				_, enhanced, err := callSubModel(enhanceReq, ws.config)
+				if err == nil && len(enhanced) > 10 {
+					enhanced = strings.TrimSpace(enhanced)
+					enhanced = strings.TrimPrefix(enhanced, "```")
+					enhanced = strings.TrimSuffix(enhanced, "```")
+					enhanced = strings.TrimSpace(enhanced)
+					// Remove surrounding quotes if present
+					if len(enhanced) > 2 && enhanced[0] == '"' && enhanced[len(enhanced)-1] == '"' {
+						enhanced = enhanced[1 : len(enhanced)-1]
+					}
+					args["prompt"] = enhanced
+					sendEvent(StreamEvent{Type: "thinking", Content: fmt.Sprintf("Prompt: %s", enhanced)})
+				} else {
+					args["prompt"] = userMsg
+				}
+			} else {
+				args["prompt"] = userMsg
 			}
 		}
 	}
@@ -4548,8 +4606,8 @@ digraph G {
 	agent.messages = append(agent.messages, toolMsg)
 	saveMsg(toolMsg, toolName)
 
-	// For run_code/diagram, the tool result IS the response (iframe/image)
-	if toolName == "run_code" || toolName == "diagram" {
+	// For run_code/diagram/generate_image, the tool result IS the response (iframe/image)
+	if toolName == "run_code" || toolName == "diagram" || toolName == "generate_image" {
 		finalMsg := Message{Role: "assistant", Content: result}
 		agent.messages = append(agent.messages, finalMsg)
 		saveMsg(finalMsg, "")
