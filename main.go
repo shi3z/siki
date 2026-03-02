@@ -7434,40 +7434,23 @@ def load_model():
     if model_loaded:
         return
     import torch
-    from diffusers import FluxPipeline
+    from diffusers import DiffusionPipeline
     model_id = os.environ.get("FLUX_MODEL", "black-forest-labs/FLUX.2-klein-4B")
     print(f"Loading {model_id}...")
     dtype = torch.bfloat16
 
-    # Try loading with all components first, then fallback for Klein/distilled variants
-    # that don't include text_encoder_2, tokenizer_2, image_encoder, feature_extractor
-    def _load(extra_kwargs=None):
-        kwargs = {"torch_dtype": dtype}
-        if extra_kwargs:
-            kwargs.update(extra_kwargs)
-        return FluxPipeline.from_pretrained(model_id, **kwargs)
+    # Use DiffusionPipeline.from_pretrained for auto-detection of pipeline class
+    # This handles FLUX.1, FLUX.2, and other variants automatically
+    pipe = DiffusionPipeline.from_pretrained(model_id, torch_dtype=dtype, trust_remote_code=True)
 
     use_fp8 = os.environ.get("FLUX_FP8", "0") == "1"
-    try:
-        if use_fp8:
-            try:
-                from torchao.quantization import float8_weight_only, quantize_
-                pipe = _load()
-                quantize_(pipe.transformer, float8_weight_only())
-                print("Using FP8 quantization")
-            except ImportError:
-                print("torchao not available, using bfloat16")
-                pipe = _load()
-        else:
-            pipe = _load()
-    except Exception as e:
-        print(f"Full pipeline load failed ({e}), trying without optional components...")
-        optional_none = {
-            "text_encoder_2": None, "tokenizer_2": None,
-            "image_encoder": None, "feature_extractor": None,
-        }
-        pipe = _load(optional_none)
-        print("Loaded with optional components disabled")
+    if use_fp8:
+        try:
+            from torchao.quantization import float8_weight_only, quantize_
+            quantize_(pipe.transformer, float8_weight_only())
+            print("Using FP8 quantization")
+        except ImportError:
+            print("torchao not available, using bfloat16")
 
     pipe = pipe.to("cuda")
     pipe.set_progress_bar_config(disable=True)
@@ -7619,76 +7602,29 @@ func startImageServer(config *Config) error {
 		modelName = "black-forest-labs/FLUX.2-klein-4B"
 	}
 
-	// Setup venv if it doesn't exist
-	venvDir := filepath.Join(imageServerDir, "venv")
-	venvPython := filepath.Join(venvDir, "bin", "python3")
-	if _, err := os.Stat(venvPython); os.IsNotExist(err) {
-		fmt.Println("[siki] Creating Python venv for image server (--system-site-packages)...")
-		venvCmd := exec.Command("python3", "-m", "venv", "--system-site-packages", venvDir)
-		venvCmd.Stdout = os.Stdout
-		venvCmd.Stderr = os.Stderr
-		if err := venvCmd.Run(); err != nil {
-			return fmt.Errorf("failed to create venv: %w", err)
-		}
-		pip := filepath.Join(venvDir, "bin", "pip")
-		// Check if CUDA-enabled torch is already available (from system or other venv)
-		checkCmd := exec.Command(venvPython, "-c", "import torch; assert torch.cuda.is_available(), 'no CUDA'")
-		if err := checkCmd.Run(); err != nil {
-			// No CUDA torch in system — try to find one from existing venvs
-			fmt.Println("[siki] No CUDA torch found in system, searching existing venvs...")
-			home, _ := os.UserHomeDir()
-			found := false
-			candidates := []string{
-				filepath.Join(home, "knowledgeCore", "venv", "bin", "python3"),
-				filepath.Join(home, ".egox_venv", "bin", "python"),
+	// Find Python with CUDA torch support
+	// Priority: 1) existing venvs with torch+CUDA, 2) system python3
+	pythonPath := "python3"
+	home, _ := os.UserHomeDir()
+	candidates := []string{
+		filepath.Join(home, "knowledgeCore", "venv", "bin", "python3"),
+		filepath.Join(home, ".egox_venv", "bin", "python"),
+	}
+	for _, cand := range candidates {
+		if _, serr := os.Stat(cand); serr == nil {
+			checkCmd := exec.Command(cand, "-c", "import torch, diffusers; assert torch.cuda.is_available()")
+			if err := checkCmd.Run(); err == nil {
+				pythonPath = cand
+				fmt.Printf("[siki] Using Python with CUDA torch: %s\n", pythonPath)
+				break
 			}
-			for _, cand := range candidates {
-				if _, serr := os.Stat(cand); serr == nil {
-					checkCand := exec.Command(cand, "-c", "import torch; print(torch.__path__[0])")
-					if out, cerr := checkCand.Output(); cerr == nil {
-						torchPath := strings.TrimSpace(string(out))
-						fmt.Printf("[siki] Found CUDA torch at: %s\n", torchPath)
-						// Create .pth file to add the site-packages to our venv
-						siteDir := filepath.Dir(torchPath)
-						pthFile := filepath.Join(venvDir, "lib")
-						// Find the python version dir
-						entries, _ := os.ReadDir(pthFile)
-						for _, e := range entries {
-							if strings.HasPrefix(e.Name(), "python") {
-								pthPath := filepath.Join(pthFile, e.Name(), "site-packages", "cuda_torch.pth")
-								os.WriteFile(pthPath, []byte(siteDir+"\n"), 0644)
-								fmt.Printf("[siki] Added %s to venv path\n", siteDir)
-								found = true
-								break
-							}
-						}
-						if found {
-							break
-						}
-					}
-				}
-			}
-			if !found {
-				fmt.Println("[siki] WARNING: No CUDA torch found. Image generation may fail on GPU.")
-				fmt.Println("[siki] Install torch+CUDA manually: pip install torch --index-url https://download.pytorch.org/whl/cu124")
-			}
-		} else {
-			fmt.Println("[siki] CUDA torch available from system packages")
 		}
-		// Install non-torch dependencies
-		fmt.Println("[siki] Installing image server dependencies...")
-		pipCmd := exec.Command(pip, "install",
-			"diffusers", "transformers", "accelerate",
-			"fastapi", "uvicorn", "Pillow", "sentencepiece", "protobuf")
-		pipCmd.Stdout = os.Stdout
-		pipCmd.Stderr = os.Stderr
-		if err := pipCmd.Run(); err != nil {
-			return fmt.Errorf("failed to install image server dependencies: %w", err)
-		}
-		fmt.Println("[siki] Image server dependencies installed")
+	}
+	if pythonPath == "python3" {
+		fmt.Println("[siki] WARNING: No CUDA-enabled Python found. Image generation may fail.")
 	}
 
-	cmd := exec.Command(venvPython, scriptPath)
+	cmd := exec.Command(pythonPath, scriptPath)
 	cmd.Env = append(os.Environ(),
 		"IMAGE_PORT="+port,
 		"FLUX_MODEL="+modelName,
