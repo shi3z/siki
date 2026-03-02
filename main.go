@@ -3116,56 +3116,43 @@ func createPlan(userMsg string, messages []Message, config *Config) (*Plan, erro
 		}
 	}
 
-	prompt := fmt.Sprintf(`あなたはタスク分解の専門家。ユーザーの複雑なリクエストを実行可能なステップに分解せよ。
+	// Determine final output tool based on user request
+	finalTool := "summarize"
+	finalToolDesc := "最終まとめを生成"
+	if needsImageGeneration(userMsg) {
+		finalTool = "generate_image"
+		finalToolDesc = "調査結果をもとにインフォグラフィック画像をAI生成"
+	} else if needsRunCode(userMsg) {
+		finalTool = "run_code"
+		finalToolDesc = "HTML/JS/Canvasでインタラクティブコンテンツを生成"
+	} else {
+		lower := strings.ToLower(userMsg)
+		for _, kw := range []string{"図", "ダイアグラム", "関係図", "構成図", "フロー図"} {
+			if strings.Contains(lower, kw) {
+				finalTool = "diagram"
+				finalToolDesc = "調査結果をもとにGraphviz図を生成"
+				break
+			}
+		}
+	}
 
-## 利用可能なツール（使い分けに注意）
-- web_search: インターネット検索
-- web_fetch: URL内容取得
-- run_code: HTMLコード実行。ゲーム・シミュレーション・インタラクティブUI等、プログラムを書く必要があるもの専用
-- diagram: Graphviz DOT図。ノードとエッジで表す関係図・フロー図専用
-- generate_image: AI画像生成。インフォグラフィック・イラスト・ポスター・写真風画像等、ビジュアルコンテンツを生成。プロンプトからAIが画像を描く
-- execute_command: シェルコマンド
-- read_file / write_file: ファイル操作
-- summarize: ツール不要の中間まとめ
+	prompt := fmt.Sprintf(`ユーザーのリクエストを実行可能なステップに分解せよ。
 
-## ビジュアル出力の使い分け（重要）
-| ユーザーの要求 | 正しいツール | 間違い |
-|---|---|---|
-| インフォグラフィック作って | generate_image | ~~run_code~~ |
-| イラスト描いて | generate_image | ~~run_code~~ |
-| 画像を生成して | generate_image | ~~diagram~~ |
-| ゲームを作って | run_code | - |
-| シミュレーション | run_code | - |
-| 関係図・フロー図 | diagram | - |
+ツール: web_search, web_fetch, summarize, diagram, generate_image, run_code, execute_command, read_file, write_file
 
-## 例1: 「〇〇を調べてインフォグラフィックにして」
+リクエスト: %s
+
+最終出力ツール: %s
+
+以下の形式のJSONのみ出力せよ。他の文章は書くな:
 {"tasks":[
-{"id":1,"description":"〇〇について検索","tool":"web_search"},
-{"id":2,"description":"検索上位のページを取得","tool":"web_fetch"},
-{"id":3,"description":"情報を要約","tool":"summarize"},
-{"id":4,"description":"要約をもとにインフォグラフィック画像を生成","tool":"generate_image"}
+{"id":1,"description":"...を検索","tool":"web_search"},
+{"id":2,"description":"検索結果の上位ページを取得","tool":"web_fetch"},
+{"id":3,"description":"情報を要約・整理","tool":"summarize"},
+{"id":4,"description":"%s","tool":"%s"}
 ]}
 
-## 例2: 「〇〇を調べて関係図にして」
-{"tasks":[
-{"id":1,"description":"〇〇について検索","tool":"web_search"},
-{"id":2,"description":"検索上位のページを取得","tool":"web_fetch"},
-{"id":3,"description":"関係図をGraphvizで生成","tool":"diagram"}
-]}
-
-## 会話履歴
-%s
-
-## ユーザーのリクエスト
-%s
-
-## 出力形式（JSON以外書くな）
-{"tasks": [{"id": 1, "description": "...", "tool": "ツール名"}, ...]}
-
-## ルール
-- 各タスクは1つのツール呼び出し
-- 実行順に並べろ。3〜10個
-- 説明は具体的に（何を検索するか等）`, ctx.String(), userMsg)
+上記は例。タスク数は3〜10個で調整せよ。最後のタスクのtoolは必ず「%s」にしろ。`, userMsg, finalTool, finalToolDesc, finalTool, finalTool)
 
 	// Use sub-agent for plan creation if available (better at complex decomposition)
 	var response string
