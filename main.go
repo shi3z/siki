@@ -61,7 +61,9 @@ type Config struct {
 	MaxTurns     int        `json:"max_turns"`
 	SystemPrompt string     `json:"system_prompt"`
 	VisionModel  string     `json:"vision_model"`
-	SubModel     string     `json:"sub_model"`
+	SubModel        string     `json:"sub_model"`
+	SubModelBackend string     `json:"sub_model_backend"` // "ollama" (default) or "vllm"
+	SubModelEndpoint string    `json:"sub_model_endpoint"` // optional separate endpoint for sub-model
 }
 
 // primaryProvider returns the first provider, or builds one from legacy config fields
@@ -117,7 +119,8 @@ func defaultConfig() *Config {
 		Workspace:   ".",
 		MaxTurns:    MaxTurns,
 		VisionModel: "moondream",
-		SubModel:    "gpt-oss:20b",
+		SubModel:        "gpt-oss:20b",
+		SubModelBackend: "ollama",
 		SystemPrompt: `あなたは式神(Shikigami)。ツールを持つAIアシスタント。
 
 ## 最重要ルール（絶対に守れ）
@@ -1194,7 +1197,16 @@ func (a *Agent) executeTool(name string, args map[string]interface{}) (result st
 		if t, ok := args["title"].(string); ok {
 			title = t
 		}
-		return a.generateDiagram(args["dot_code"].(string), title)
+		dotCode := ""
+		if d, ok := args["dot_code"].(string); ok && d != "" {
+			dotCode = d
+		} else if d, ok := args["dot_source"].(string); ok && d != "" {
+			dotCode = d
+		}
+		if dotCode == "" {
+			return "", fmt.Errorf("diagram: dot_source or dot_code argument is required")
+		}
+		return a.generateDiagram(dotCode, title)
 	case "search_conversation":
 		return a.searchConversation(args["query"].(string)), nil
 	case "recall_context":
@@ -2367,7 +2379,150 @@ func describeImages(images []string, visionModel string, ollamaEndpoint string) 
 	return strings.Join(descriptions, "\n")
 }
 
-// callSubModel calls a lightweight sub-model (e.g. lfm2.5-thinking) via Ollama native /api/generate.
+// subModelEndpoint returns the endpoint URL for the sub-model.
+// If SubModelEndpoint is set, use it; otherwise fall back to the primary provider's endpoint.
+func subModelEndpoint(config *Config) string {
+	if config.SubModelEndpoint != "" {
+		return strings.TrimSuffix(config.SubModelEndpoint, "/")
+	}
+	return strings.TrimSuffix(config.primaryProvider().Endpoint, "/v1")
+}
+
+// isSubModelVLLM returns true if the sub-model backend is vllm (OpenAI-compatible API).
+func isSubModelVLLM(config *Config) bool {
+	return config.SubModelBackend == "vllm"
+}
+
+// callVLLMGenerate calls a model via vllm's OpenAI-compatible /v1/chat/completions endpoint.
+// Returns the generated text with <think> tags stripped.
+func callVLLMGenerate(model, prompt string, maxTokens int, timeout time.Duration, endpoint string) (string, error) {
+	ep := strings.TrimSuffix(endpoint, "/")
+	if !strings.HasSuffix(ep, "/v1") {
+		ep = ep + "/v1"
+	}
+
+	reqBody := map[string]interface{}{
+		"model": model,
+		"messages": []map[string]string{
+			{"role": "user", "content": prompt},
+		},
+		"max_tokens": maxTokens,
+		"stream":     false,
+	}
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", fmt.Errorf("marshal error: %w", err)
+	}
+
+	client := &http.Client{Timeout: timeout}
+	resp, err := client.Post(ep+"/chat/completions", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return "", fmt.Errorf("vllm request error: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var chatResp struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&chatResp); err != nil {
+		return "", fmt.Errorf("vllm decode error: %w", err)
+	}
+
+	if len(chatResp.Choices) == 0 {
+		return "", fmt.Errorf("vllm returned no choices")
+	}
+
+	content := chatResp.Choices[0].Message.Content
+
+	// Strip inline <think> tags
+	if ti := strings.Index(content, "<think>"); ti >= 0 {
+		if te := strings.Index(content, "</think>"); te > ti {
+			content = strings.TrimSpace(content[:ti] + content[te+8:])
+		}
+	}
+	return content, nil
+}
+
+// streamVLLMGenerate streams a response from vllm's OpenAI-compatible /v1/chat/completions endpoint.
+func streamVLLMGenerate(model, prompt string, maxTokens int, timeout time.Duration, endpoint string, sendEvent func(StreamEvent)) (string, error) {
+	ep := strings.TrimSuffix(endpoint, "/")
+	if !strings.HasSuffix(ep, "/v1") {
+		ep = ep + "/v1"
+	}
+
+	reqBody := map[string]interface{}{
+		"model": model,
+		"messages": []map[string]string{
+			{"role": "user", "content": prompt},
+		},
+		"max_tokens": maxTokens,
+		"stream":     true,
+	}
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", fmt.Errorf("marshal error: %w", err)
+	}
+
+	client := &http.Client{Timeout: timeout}
+	resp, err := client.Post(ep+"/chat/completions", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return "", fmt.Errorf("vllm stream request error: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var fullResponse strings.Builder
+	inThinking := false
+	scanner := bufio.NewScanner(resp.Body)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		data := strings.TrimPrefix(line, "data: ")
+		if data == "[DONE]" {
+			break
+		}
+		var chunk struct {
+			Choices []struct {
+				Delta struct {
+					Content string `json:"content"`
+				} `json:"delta"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			continue
+		}
+		if len(chunk.Choices) == 0 {
+			continue
+		}
+		text := chunk.Choices[0].Delta.Content
+		if text == "" {
+			continue
+		}
+		// Skip <think> blocks
+		if strings.Contains(text, "<think>") {
+			inThinking = true
+			continue
+		}
+		if strings.Contains(text, "</think>") {
+			inThinking = false
+			continue
+		}
+		if inThinking {
+			continue
+		}
+		fullResponse.WriteString(text)
+		sendEvent(StreamEvent{Type: "content", Content: text})
+	}
+
+	return fullResponse.String(), nil
+}
+
+// callSubModel calls a lightweight sub-model (e.g. lfm2.5-thinking) via Ollama or vllm.
 // It handles <think></think> tag extraction, returning (thinking, response).
 // Used for fast tasks like reflection, summarization, and document tree search.
 func callSubModel(prompt string, config *Config) (thinking string, response string, err error) {
@@ -2375,8 +2530,18 @@ func callSubModel(prompt string, config *Config) (thinking string, response stri
 		return "", "", fmt.Errorf("no sub-model configured")
 	}
 
-	endpoint := strings.TrimSuffix(config.primaryProvider().Endpoint, "/v1")
+	endpoint := subModelEndpoint(config)
 
+	// Use vllm (OpenAI-compatible) API if configured
+	if isSubModelVLLM(config) {
+		content, err := callVLLMGenerate(config.SubModel, prompt, 32768, 120*time.Second, endpoint)
+		if err != nil {
+			return "", "", err
+		}
+		return "", content, nil
+	}
+
+	// Ollama native API
 	reqBody := map[string]interface{}{
 		"model":      config.SubModel,
 		"prompt":     prompt,
@@ -2447,49 +2612,58 @@ func generateCodeWithSubModel(userRequest string, config *Config) (string, error
 
 リクエスト: %s`, userRequest)
 
-	endpoint := strings.TrimSuffix(config.primaryProvider().Endpoint, "/v1")
+	endpoint := subModelEndpoint(config)
 
-	reqBody := map[string]interface{}{
-		"model":      config.SubModel,
-		"prompt":     prompt,
-		"stream":     false,
-		"keep_alive": -1,
-		"options": map[string]interface{}{
-			"num_predict": 32768,
-		},
-	}
+	var content string
+	if isSubModelVLLM(config) {
+		var err2 error
+		content, err2 = callVLLMGenerate(config.SubModel, prompt, 32768, 600*time.Second, endpoint)
+		if err2 != nil {
+			return "", fmt.Errorf("sub-model request error: %w", err2)
+		}
+	} else {
+		reqBody := map[string]interface{}{
+			"model":      config.SubModel,
+			"prompt":     prompt,
+			"stream":     false,
+			"keep_alive": -1,
+			"options": map[string]interface{}{
+				"num_predict": 32768,
+			},
+		}
 
-	body, err := json.Marshal(reqBody)
-	if err != nil {
-		return "", fmt.Errorf("marshal error: %w", err)
-	}
+		body, err := json.Marshal(reqBody)
+		if err != nil {
+			return "", fmt.Errorf("marshal error: %w", err)
+		}
 
-	// Longer timeout: sub-model may need to load first (20B model takes minutes on RPi)
-	client := &http.Client{Timeout: 600 * time.Second}
-	resp, err := client.Post(endpoint+"/api/generate", "application/json", bytes.NewReader(body))
-	if err != nil {
-		return "", fmt.Errorf("sub-model request error: %w", err)
-	}
-	defer resp.Body.Close()
+		// Longer timeout: sub-model may need to load first (20B model takes minutes on RPi)
+		client := &http.Client{Timeout: 600 * time.Second}
+		resp, err := client.Post(endpoint+"/api/generate", "application/json", bytes.NewReader(body))
+		if err != nil {
+			return "", fmt.Errorf("sub-model request error: %w", err)
+		}
+		defer resp.Body.Close()
 
-	var genResp struct {
-		Response string `json:"response"`
-		Thinking string `json:"thinking"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&genResp); err != nil {
-		return "", fmt.Errorf("sub-model decode error: %w", err)
-	}
+		var genResp struct {
+			Response string `json:"response"`
+			Thinking string `json:"thinking"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&genResp); err != nil {
+			return "", fmt.Errorf("sub-model decode error: %w", err)
+		}
 
-	// Thinking models put content in "thinking" field with empty "response"
-	content := genResp.Response
-	if content == "" && genResp.Thinking != "" {
-		content = genResp.Thinking
-	}
+		// Thinking models put content in "thinking" field with empty "response"
+		content = genResp.Response
+		if content == "" && genResp.Thinking != "" {
+			content = genResp.Thinking
+		}
 
-	// Strip <think>...</think> tags
-	if ti := strings.Index(content, "<think>"); ti >= 0 {
-		if te := strings.Index(content, "</think>"); te > ti {
-			content = strings.TrimSpace(content[:ti] + content[te+8:])
+		// Strip <think>...</think> tags
+		if ti := strings.Index(content, "<think>"); ti >= 0 {
+			if te := strings.Index(content, "</think>"); te > ti {
+				content = strings.TrimSpace(content[:ti] + content[te+8:])
+			}
 		}
 	}
 
@@ -2541,10 +2715,17 @@ func generateCodeWithSubModel(userRequest string, config *Config) (string, error
 // Dual-Model Pipeline: lfm (fast ack) + gpt-oss (real orchestration)
 // ============================================================================
 
-// callOllamaGenerate calls any model via Ollama's /api/generate endpoint.
+// callOllamaGenerate calls any model via Ollama's /api/generate or vllm's OpenAI-compatible endpoint.
 // Strips <think> tags from response. Returns the generated text.
 func callOllamaGenerate(model, prompt string, maxTokens int, timeout time.Duration, config *Config) (string, error) {
-	endpoint := strings.TrimSuffix(config.primaryProvider().Endpoint, "/v1")
+	endpoint := subModelEndpoint(config)
+
+	// Use vllm (OpenAI-compatible) API if configured
+	if isSubModelVLLM(config) {
+		return callVLLMGenerate(model, prompt, maxTokens, timeout, endpoint)
+	}
+
+	// Ollama native API
 	reqBody := map[string]interface{}{
 		"model":      model,
 		"prompt":     prompt,
@@ -2594,6 +2775,515 @@ type OrchestratorDecision struct {
 	Tool     string                 `json:"tool"`
 	Args     map[string]interface{} `json:"args,omitempty"`
 	Response string                 `json:"response,omitempty"`
+}
+
+// ============================================================================
+// Plan Mode: TODO list management for complex multi-step tasks
+// ============================================================================
+
+// PlanTask represents a single task in a plan
+type PlanTask struct {
+	ID          int    `json:"id"`
+	Description string `json:"description"`
+	Status      string `json:"status"` // "pending", "in_progress", "completed", "failed"
+	Tool        string `json:"tool,omitempty"`
+	Result      string `json:"result,omitempty"`
+}
+
+// Plan represents a multi-step execution plan
+type Plan struct {
+	Goal      string     `json:"goal"`
+	Tasks     []PlanTask `json:"tasks"`
+	CreatedAt string     `json:"created_at"`
+	Status    string     `json:"status"` // "planning", "executing", "completed", "failed"
+}
+
+// planDir returns the directory for storing plan files
+func planDir() string {
+	home, _ := os.UserHomeDir()
+	dir := filepath.Join(home, ".siki", "plans")
+	os.MkdirAll(dir, 0755)
+	return dir
+}
+
+// savePlan writes a plan to a JSON file
+func savePlan(plan *Plan, planID string) error {
+	path := filepath.Join(planDir(), planID+".json")
+	data, err := json.MarshalIndent(plan, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0644)
+}
+
+// loadPlan reads a plan from a JSON file
+func loadPlan(planID string) (*Plan, error) {
+	path := filepath.Join(planDir(), planID+".json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var plan Plan
+	return &plan, json.Unmarshal(data, &plan)
+}
+
+// createPlan asks the sub-model to create a plan for a complex task
+func createPlan(userMsg string, messages []Message, config *Config) (*Plan, error) {
+	var ctx strings.Builder
+	start := 0
+	if len(messages) > 5 {
+		start = len(messages) - 5
+	}
+	for _, m := range messages[start:] {
+		if m.Role == "user" {
+			ctx.WriteString(fmt.Sprintf("ユーザー: %s\n", m.Content))
+		} else if m.Role == "assistant" && m.Content != "" {
+			c := m.Content
+			if len(c) > 200 {
+				c = c[:200] + "..."
+			}
+			ctx.WriteString(fmt.Sprintf("アシスタント: %s\n", c))
+		}
+	}
+
+	prompt := fmt.Sprintf(`あなたはタスク分解の専門家。ユーザーの複雑なリクエストを実行可能なステップに分解せよ。
+
+## 利用可能なツール
+- web_search: インターネット検索
+- web_fetch: URL内容取得
+- run_code: HTML/JS/Canvas実行
+- diagram: Graphviz図生成
+- execute_command: シェルコマンド
+- read_file: ファイル読込
+- write_file: ファイル書込
+
+## 会話履歴
+%s
+
+## ユーザーのリクエスト
+%s
+
+## 出力形式
+以下のJSONのみ出力せよ（他の文章は書くな）:
+{"tasks": [
+  {"id": 1, "description": "タスクの説明", "tool": "使うツール名"},
+  {"id": 2, "description": "タスクの説明", "tool": "使うツール名"},
+  ...
+]}
+
+## ルール
+- 各タスクは1つのツール呼び出しに対応させろ
+- タスクは実行順に並べろ
+- 3〜10個のタスクに分解しろ
+- 各タスクの説明は具体的にしろ（何を検索するか、何を実行するか）
+- ツール不要の中間ステップ（まとめ・分析）には tool を "summarize" にしろ`, ctx.String(), userMsg)
+
+	response, err := callOllamaGenerate(config.SubModel, prompt, 4096, 600*time.Second, config)
+	if err != nil {
+		return nil, fmt.Errorf("plan creation failed: %w", err)
+	}
+
+	// Parse JSON from response
+	response = strings.TrimSpace(response)
+	var planData struct {
+		Tasks []struct {
+			ID          int    `json:"id"`
+			Description string `json:"description"`
+			Tool        string `json:"tool"`
+		} `json:"tasks"`
+	}
+
+	// Try to extract JSON
+	jsonStr := response
+	if idx := strings.Index(jsonStr, "{"); idx >= 0 {
+		jsonStr = jsonStr[idx:]
+		depth := 0
+		for i, ch := range jsonStr {
+			if ch == '{' {
+				depth++
+			}
+			if ch == '}' {
+				depth--
+				if depth == 0 {
+					jsonStr = jsonStr[:i+1]
+					break
+				}
+			}
+		}
+	}
+
+	if err := json.Unmarshal([]byte(jsonStr), &planData); err != nil {
+		return nil, fmt.Errorf("plan JSON parse failed: %w", err)
+	}
+
+	if len(planData.Tasks) == 0 {
+		return nil, fmt.Errorf("plan has no tasks")
+	}
+
+	plan := &Plan{
+		Goal:      userMsg,
+		CreatedAt: time.Now().Format(time.RFC3339),
+		Status:    "planning",
+	}
+	for _, t := range planData.Tasks {
+		plan.Tasks = append(plan.Tasks, PlanTask{
+			ID:          t.ID,
+			Description: t.Description,
+			Status:      "pending",
+			Tool:        t.Tool,
+		})
+	}
+
+	return plan, nil
+}
+
+// executePlanTask asks the orchestrator to execute a specific plan task
+func executePlanTask(task *PlanTask, plan *Plan, agent *Agent, config *Config, sendEvent func(StreamEvent)) (string, error) {
+	// Build context from plan progress so far
+	var ctx strings.Builder
+	ctx.WriteString(fmt.Sprintf("## 全体目標\n%s\n\n## 進捗\n", plan.Goal))
+	for _, t := range plan.Tasks {
+		status := "⬜"
+		switch t.Status {
+		case "completed":
+			status = "✅"
+		case "in_progress":
+			status = "🔄"
+		case "failed":
+			status = "❌"
+		}
+		ctx.WriteString(fmt.Sprintf("%s %d. %s", status, t.ID, t.Description))
+		if t.Result != "" {
+			r := t.Result
+			if len(r) > 3000 {
+				r = r[:3000] + "..."
+			}
+			ctx.WriteString(fmt.Sprintf("\n結果:\n%s\n", r))
+		}
+		ctx.WriteString("\n")
+	}
+
+	prompt := fmt.Sprintf(`%s
+
+## 現在実行するタスク
+タスク%d: %s
+推奨ツール: %s
+
+このタスクを実行するためのツール呼び出しをJSON形式で出力せよ:
+{"tool":"ツール名","args":{引数}}
+
+注意:
+- web_searchの場合、具体的な検索クエリを指定
+- run_codeの場合、完全なHTMLを生成
+- execute_commandの場合、具体的なコマンドを指定
+- summarize の場合は {"tool":"none","response":"まとめテキスト"} を返せ`,
+		ctx.String(), task.ID, task.Description, task.Tool)
+
+	response, err := callOllamaGenerate(config.SubModel, prompt, 4096, 600*time.Second, config)
+	if err != nil {
+		return "", err
+	}
+
+	// Parse the tool decision
+	response = strings.TrimSpace(response)
+	var decision OrchestratorDecision
+	jsonStr := response
+	if idx := strings.Index(jsonStr, "{"); idx >= 0 {
+		jsonStr = jsonStr[idx:]
+		depth := 0
+		for i, ch := range jsonStr {
+			if ch == '{' {
+				depth++
+			}
+			if ch == '}' {
+				depth--
+				if depth == 0 {
+					jsonStr = jsonStr[:i+1]
+					break
+				}
+			}
+		}
+	}
+	if err := json.Unmarshal([]byte(jsonStr), &decision); err != nil {
+		// Fallback: use the task's recommended tool
+		decision = OrchestratorDecision{Tool: task.Tool, Args: map[string]interface{}{}}
+	}
+
+	// Execute the tool
+	toolName := decision.Tool
+	if toolName == "" || toolName == "none" || toolName == "summarize" {
+		// No tool needed - use sub-model for summarization
+		if decision.Response != "" {
+			return decision.Response, nil
+		}
+		// Collect all previous task results as context for summarization
+		var prevResults strings.Builder
+		for _, t := range plan.Tasks {
+			if t.Status == "completed" && t.Result != "" {
+				prevResults.WriteString(fmt.Sprintf("## タスク%d: %s\n%s\n\n", t.ID, t.Description, t.Result))
+			}
+		}
+		resp, err := streamSubModelSummarize(
+			fmt.Sprintf("%s\n\nタスク: %s", plan.Goal, task.Description),
+			"previous_results", prevResults.String(), config, sendEvent)
+		if err != nil {
+			return "", err
+		}
+		return resp, nil
+	}
+
+	args := decision.Args
+	if args == nil {
+		args = map[string]interface{}{}
+	}
+
+	// Set defaults
+	if toolName == "web_search" {
+		if _, ok := args["query"]; !ok {
+			args["query"] = task.Description
+		}
+	}
+
+	// For web_fetch: auto-extract URLs from previous web_search results
+	if toolName == "web_fetch" {
+		argURL, _ := args["url"].(string)
+		// If no URL or dummy URL (example.com, etc.), extract from previous search results
+		if argURL == "" || strings.Contains(argURL, "example.com") || strings.Contains(argURL, "example.org") || !strings.HasPrefix(argURL, "http") {
+			// Find previous web_search result
+			var searchResult string
+			for _, t := range plan.Tasks {
+				if t.Status == "completed" && t.Tool == "web_search" && t.Result != "" {
+					searchResult = t.Result
+					break
+				}
+			}
+			if searchResult != "" {
+				// Extract all URLs from search results using markdown link format [text](url)
+				var urls []string
+				remaining := searchResult
+				for {
+					idx := strings.Index(remaining, "](http")
+					if idx == -1 {
+						break
+					}
+					urlStart := idx + 2
+					urlEnd := strings.Index(remaining[urlStart:], ")")
+					if urlEnd == -1 {
+						break
+					}
+					u := remaining[urlStart : urlStart+urlEnd]
+					// Skip DuckDuckGo internal URLs
+					if !strings.Contains(u, "duckduckgo.com") {
+						urls = append(urls, u)
+					}
+					remaining = remaining[urlStart+urlEnd:]
+				}
+
+				if len(urls) > 0 {
+					// Determine which URL to use based on task description
+					urlIndex := 0
+					desc := task.Description
+					if strings.Contains(desc, "2番目") || strings.Contains(desc, "2つ目") || strings.Contains(desc, "second") {
+						urlIndex = 1
+					} else if strings.Contains(desc, "3番目") || strings.Contains(desc, "3つ目") || strings.Contains(desc, "third") {
+						urlIndex = 2
+					} else if strings.Contains(desc, "4番目") || strings.Contains(desc, "4つ目") {
+						urlIndex = 3
+					} else if strings.Contains(desc, "5番目") || strings.Contains(desc, "5つ目") {
+						urlIndex = 4
+					}
+					// Also detect generic Nth pattern
+					for n := 1; n <= 10; n++ {
+						if strings.Contains(desc, fmt.Sprintf("%d番目", n)) {
+							urlIndex = n - 1
+							break
+						}
+					}
+					if urlIndex >= len(urls) {
+						urlIndex = len(urls) - 1
+					}
+					args["url"] = urls[urlIndex]
+					fmt.Printf("[siki] Plan web_fetch: auto-extracted URL[%d]: %s\n", urlIndex, urls[urlIndex])
+				}
+			}
+		}
+	}
+
+	// For diagram: generate DOT from previous task results if not provided
+	if toolName == "diagram" {
+		dotCode, _ := args["dot_source"].(string)
+		if dotCode == "" {
+			dotCode, _ = args["dot_code"].(string)
+		}
+		if dotCode == "" || !strings.Contains(dotCode, "digraph") {
+			// Collect previous task results as context for diagram generation
+			var prevData strings.Builder
+			for _, t := range plan.Tasks {
+				if t.Status == "completed" && t.Result != "" {
+					prevData.WriteString(fmt.Sprintf("## タスク%d: %s\n%s\n\n", t.ID, t.Description, t.Result))
+				}
+			}
+			// Ask sub-model to generate DOT code from accumulated data
+			dotPrompt := fmt.Sprintf(`以下の情報を元に、Graphviz DOTコードを生成せよ。
+目標: %s
+
+## これまでの調査結果:
+%s
+
+## ルール:
+- digraph G { ... } 形式のDOTコードのみを出力せよ
+- 日本語のラベルを使え
+- node [shape=box, style=filled] を使え
+- 重要度に応じてfillcolorを変えろ
+- エッジにlabelで関係性を書け
+- コード以外の説明文は一切書くな
+- DOTコードだけを出力せよ`, plan.Goal, prevData.String())
+
+			dotResponse, err := callOllamaGenerate(config.SubModel, dotPrompt, 4096, 120*time.Second, config)
+			if err == nil {
+				// Extract DOT code from response
+				dotResponse = strings.TrimSpace(dotResponse)
+				if idx := strings.Index(dotResponse, "digraph"); idx >= 0 {
+					dotCode = dotResponse[idx:]
+					// Find matching closing brace
+					depth := 0
+					for i, ch := range dotCode {
+						if ch == '{' {
+							depth++
+						} else if ch == '}' {
+							depth--
+							if depth == 0 {
+								dotCode = dotCode[:i+1]
+								break
+							}
+						}
+					}
+				}
+			}
+			if dotCode != "" && strings.Contains(dotCode, "digraph") {
+				args["dot_source"] = dotCode
+				fmt.Printf("[siki] Plan diagram: generated DOT code (%d bytes)\n", len(dotCode))
+			} else {
+				// Fallback default diagram
+				args["dot_source"] = fmt.Sprintf(`digraph G {
+  rankdir=LR;
+  node [shape=box, style=filled, fillcolor="#e8e8e8"];
+  Goal [label="%s", fillcolor="#e94560", fontcolor=white];
+  Data [label="調査データ", fillcolor="#16213e", fontcolor=white];
+  Result [label="結果"];
+  Goal -> Data [label="調査"];
+  Data -> Result [label="分析"];
+}`, strings.ReplaceAll(plan.Goal, `"`, `'`))
+				fmt.Printf("[siki] Plan diagram: using fallback DOT\n")
+			}
+		}
+	}
+
+	// For run_code, ensure quality HTML
+	if toolName == "run_code" {
+		html, _ := args["html"].(string)
+		if len(html) < 100 {
+			if newHTML, err := generateCodeWithSubModel(task.Description, config); err == nil {
+				args["html"] = newHTML
+			}
+		}
+	}
+
+	sendEvent(StreamEvent{Type: "tool_start", Name: toolName})
+	result, err := agent.executeTool(toolName, args)
+	if err != nil {
+		result = fmt.Sprintf("Error: %v", err)
+	}
+
+	displayResult := result
+	if len(displayResult) > 2000 {
+		displayResult = displayResult[:2000] + "\n... (truncated)"
+	}
+	sendEvent(StreamEvent{Type: "tool_call", Name: toolName, Result: displayResult})
+
+	return result, nil
+}
+
+// (ws *WebServer) executePlan runs all tasks in a plan sequentially
+func (ws *WebServer) executePlan(ctx context.Context, plan *Plan, planID string, agent *Agent, sendEvent func(StreamEvent), saveMsg func(Message, string)) string {
+	plan.Status = "executing"
+	savePlan(plan, planID)
+
+	var allResults strings.Builder
+	var diagramResults []string // Keep diagram HTML outputs separate
+
+	for i := range plan.Tasks {
+		select {
+		case <-ctx.Done():
+			plan.Status = "failed"
+			savePlan(plan, planID)
+			return allResults.String()
+		default:
+		}
+
+		task := &plan.Tasks[i]
+		task.Status = "in_progress"
+		savePlan(plan, planID)
+
+		// Send plan progress event
+		sendEvent(StreamEvent{
+			Type:    "plan_progress",
+			Content: fmt.Sprintf("タスク %d/%d 実行中: %s", task.ID, len(plan.Tasks), task.Description),
+		})
+
+		fmt.Printf("[siki] Plan: executing task %d/%d: %s (tool=%s)\n", task.ID, len(plan.Tasks), task.Description, task.Tool)
+
+		result, err := executePlanTask(task, plan, agent, ws.config, sendEvent)
+		if err != nil {
+			task.Status = "failed"
+			task.Result = fmt.Sprintf("Error: %v", err)
+			fmt.Printf("[siki] Plan: task %d failed: %v\n", task.ID, err)
+		} else {
+			task.Status = "completed"
+			r := result
+			if len(r) > 5000 {
+				r = r[:5000] + "..."
+			}
+			task.Result = r
+			fmt.Printf("[siki] Plan: task %d completed\n", task.ID)
+		}
+
+		// If this is a diagram result (contains iframe), save separately
+		if task.Tool == "diagram" && strings.Contains(result, "<iframe") {
+			diagramResults = append(diagramResults, result)
+			allResults.WriteString(fmt.Sprintf("\n## タスク%d: %s\n[図が生成されました]\n", task.ID, task.Description))
+		} else {
+			allResults.WriteString(fmt.Sprintf("\n## タスク%d: %s\n%s\n", task.ID, task.Description, result))
+		}
+		savePlan(plan, planID)
+
+		// Send updated progress
+		sendEvent(StreamEvent{
+			Type:    "plan_progress",
+			Content: fmt.Sprintf("タスク %d/%d 完了 ✅", task.ID, len(plan.Tasks)),
+		})
+	}
+
+	plan.Status = "completed"
+	savePlan(plan, planID)
+
+	// Generate final summary
+	sendEvent(StreamEvent{Type: "thinking", Content: "全タスク完了。最終まとめを生成中..."})
+	summary, err := streamSubModelSummarize(plan.Goal, "plan", allResults.String(), ws.config, sendEvent)
+	if err != nil || summary == "" {
+		summary = allResults.String()
+		sendEvent(StreamEvent{Type: "content", Content: summary})
+	}
+
+	// Append diagram results (iframe HTML) after the summary
+	if len(diagramResults) > 0 {
+		for _, diag := range diagramResults {
+			summary += "\n\n" + diag
+			sendEvent(StreamEvent{Type: "content", Content: "\n\n" + diag})
+		}
+	}
+
+	return summary
 }
 
 // quickAck generates a fast 1-sentence acknowledgment using lfm (primary model).
@@ -2670,6 +3360,7 @@ func subModelOrchestrate(userMsg string, messages []Message, config *Config) (*O
 - execute_command: シェルコマンド。引数: {"command": "コマンド"}
 - read_file: ファイル読込。引数: {"path": "ファイルパス"}
 - write_file: ファイル書込。引数: {"path": "パス", "content": "内容"}
+- plan: 複雑なタスクを複数ステップに分解して順次実行。引数: {"goal": "達成したい目標"}
 
 ## 会話履歴
 %s
@@ -2680,6 +3371,9 @@ func subModelOrchestrate(userMsg string, messages []Message, config *Config) (*O
 - 今日は%d年%d月%d日
 - run_codeの場合、完全で美しいHTMLを生成せよ（<html>から</html>まで、CSS/JS全部含む）
 - web_searchの場合、適切な検索クエリを指定
+- 複数のツールを組み合わせる必要がある複雑なリクエスト（調査→分析→可視化など）には plan を使え
+- 「〇〇を調べて図にして」「〇〇について調査してまとめて」のような複合タスクには plan を使え
+- 単純な1ステップの作業にはplanを使うな
 - ツール不要（挨拶・計算・知識質問）なら直接回答
 
 以下のJSON形式のみ出力せよ（他の文章は絶対に書くな）:
@@ -2805,6 +3499,31 @@ func (ws *WebServer) executeToolAndSummarize(agent *Agent, userMsg, toolName str
 	args := map[string]interface{}{}
 	if toolName == "web_search" {
 		args["query"] = userMsg
+	}
+
+	// Generate DOT code for diagram
+	if toolName == "diagram" {
+		sendEvent(StreamEvent{Type: "thinking", Content: "図のDOTコードを生成中..."})
+		prompt := fmt.Sprintf("以下のリクエストに対して、Graphviz DOTコードのみ出力せよ（説明不要、コードフェンスも不要）。\nリクエスト: %s", userMsg)
+		_, genDot, err := callSubModel(prompt, ws.config)
+		if err == nil && len(genDot) > 10 {
+			dot := genDot
+			if idx := strings.Index(dot, "```dot"); idx >= 0 {
+				dot = dot[idx+6:]
+				if end := strings.Index(dot, "```"); end >= 0 { dot = dot[:end] }
+			} else if idx := strings.Index(dot, "```graphviz"); idx >= 0 {
+				dot = dot[idx+11:]
+				if end := strings.Index(dot, "```"); end >= 0 { dot = dot[:end] }
+			} else if idx := strings.Index(dot, "```"); idx >= 0 {
+				dot = dot[idx+3:]
+				if nl := strings.Index(dot, "\n"); nl >= 0 { dot = dot[nl+1:] }
+				if end := strings.Index(dot, "```"); end >= 0 { dot = dot[:end] }
+			}
+			dot = strings.TrimSpace(dot)
+			if strings.Contains(dot, "digraph") || strings.Contains(dot, "graph") {
+				args["dot_source"] = dot
+			}
+		}
 	}
 
 	sendEvent(StreamEvent{Type: "tool_start", Name: toolName})
@@ -3256,8 +3975,14 @@ func streamSubModelSummarize(userMsg, toolName, toolResult string, config *Confi
 
 上記のツール結果のみに基づいて、日本語で詳しく回答せよ。`, userMsg, toolName, result)
 
-	endpoint := strings.TrimSuffix(config.primaryProvider().Endpoint, "/v1")
+	endpoint := subModelEndpoint(config)
 
+	// Use vllm (OpenAI-compatible) streaming API if configured
+	if isSubModelVLLM(config) {
+		return streamVLLMGenerate(config.SubModel, prompt, 32768, 300*time.Second, endpoint, sendEvent)
+	}
+
+	// Ollama native streaming API
 	reqBody := map[string]interface{}{
 		"model":      config.SubModel,
 		"prompt":     prompt,
@@ -3513,6 +4238,53 @@ func (ws *WebServer) dualModelPipeline(ctx context.Context, agent *Agent, userMs
 		}
 	}
 
+	// Plan mode: create and execute a multi-step plan
+	if decision.Tool == "plan" {
+		fmt.Printf("[siki] Entering plan mode for: %s\n", userMsg)
+		sendEvent(StreamEvent{Type: "thinking", Content: "複雑なタスクを検出。プランを作成中..."})
+
+		goal := userMsg
+		if g, ok := decision.Args["goal"].(string); ok && g != "" {
+			goal = g
+		}
+
+		plan, err := createPlan(goal, agent.messages, ws.config)
+		if err != nil {
+			fmt.Printf("[siki] Plan creation failed: %v, falling back to direct execution\n", err)
+			sendEvent(StreamEvent{Type: "thinking", Content: "プラン作成失敗。直接実行します..."})
+			// Fall through to normal tool execution with web_search as fallback
+			decision.Tool = detectToolFromKeywords(userMsg)
+			if decision.Tool == "" {
+				decision.Tool = "web_search"
+			}
+			decision.Args = map[string]interface{}{"query": userMsg}
+		} else {
+			planID := fmt.Sprintf("plan_%d", time.Now().UnixMilli())
+
+			// Display the plan as a TODO list
+			var planDisplay strings.Builder
+			planDisplay.WriteString(fmt.Sprintf("## 📋 実行プラン\n**目標:** %s\n\n", goal))
+			for _, t := range plan.Tasks {
+				planDisplay.WriteString(fmt.Sprintf("- [ ] **タスク%d:** %s (`%s`)\n", t.ID, t.Description, t.Tool))
+			}
+			planDisplay.WriteString(fmt.Sprintf("\n---\n*%d個のタスクを順次実行します*\n\n", len(plan.Tasks)))
+			sendEvent(StreamEvent{Type: "content", Content: planDisplay.String()})
+
+			// Save plan and execute
+			savePlan(plan, planID)
+			result := ws.executePlan(ctx, plan, planID, agent, sendEvent, saveMsg)
+
+			// Save final result
+			finalMsg := Message{Role: "assistant", Content: result}
+			agent.messages = append(agent.messages, finalMsg)
+			saveMsg(finalMsg, "")
+
+			suggestions := generateSuggestions(userMsg, result, "plan")
+			sendEvent(StreamEvent{Type: "suggestions", Suggestions: suggestions})
+			return result
+		}
+	}
+
 	// Tool execution
 	toolName := decision.Tool
 
@@ -3554,6 +4326,87 @@ func (ws *WebServer) dualModelPipeline(ctx context.Context, agent *Agent, userMs
 			fmt.Printf("[siki] run_code HTML too short (%d), regenerating\n", len(html))
 			if newHTML, err := generateCodeWithSubModel(userMsg, ws.config); err == nil {
 				args["html"] = newHTML
+			}
+		}
+	}
+
+	// Generate DOT code for diagram if not provided
+	if toolName == "diagram" {
+		dotCode, _ := args["dot_source"].(string)
+		if dotCode == "" {
+			dotCode, _ = args["dot_code"].(string)
+		}
+		if dotCode == "" || !strings.Contains(dotCode, "graph") {
+			fmt.Printf("[siki] diagram: DOT code missing or invalid, generating via sub-model\n")
+			sendEvent(StreamEvent{Type: "thinking", Content: "図のDOTコードを生成中..."})
+			prompt := fmt.Sprintf(`以下のリクエストに対して、Graphviz DOTコードのみ出力せよ。
+説明不要。コードフェンス不要。digraphまたはgraphで始まるDOTコードだけを出力しろ。
+
+例:
+digraph G {
+  A -> B -> C;
+}
+
+リクエスト: %s`, userMsg)
+			_, genDot, err := callSubModel(prompt, ws.config)
+			if err != nil {
+				fmt.Printf("[siki] diagram: sub-model call failed: %v\n", err)
+			} else {
+				fmt.Printf("[siki] diagram: sub-model returned %d bytes\n", len(genDot))
+				// Extract DOT from code fences if present
+				dot := genDot
+				if idx := strings.Index(dot, "```dot"); idx >= 0 {
+					dot = dot[idx+6:]
+					if end := strings.Index(dot, "```"); end >= 0 {
+						dot = dot[:end]
+					}
+				} else if idx := strings.Index(dot, "```graphviz"); idx >= 0 {
+					dot = dot[idx+11:]
+					if end := strings.Index(dot, "```"); end >= 0 {
+						dot = dot[:end]
+					}
+				} else if idx := strings.Index(dot, "```"); idx >= 0 {
+					dot = dot[idx+3:]
+					if nl := strings.Index(dot, "\n"); nl >= 0 {
+						dot = dot[nl+1:]
+					}
+					if end := strings.Index(dot, "```"); end >= 0 {
+						dot = dot[:end]
+					}
+				}
+				dot = strings.TrimSpace(dot)
+				if strings.Contains(dot, "digraph") || strings.Contains(dot, "graph") {
+					args["dot_source"] = dot
+					fmt.Printf("[siki] diagram: generated %d bytes of DOT code\n", len(dot))
+				} else {
+					// Last resort: try to find digraph/graph anywhere in the response
+					if idx := strings.Index(genDot, "digraph"); idx >= 0 {
+						dot = genDot[idx:]
+						args["dot_source"] = dot
+						fmt.Printf("[siki] diagram: extracted digraph from response (%d bytes)\n", len(dot))
+					} else if idx := strings.Index(genDot, "graph"); idx >= 0 {
+						dot = genDot[idx:]
+						args["dot_source"] = dot
+						fmt.Printf("[siki] diagram: extracted graph from response (%d bytes)\n", len(dot))
+					} else {
+						fmt.Printf("[siki] diagram: no valid DOT found in response, using default diagram\n")
+						// Fallback: generate a default sample diagram
+						defaultDot := `digraph G {
+  rankdir=LR;
+  node [shape=box, style=filled, fillcolor="#e8e8e8"];
+  User [label="ユーザー", fillcolor="#e94560", fontcolor=white];
+  AI [label="AI", fillcolor="#16213e", fontcolor=white];
+  Tool [label="ツール"];
+  Result [label="結果"];
+  User -> AI [label="リクエスト"];
+  AI -> Tool [label="実行"];
+  Tool -> Result [label="出力"];
+  Result -> AI [label="要約"];
+  AI -> User [label="回答"];
+}`
+						args["dot_source"] = defaultDot
+					}
+				}
 			}
 		}
 	}
@@ -3875,53 +4728,62 @@ func initDiagramDir() error {
 }
 
 func (a *Agent) generateDiagram(dotCode, title string) (string, error) {
-	// Check if Graphviz is installed
-	dotPath, err := exec.LookPath("dot")
-	if err != nil {
-		// Graphviz not installed - return helpful message
-		return fmt.Sprintf(`Graphviz is not installed. To enable diagram generation:
+	// Client-side rendering using d3-graphviz (no server-side Graphviz needed)
+	// Escape the DOT code for embedding in HTML
+	escapedDot := strings.ReplaceAll(dotCode, "`", "\\`")
+	escapedDot = strings.ReplaceAll(escapedDot, "${", "\\${")
+	escapedTitle := strings.ReplaceAll(title, `"`, "&quot;")
 
-**macOS:** brew install graphviz
-**Linux:** sudo apt install graphviz
-**Windows:** Download from https://graphviz.org/download/
+	// Return an HTML snippet with d3-graphviz that renders in an iframe
+	html := fmt.Sprintf(`<!DOCTYPE html>
+<html><head><meta charset="UTF-8">
+<title>%s</title>
+<script src="/js/d3.v7.min.js"></script>
+<script src="/js/graphviz.umd.js"></script>
+<script src="/js/d3-graphviz.min.js"></script>
+<style>
+body { margin: 0; padding: 16px; background: #1a1a2e; color: #eee; font-family: sans-serif; display: flex; flex-direction: column; align-items: center; }
+h3 { margin: 0 0 12px 0; color: #e94560; }
+#graph { background: #16213e; border-radius: 8px; padding: 16px; width: 95vw; min-height: 200px; overflow: auto; }
+#graph svg { max-width: 100%%; height: auto; }
+#graph svg text { fill: #eee !important; }
+#graph svg polygon[fill="white"] { fill: #16213e !important; }
+#graph svg polygon[stroke="black"] { stroke: #444 !important; }
+#graph svg path[stroke="black"] { stroke: #888 !important; }
+#graph svg ellipse[stroke="black"] { stroke: #e94560 !important; }
+#graph svg ellipse[fill="none"] { fill: #1a1a3e !important; }
+#graph svg polygon[fill="none"] { fill: #1a1a3e !important; }
+.error { color: #ff6b6b; padding: 12px; background: #2d1b1b; border-radius: 8px; }
+</style>
+</head><body>
+<h3>%s</h3>
+<div id="graph"></div>
+<script>
+try {
+  d3.select("#graph").graphviz()
+    .fit(true)
+    .zoom(false)
+    .renderDot(`+"`%s`"+`);
+} catch(e) {
+  document.getElementById("graph").innerHTML = '<div class="error">Rendering error: ' + e.message + '</div><pre>' + `+"`%s`"+` + '</pre>';
+}
+</script>
+</body></html>`, escapedTitle, escapedTitle, escapedDot, escapedDot)
 
-After installing, restart Siki and try again.
-
-Here's the DOT code for reference:
-%s%s%s`, "```dot\n", dotCode, "\n```"), nil
+	// Save as playground file for iframe rendering
+	if err := initPlaygroundDir(); err != nil {
+		return "", fmt.Errorf("failed to create playground dir: %w", err)
+	}
+	filename := fmt.Sprintf("diagram_%d.html", time.Now().UnixNano())
+	outputPath := filepath.Join(playgroundDir, filename)
+	if err := os.WriteFile(outputPath, []byte(html), 0644); err != nil {
+		return "", fmt.Errorf("failed to write diagram file: %w", err)
 	}
 
-	if err := initDiagramDir(); err != nil {
-		return "", fmt.Errorf("failed to create diagram dir: %w", err)
-	}
-
-	// Generate unique filename
-	filename := fmt.Sprintf("diagram_%d.svg", time.Now().UnixNano())
-	outputPath := filepath.Join(diagramDir, filename)
-
-	// Create temp file for DOT code
-	tmpFile, err := os.CreateTemp("", "diagram_*.dot")
-	if err != nil {
-		return "", fmt.Errorf("failed to create temp file: %w", err)
-	}
-	defer os.Remove(tmpFile.Name())
-
-	if _, err := tmpFile.WriteString(dotCode); err != nil {
-		tmpFile.Close()
-		return "", fmt.Errorf("failed to write DOT code: %w", err)
-	}
-	tmpFile.Close()
-
-	// Run graphviz dot command
-	cmd := exec.Command(dotPath, "-Tsvg", "-o", outputPath, tmpFile.Name())
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("graphviz error: %s - %w", string(output), err)
-	}
-
-	// Return markdown image syntax
-	diagramURL := fmt.Sprintf("/diagrams/%s", filename)
-	return fmt.Sprintf("Diagram generated:\n\n![%s](%s)", title, diagramURL), nil
+	playgroundURL := fmt.Sprintf("/playground/%s", filename)
+	iframeHTML := fmt.Sprintf(`<iframe src="%s" style="width:100%%;height:500px;border:none;border-radius:8px;" sandbox="allow-scripts allow-same-origin"></iframe>`, playgroundURL)
+	fmt.Printf("[siki] Diagram rendered client-side via d3-graphviz (%d bytes DOT)\n", len(dotCode))
+	return iframeHTML, nil
 }
 
 // Playground directory for interactive code
@@ -7768,6 +8630,9 @@ Options:
   --workspace <path>           Set workspace directory
   --host <ip>                  Set web server host (default: 127.0.0.1, use 0.0.0.0 for network)
   --port <port>                Set web server port (default: 3000)
+  --sub-model <name>           Set sub-model name (default: gpt-oss:20b)
+  --sub-backend <backend>      Set sub-model backend: ollama or vllm (default: ollama)
+  --sub-endpoint <url>         Set sub-model endpoint (default: same as main endpoint)
 
 Examples:
   siki web                                     # Start web GUI
@@ -8159,6 +9024,11 @@ func fixIncompleteToolCalls(msgs []Message) []Message {
 }
 
 func (ws *WebServer) handleIndex(w http.ResponseWriter, r *http.Request) {
+	// Only serve index.html for root path
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
 	content, err := webFS.ReadFile("web/index.html")
 	if err != nil {
 		http.Error(w, "Not found", http.StatusNotFound)
@@ -8219,6 +9089,58 @@ func (ws *WebServer) handlePlayground(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(data)))
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Write(data)
+}
+
+// resolvedStaticDir is set at startup to the actual static directory path
+var resolvedStaticDir string
+
+func initStaticDir() {
+	// Check CWD first (most common dev scenario)
+	if cwd, err := os.Getwd(); err == nil {
+		dir := filepath.Join(cwd, "static")
+		if _, err := os.Stat(dir); err == nil {
+			resolvedStaticDir = dir
+			fmt.Printf("[siki] Static dir: %s\n", dir)
+			return
+		}
+	}
+	// Try next to executable
+	if exe, err := os.Executable(); err == nil {
+		if real, err := filepath.EvalSymlinks(exe); err == nil {
+			dir := filepath.Join(filepath.Dir(real), "static")
+			if _, err := os.Stat(dir); err == nil {
+				resolvedStaticDir = dir
+				fmt.Printf("[siki] Static dir: %s\n", dir)
+				return
+			}
+		}
+	}
+	// Last resort: home dir
+	home, _ := os.UserHomeDir()
+	resolvedStaticDir = filepath.Join(home, ".siki", "static")
+	fmt.Printf("[siki] Static dir (fallback): %s\n", resolvedStaticDir)
+}
+
+func (ws *WebServer) handleJS(w http.ResponseWriter, r *http.Request) {
+	// Serve JS/WASM files from static/ directory next to the binary
+	filename := strings.TrimPrefix(r.URL.Path, "/js/")
+	if filename == "" || strings.Contains(filename, "..") || strings.Contains(filename, "/") {
+		http.Error(w, "Invalid filename", http.StatusBadRequest)
+		return
+	}
+	data, err := os.ReadFile(filepath.Join(resolvedStaticDir, filename))
+	if err != nil {
+		http.Error(w, "Not found", http.StatusNotFound)
+		return
+	}
+	if strings.HasSuffix(filename, ".js") {
+		w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+	} else if strings.HasSuffix(filename, ".wasm") {
+		w.Header().Set("Content-Type", "application/wasm")
+	}
+	w.Header().Set("Cache-Control", "public, max-age=86400")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Write(data)
 }
@@ -9119,12 +10041,15 @@ func saveUploadedFile(fh *multipart.FileHeader, destDir string) error {
 func runWeb(config *Config, host string, port int) error {
 	ws := NewWebServer(config)
 
+	initStaticDir()
+
 	http.HandleFunc("/", ws.handleIndex)
 	http.HandleFunc("/api/status", ws.handleStatus)
 	http.HandleFunc("/api/settings", ws.handleSettings)
 	http.HandleFunc("/api/chat", ws.handleChat)
 	http.HandleFunc("/api/chat/stream", ws.handleChatStream)
 	http.HandleFunc("/api/images", ws.handleImages)
+	http.HandleFunc("/js/", ws.handleJS)
 	http.HandleFunc("/diagrams/", ws.handleDiagrams)
 	http.HandleFunc("/playground/", ws.handlePlayground)
 	http.HandleFunc("/api/plugins/ui", ws.handlePluginsUI)
@@ -9407,6 +10332,18 @@ func main() {
 		case "--host":
 			if i+1 < len(args) {
 				webHost = args[i+1]
+				i += 2
+				continue
+			}
+		case "--sub-backend":
+			if i+1 < len(args) {
+				config.SubModelBackend = args[i+1]
+				i += 2
+				continue
+			}
+		case "--sub-endpoint":
+			if i+1 < len(args) {
+				config.SubModelEndpoint = args[i+1]
 				i += 2
 				continue
 			}

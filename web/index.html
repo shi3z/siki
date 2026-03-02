@@ -272,7 +272,7 @@
         }
 
         .message {
-            max-width: 80%;
+            max-width: 95%;
             padding: 1rem;
             border-radius: 12px;
             line-height: 1.6;
@@ -281,6 +281,7 @@
         .message.user {
             background: var(--user-bg);
             align-self: flex-end;
+            max-width: 80%;
             border-bottom-right-radius: 4px;
         }
 
@@ -377,6 +378,18 @@
             to { transform: rotate(360deg); }
         }
 
+        .plan-status {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 12px;
+            background: rgba(233, 69, 96, 0.1);
+            border-left: 3px solid var(--accent);
+            border-radius: 4px;
+            font-size: 0.9rem;
+            color: var(--text-primary);
+        }
+
         .message.tool.diagram-result .tool-result {
             max-height: none;
             overflow: visible;
@@ -391,6 +404,18 @@
             background: #fff;
             border-radius: 8px;
             padding: 1rem;
+        }
+
+        .diagram-inline {
+            text-align: center;
+            margin: 1rem 0;
+        }
+
+        .diagram-inline iframe {
+            width: 100%;
+            height: 500px;
+            border: none;
+            border-radius: 8px;
         }
 
         .popout-btn {
@@ -1778,14 +1803,14 @@
                 // Special handling for diagram results
                 if (toolName === 'diagram') {
                     div.classList.add('diagram-result');
-                    // Extract image URL and add popout button
-                    const imgMatch = content.match(/!\[.*?\]\((\/diagrams\/[^)]+)\)/);
-                    if (imgMatch) {
+                    // Extract playground URL from iframe for popout
+                    const diagramIframeMatch = content.match(/src="(\/playground\/[^"]+)"/);
+                    if (diagramIframeMatch) {
                         const popBtn = document.createElement('button');
                         popBtn.className = 'popout-btn';
                         popBtn.textContent = '↗ Pop out';
                         popBtn.onclick = function() {
-                            window.open(imgMatch[1], '_blank', 'width=1000,height=800');
+                            window.open(diagramIframeMatch[1], '_blank', 'width=1200,height=800');
                         };
                         div.querySelector('.tool-result').appendChild(popBtn);
                     }
@@ -1860,9 +1885,14 @@
             // Parse markdown
             let html = marked.parse(protectedContent);
 
-            // Restore iframes
+            // Restore iframes with popout button for playground/diagram iframes
             iframes.forEach((iframe, index) => {
-                html = html.replace(`SIKIFRAME${index}ENDFRAME`, iframe);
+                let replacement = iframe;
+                const srcMatch = iframe.match(/src="(\/playground\/[^"]+)"/);
+                if (srcMatch) {
+                    replacement = `<div class="diagram-inline">${iframe}<br><button class="popout-btn" onclick="window.open('${srcMatch[1]}', '_blank', 'width=1200,height=800')">↗ Pop out</button></div>`;
+                }
+                html = html.replace(`SIKIFRAME${index}ENDFRAME`, replacement);
             });
 
             // Open all links in new tab
@@ -2429,6 +2459,24 @@
                                         });
                                     });
                                 }
+                            } else if (event.type === 'plan_progress') {
+                                // Plan progress update — show as a status indicator
+                                typing.classList.remove('show');
+                                if (thinkingDiv && thinkingContent) {
+                                    finalizeStreamingMessage(thinkingDiv, thinkingContent);
+                                    thinkingDiv = null;
+                                    thinkingContent = '';
+                                }
+                                // Update or create plan progress element
+                                let planDiv = document.getElementById('plan-progress');
+                                if (!planDiv) {
+                                    planDiv = document.createElement('div');
+                                    planDiv.id = 'plan-progress';
+                                    planDiv.className = 'message tool';
+                                    chatContainer.appendChild(planDiv);
+                                }
+                                planDiv.innerHTML = `<div class="plan-status"><span class="tool-spinner"></span> ${event.content}</div>`;
+                                chatContainer.scrollTop = chatContainer.scrollHeight;
                             } else if (event.type === 'error') {
                                 typing.classList.remove('show');
                                 addMessage('assistant', `Error: ${event.error}`);
