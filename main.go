@@ -9,14 +9,17 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"embed"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/rand"
 	"mime/multipart"
 	"net"
 	"net/http"
+	"net/smtp"
 	"net/url"
 	"os"
 	"os/exec"
@@ -66,12 +69,24 @@ type Config struct {
 	SubModel        string     `json:"sub_model"`
 	SubModelBackend string     `json:"sub_model_backend"` // "ollama" (default) or "vllm"
 	SubModelEndpoint string    `json:"sub_model_endpoint"` // optional separate endpoint for sub-model
+	Orchestrator         string `json:"orchestrator"`           // orchestrator model (defaults to SubModel if empty)
+	OrchestratorBackend  string `json:"orchestrator_backend"`   // "ollama" (default) or "vllm"
+	OrchestratorEndpoint string `json:"orchestrator_endpoint"`  // optional separate endpoint
 	SubAgent         string    `json:"sub_agent"`          // powerful model for summarization/code gen (e.g. Qwen3.5-27B)
 	SubAgentBackend  string    `json:"sub_agent_backend"`  // "vllm" (default) or "ollama"
 	SubAgentEndpoint string    `json:"sub_agent_endpoint"` // endpoint for sub-agent (e.g. http://localhost:8000)
 	ImageModel      string     `json:"image_model"`      // default: "black-forest-labs/FLUX.2-klein-4B"
 	ImageEndpoint   string     `json:"image_endpoint"`   // default: "http://localhost:8100"
 	ImageEnabled    bool       `json:"image_enabled"`    // default: true
+	// Email digest settings
+	EmailTo       string `json:"email_to"`
+	EmailFrom     string `json:"email_from"`
+	SMTPHost      string `json:"smtp_host"`
+	SMTPPort      int    `json:"smtp_port"`
+	SMTPUser      string `json:"smtp_user"`
+	SMTPPass      string `json:"smtp_pass"`
+	DigestEnabled bool   `json:"digest_enabled"`
+	DigestHours   []int  `json:"digest_hours"`
 }
 
 // primaryProvider returns the first provider, or builds one from legacy config fields
@@ -99,6 +114,37 @@ func (c *Config) findProvider(name string) *Provider {
 	return nil
 }
 
+// orchestratorModel returns the model used for orchestration (falls back to SubModel).
+func (c *Config) orchestratorModel() string {
+	if c.Orchestrator != "" {
+		return c.Orchestrator
+	}
+	return c.SubModel
+}
+
+// orchestratorBackend returns the backend for orchestration (falls back to SubModelBackend).
+func (c *Config) orchestratorBackend() string {
+	if c.OrchestratorBackend != "" {
+		return c.OrchestratorBackend
+	}
+	return c.SubModelBackend
+}
+
+// orchestratorEndpoint returns the endpoint for orchestration (falls back to sub-model endpoint).
+func (c *Config) orchestratorEndpoint() string {
+	if c.OrchestratorEndpoint != "" {
+		return c.OrchestratorEndpoint
+	}
+	// If orchestrator uses ollama backend, default to ollama endpoint
+	if c.Orchestrator != "" && c.orchestratorBackend() == "ollama" {
+		if c.SubModelEndpoint != "" {
+			return strings.TrimSuffix(c.SubModelEndpoint, "/")
+		}
+		return "http://localhost:11434"
+	}
+	return subModelEndpoint(c)
+}
+
 func setProviderHeaders(req *http.Request, p Provider) {
 	req.Header.Set("Content-Type", "application/json")
 	if p.APIKey != "" {
@@ -114,20 +160,15 @@ func setProviderHeaders(req *http.Request, p Provider) {
 
 func defaultConfig() *Config {
 	home, _ := os.UserHomeDir()
-	backend := detectBackend()
-	endpoint := "http://localhost:8000/v1"
-	if backend == "ollama" {
-		endpoint = "http://localhost:11434/v1"
-	}
 	return &Config{
 		ModelPath:   filepath.Join(home, ".siki", "models"),
-		ModelName:   "lfm2.5-thinking:latest",
-		Backend:     backend,
-		APIEndpoint: endpoint,
+		ModelName:   "openai/gpt-oss-20b",
+		Backend:     "vllm",
+		APIEndpoint: "http://localhost:8001/v1",
 		Workspace:   ".",
 		MaxTurns:    MaxTurns,
 		VisionModel: "moondream",
-		SubModel:        "gpt-oss:20b",
+		SubModel:        "gpt-oss:latest",
 		SubModelBackend: "ollama",
 		ImageModel:   "black-forest-labs/FLUX.2-klein-4B",
 		ImageEndpoint: "http://localhost:8100",
@@ -933,7 +974,7 @@ func needsImageGeneration(userMsg string) bool {
 		"画像生成", "画像を生成", "画像を作", "イラスト描", "イラストを描",
 		"インフォグラフィック", "インフォグラフィクス",
 		"image generat", "generate image", "generate an image",
-		"写真を生成", "写真を作", "絵を描いて", "絵を生成",
+		"写真を生成", "写真を作", "絵を描いて", "絵を生成", "絵をかいて",
 		"コンセプトアート", "concept art",
 	}
 	for _, kw := range keywords {
@@ -1066,7 +1107,7 @@ func overrideToolArgs(toolName, userMsg string, originalArgs map[string]interfac
 				enhanced = strings.TrimSuffix(enhanced, "```")
 				enhanced = strings.TrimSpace(enhanced)
 				if sendEvent != nil {
-					sendEvent(StreamEvent{Type: "thinking", Content: fmt.Sprintf("プロンプト強化: %s", enhanced)})
+					sendEvent(modelThinkingEvent(fmt.Sprintf("プロンプト強化: %s", enhanced), config, hasSubAgent(config)))
 				}
 				originalArgs["prompt"] = enhanced
 			}
@@ -2485,11 +2526,63 @@ func describeImages(images []string, visionModel string, ollamaEndpoint string) 
 	return strings.Join(descriptions, "\n")
 }
 
+// describeImageForCharacter sends a single image to the vision model with a custom prompt
+// for extracting character appearance details. Returns the description text.
+func describeImageForCharacter(b64image string, prompt string, visionModel string, config *Config) string {
+	if b64image == "" || visionModel == "" {
+		return ""
+	}
+
+	endpoint := strings.TrimSuffix(config.primaryProvider().Endpoint, "/v1")
+
+	reqBody := map[string]interface{}{
+		"model": visionModel,
+		"messages": []map[string]interface{}{
+			{
+				"role":    "user",
+				"content": prompt,
+				"images":  []string{b64image},
+			},
+		},
+		"stream": false,
+	}
+
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		fmt.Printf("[siki] describeImageForCharacter: marshal error: %v\n", err)
+		return ""
+	}
+
+	client := &http.Client{Timeout: 90 * time.Second}
+	resp, err := client.Post(endpoint+"/api/chat", "application/json", bytes.NewReader(body))
+	if err != nil {
+		fmt.Printf("[siki] describeImageForCharacter: request error: %v\n", err)
+		return ""
+	}
+	defer resp.Body.Close()
+
+	var chatResp struct {
+		Message struct {
+			Content string `json:"content"`
+		} `json:"message"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&chatResp); err != nil {
+		fmt.Printf("[siki] describeImageForCharacter: decode error: %v\n", err)
+		return ""
+	}
+
+	return strings.TrimSpace(chatResp.Message.Content)
+}
+
 // subModelEndpoint returns the endpoint URL for the sub-model.
-// If SubModelEndpoint is set, use it; otherwise fall back to the primary provider's endpoint.
+// If SubModelEndpoint is set, use it; otherwise fall back based on backend type.
 func subModelEndpoint(config *Config) string {
 	if config.SubModelEndpoint != "" {
 		return strings.TrimSuffix(config.SubModelEndpoint, "/")
+	}
+	// If sub-model uses ollama backend, default to ollama endpoint
+	if config.SubModelBackend == "ollama" || config.SubModelBackend == "" {
+		return "http://localhost:11434"
 	}
 	return strings.TrimSuffix(config.primaryProvider().Endpoint, "/v1")
 }
@@ -2497,6 +2590,63 @@ func subModelEndpoint(config *Config) string {
 // isSubModelVLLM returns true if the sub-model backend is vllm (OpenAI-compatible API).
 func isSubModelVLLM(config *Config) bool {
 	return config.SubModelBackend == "vllm"
+}
+
+// callOrchestratorGenerate calls the orchestrator model (falls back to sub-model if not configured).
+func callOrchestratorGenerate(prompt string, maxTokens int, timeout time.Duration, config *Config) (string, error) {
+	model := config.orchestratorModel()
+	endpoint := config.orchestratorEndpoint()
+	isVLLM := config.orchestratorBackend() == "vllm"
+
+	if isVLLM {
+		return callVLLMGenerate(model, prompt, maxTokens, timeout, endpoint)
+	}
+
+	// Ollama native API
+	reqBody := map[string]interface{}{
+		"model":      model,
+		"prompt":     prompt,
+		"stream":     false,
+		"keep_alive": -1,
+		"options": map[string]interface{}{
+			"num_predict": maxTokens,
+		},
+	}
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", fmt.Errorf("marshal error: %w", err)
+	}
+	client := &http.Client{Timeout: timeout}
+	resp, err := client.Post(endpoint+"/api/generate", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return "", fmt.Errorf("orchestrator request error: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var genResp struct {
+		Response string `json:"response"`
+		Thinking string `json:"thinking"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&genResp); err != nil {
+		return "", fmt.Errorf("decode error: %w", err)
+	}
+	content := genResp.Response
+	// Strip <think>...</think> tags that some models embed in the response
+	if idx := strings.Index(content, "</think>"); idx >= 0 {
+		content = strings.TrimSpace(content[idx+len("</think>"):])
+	}
+	// If response is empty but thinking has content, the model may have
+	// embedded the actual answer inside thinking text — extract it
+	if content == "" && genResp.Thinking != "" {
+		thinking := genResp.Thinking
+		// Look for JSON in thinking text (qwen3.5 sometimes puts JSON in thinking)
+		if idx := strings.Index(thinking, "{"); idx >= 0 {
+			content = thinking[idx:]
+		} else {
+			content = thinking
+		}
+	}
+	return content, nil
 }
 
 // ============================================================================
@@ -2638,8 +2788,10 @@ func streamSubAgentGenerate(prompt string, config *Config, sendEvent func(Stream
 		if err := decoder.Decode(&chunk); err != nil {
 			break
 		}
+		// Capture thinking tokens as thinking events (instead of discarding)
 		if chunk.Thinking != "" {
 			inThinking = true
+			sendEvent(StreamEvent{Type: "thinking", Content: chunk.Thinking})
 			continue
 		}
 		if inThinking && chunk.Response != "" {
@@ -2647,7 +2799,17 @@ func streamSubAgentGenerate(prompt string, config *Config, sendEvent func(Stream
 		}
 		if chunk.Response != "" {
 			text := chunk.Response
-			if strings.Contains(text, "<think>") || strings.Contains(text, "</think>") {
+			if strings.Contains(text, "<think>") {
+				inThinking = true
+				sendEvent(StreamEvent{Type: "thinking", Content: text})
+				continue
+			}
+			if strings.Contains(text, "</think>") {
+				inThinking = false
+				continue
+			}
+			if inThinking {
+				sendEvent(StreamEvent{Type: "thinking", Content: text})
 				continue
 			}
 			fullResponse.WriteString(text)
@@ -2770,16 +2932,39 @@ func streamVLLMGenerate(model, prompt string, maxTokens int, timeout time.Durati
 		if text == "" {
 			continue
 		}
-		// Skip <think> blocks
+		// Capture <think> blocks as thinking events (instead of discarding)
 		if strings.Contains(text, "<think>") {
 			inThinking = true
+			// Send any content after <think> tag
+			if idx := strings.Index(text, "<think>"); idx > 0 {
+				fullResponse.WriteString(text[:idx])
+				sendEvent(StreamEvent{Type: "content", Content: text[:idx]})
+			}
+			after := ""
+			if idx := strings.Index(text, "<think>"); idx+7 < len(text) {
+				after = text[idx+7:]
+			}
+			if after != "" {
+				sendEvent(StreamEvent{Type: "thinking", Content: after})
+			}
 			continue
 		}
 		if strings.Contains(text, "</think>") {
 			inThinking = false
+			// Send any content before </think> as thinking
+			if idx := strings.Index(text, "</think>"); idx > 0 {
+				sendEvent(StreamEvent{Type: "thinking", Content: text[:idx]})
+			}
+			// Send any content after </think> as content
+			if idx := strings.Index(text, "</think>"); idx+8 < len(text) {
+				after := text[idx+8:]
+				fullResponse.WriteString(after)
+				sendEvent(StreamEvent{Type: "content", Content: after})
+			}
 			continue
 		}
 		if inThinking {
+			sendEvent(StreamEvent{Type: "thinking", Content: text})
 			continue
 		}
 		fullResponse.WriteString(text)
@@ -3073,6 +3258,7 @@ type PlanTask struct {
 	Status      string `json:"status"` // "pending", "in_progress", "completed", "failed"
 	Tool        string `json:"tool,omitempty"`
 	Result      string `json:"result,omitempty"`
+	ImagePrompt string `json:"image_prompt,omitempty"` // Pre-generated prompt for generate_image tasks (e.g., comic panels)
 }
 
 // Plan represents a multi-step execution plan
@@ -3110,6 +3296,224 @@ func loadPlan(planID string) (*Plan, error) {
 	}
 	var plan Plan
 	return &plan, json.Unmarshal(data, &plan)
+}
+
+// isComicRequest detects if user wants a multi-panel comic (4コマ漫画 etc.)
+func isComicRequest(userMsg string) bool {
+	lower := strings.ToLower(userMsg)
+	keywords := []string{"4コマ", "４コマ", "漫画", "マンガ", "コミック", "comic"}
+	for _, kw := range keywords {
+		if strings.Contains(lower, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+// createComicPlan creates a specialized plan for 4-panel comic generation.
+// Flow: character design → reference image → vision description → 4 panels
+func createComicPlan(userMsg string, messages []Message, config *Config) (*Plan, error) {
+	// Extract the topic from user message
+	topic := userMsg
+
+	fmt.Printf("[siki] Creating 4-panel comic plan for: %s\n", topic)
+
+	// Step 1: Ask sub-model to write a 4-panel scenario with character designs
+	scenarioPrompt := fmt.Sprintf(`ユーザーが「%s」というリクエストをしました。
+まずテーマについてあなたの知識を使って情報を整理し、キャラクターをデザインし、4コマ漫画のシナリオ（起承転結）を作成せよ。
+
+以下のJSON形式のみ出力せよ:
+{
+  "topic_summary": "テーマの簡単な説明（1-2文）",
+  "characters": [
+    {
+      "name": "キャラクター名",
+      "appearance": "外見の詳細（髪型、髪色、目の色、服装、体型、特徴的なアクセサリーなど）を英語で具体的に記述",
+      "personality": "性格の簡単な説明（日本語）"
+    }
+  ],
+  "character_design_prompt": "メインキャラクター全員を1枚の画像に描いた英語プロンプト。character reference sheet style, full body, front view, white background, detailed features, anime style",
+  "panels": [
+    {"id": 1, "title": "起", "scene": "シーンの描写（何が描かれているか）", "dialogue": "セリフ（あれば）", "image_prompt": "英語の画像生成プロンプト。comic panel style, manga style を含めること。キャラクターの外見描写も含めること"},
+    {"id": 2, "title": "承", "scene": "...", "dialogue": "...", "image_prompt": "..."},
+    {"id": 3, "title": "転", "scene": "...", "dialogue": "...", "image_prompt": "..."},
+    {"id": 4, "title": "結", "scene": "...", "dialogue": "...", "image_prompt": "..."}
+  ]
+}
+
+注意:
+- キャラクターデザインを最初に決め、各コマで一貫した外見にすること
+- characters配列にはメインキャラクター（1-3人程度）を定義すること
+- character_design_promptは全キャラクターを1枚に描くための英語プロンプト
+- appearanceは英語で、髪型・髪色・目の色・服装・体型を具体的に書くこと
+- 4コマ漫画は起承転結の構造を持つこと
+- 各コマのimage_promptに、キャラクターのappearanceの詳細を必ず含めること
+- comic panel style, simple background, bold outlines を含めること
+- テーマに関する正確な情報を反映すること`, topic)
+
+	var scenarioJSON string
+	var err error
+	if hasSubAgent(config) {
+		_, scenarioJSON, err = callSubAgent(scenarioPrompt, config)
+	} else {
+		scenarioJSON, err = callOrchestratorGenerate(scenarioPrompt, 4096, 600*time.Second, config)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("comic scenario generation failed: %w", err)
+	}
+
+	// Parse scenario JSON
+	scenarioJSON = strings.TrimSpace(scenarioJSON)
+	// Strip any <think>...</think> tags from the response
+	if idx := strings.Index(scenarioJSON, "</think>"); idx >= 0 {
+		scenarioJSON = strings.TrimSpace(scenarioJSON[idx+len("</think>"):])
+	}
+	if idx := strings.Index(scenarioJSON, "{"); idx >= 0 {
+		scenarioJSON = scenarioJSON[idx:]
+		depth := 0
+		for i, ch := range scenarioJSON {
+			if ch == '{' {
+				depth++
+			}
+			if ch == '}' {
+				depth--
+				if depth == 0 {
+					scenarioJSON = scenarioJSON[:i+1]
+					break
+				}
+			}
+		}
+	} else {
+		fmt.Printf("[siki] Comic scenario: no JSON found in response (len=%d): %.100s\n", len(scenarioJSON), scenarioJSON)
+		return nil, fmt.Errorf("comic scenario: LLM did not return JSON")
+	}
+
+	var scenario struct {
+		TopicSummary         string `json:"topic_summary"`
+		Characters           []struct {
+			Name       string `json:"name"`
+			Appearance string `json:"appearance"`
+			Personality string `json:"personality"`
+		} `json:"characters"`
+		CharacterDesignPrompt string `json:"character_design_prompt"`
+		Panels               []struct {
+			ID          int             `json:"id"`
+			Title       string          `json:"title"`
+			Scene       string          `json:"scene"`
+			Dialogue    json.RawMessage `json:"dialogue"`
+			ImagePrompt string          `json:"image_prompt"`
+		} `json:"panels"`
+	}
+
+	if err := json.Unmarshal([]byte(scenarioJSON), &scenario); err != nil {
+		fmt.Printf("[siki] Comic scenario JSON parse failed: %v, raw: %s\n", err, scenarioJSON[:min(len(scenarioJSON), 200)])
+		return nil, fmt.Errorf("comic scenario parse failed: %w", err)
+	}
+
+	// Helper: extract dialogue as string regardless of JSON type (string, array, etc.)
+	extractDialogue := func(raw json.RawMessage) string {
+		if len(raw) == 0 {
+			return ""
+		}
+		// Try as string first
+		var s string
+		if json.Unmarshal(raw, &s) == nil {
+			return s
+		}
+		// Try as array of strings
+		var arr []string
+		if json.Unmarshal(raw, &arr) == nil {
+			return strings.Join(arr, " / ")
+		}
+		// Fallback: return raw trimmed
+		return strings.Trim(string(raw), "\"")
+	}
+
+	if len(scenario.Panels) < 4 {
+		return nil, fmt.Errorf("comic scenario has %d panels, need 4", len(scenario.Panels))
+	}
+
+	// Build character appearance description for prompt embedding
+	var charDesc strings.Builder
+	for _, c := range scenario.Characters {
+		charDesc.WriteString(fmt.Sprintf("%s: %s. ", c.Name, c.Appearance))
+	}
+	charAppearance := strings.TrimSpace(charDesc.String())
+
+	// Build plan: scenario + character design image + describe image + 4 panels
+	plan := &Plan{
+		Goal:      userMsg,
+		CreatedAt: time.Now().Format(time.RFC3339),
+		Status:    "planning",
+	}
+
+	// Task 1: Display the scenario and character designs
+	var scenarioText strings.Builder
+	scenarioText.WriteString(fmt.Sprintf("## 4コマ漫画シナリオ\n**テーマ:** %s\n\n", scenario.TopicSummary))
+
+	if len(scenario.Characters) > 0 {
+		scenarioText.WriteString("### キャラクターデザイン\n")
+		for _, c := range scenario.Characters {
+			scenarioText.WriteString(fmt.Sprintf("- **%s**: %s（%s）\n", c.Name, c.Appearance, c.Personality))
+		}
+		scenarioText.WriteString("\n")
+	}
+
+	for _, p := range scenario.Panels {
+		scenarioText.WriteString(fmt.Sprintf("### %d. %s\n", p.ID, p.Title))
+		scenarioText.WriteString(fmt.Sprintf("**シーン:** %s\n", p.Scene))
+		dlg := extractDialogue(p.Dialogue)
+		if dlg != "" {
+			scenarioText.WriteString(fmt.Sprintf("**セリフ:** %s\n", dlg))
+		}
+		scenarioText.WriteString("\n")
+	}
+
+	plan.Tasks = append(plan.Tasks, PlanTask{
+		ID:          1,
+		Description: scenarioText.String(),
+		Status:      "pending",
+		Tool:        "summarize",
+	})
+
+	// Task 2: Generate character reference image
+	charDesignPrompt := scenario.CharacterDesignPrompt
+	if charDesignPrompt == "" {
+		charDesignPrompt = fmt.Sprintf("character reference sheet, full body, front view, white background, anime style, detailed features, %s", charAppearance)
+	}
+	plan.Tasks = append(plan.Tasks, PlanTask{
+		ID:          2,
+		Description: "キャラクターデザイン参照画像を生成",
+		Status:      "pending",
+		Tool:        "generate_image",
+		ImagePrompt: charDesignPrompt,
+	})
+
+	// Task 3: Use vision model to extract detailed character description from reference image
+	plan.Tasks = append(plan.Tasks, PlanTask{
+		ID:          3,
+		Description: "参照画像からキャラクター外見を詳細解析",
+		Status:      "pending",
+		Tool:        "describe_image",
+	})
+
+	// Tasks 4-7: Generate each panel image with character description prepended
+	for i, p := range scenario.Panels[:4] {
+		prompt := p.ImagePrompt
+		if prompt == "" {
+			prompt = fmt.Sprintf("4-panel comic, panel %d, %s, manga style, simple background, bold outlines, %s", p.ID, p.Scene, charAppearance)
+		}
+		// Prepend character appearance to ensure consistency (will be enhanced at execution time with vision description)
+		plan.Tasks = append(plan.Tasks, PlanTask{
+			ID:          i + 4,
+			Description: fmt.Sprintf("%dコマ目「%s」を画像生成: %s", p.ID, p.Title, p.Scene),
+			Status:      "pending",
+			Tool:        "generate_image",
+			ImagePrompt: prompt,
+		})
+	}
+
+	return plan, nil
 }
 
 // createPlan asks the sub-model to create a plan for a complex task
@@ -3266,6 +3670,48 @@ func createPlan(userMsg string, messages []Message, config *Config) (*Plan, erro
 
 // executePlanTask asks the orchestrator to execute a specific plan task
 func executePlanTask(task *PlanTask, plan *Plan, agent *Agent, config *Config, sendEvent func(StreamEvent)) (string, error) {
+	// describe_image: directly use vision model without sub-model decision
+	if task.Tool == "describe_image" {
+		sendEvent(StreamEvent{Type: "thinking", Content: "参照画像を解析中...", Model: config.VisionModel})
+		// Find the most recent generate_image result (should be the character reference image)
+		var imagePath string
+		for _, t := range plan.Tasks {
+			if t.Status == "completed" && t.Tool == "generate_image" && t.Result != "" {
+				imagePath = t.Result
+			}
+		}
+		if imagePath == "" {
+			return "参照画像が見つかりません", nil
+		}
+
+		// Resolve path: result is like "/playground/image_xxx.png"
+		actualPath := imagePath
+		if strings.HasPrefix(imagePath, "/playground/") {
+			actualPath = filepath.Join(playgroundDir, strings.TrimPrefix(imagePath, "/playground/"))
+		}
+		imgData, err := os.ReadFile(actualPath)
+		if err != nil {
+			fmt.Printf("[siki] describe_image: failed to read image %s: %v\n", actualPath, err)
+			return fmt.Sprintf("画像ファイルの読み込みに失敗: %v", err), nil
+		}
+		b64 := base64.StdEncoding.EncodeToString(imgData)
+
+		if config.VisionModel == "" {
+			fmt.Printf("[siki] describe_image: no vision model configured\n")
+			return "Vision modelが未設定のため、シナリオのキャラクター描写を使用します。", nil
+		}
+
+		charDescPrompt := "Describe this character reference image in detail. Focus on: hair style, hair color, eye color, clothing, accessories, body type, distinctive features. Be very specific and use English. This description will be used to maintain character consistency across multiple comic panels."
+		desc := describeImageForCharacter(b64, charDescPrompt, config.VisionModel, config)
+		if desc == "" {
+			return "キャラクター描写を取得できませんでした", nil
+		}
+
+		fmt.Printf("[siki] describe_image: character description extracted (%d bytes)\n", len(desc))
+		sendEvent(StreamEvent{Type: "content", Content: fmt.Sprintf("\n**キャラクター外見解析結果:**\n%s\n", desc)})
+		return desc, nil
+	}
+
 	// Build context from plan progress so far
 	var ctx strings.Builder
 	ctx.WriteString(fmt.Sprintf("## 全体目標\n%s\n\n## 進捗\n", plan.Goal))
@@ -3525,9 +3971,32 @@ func executePlanTask(task *PlanTask, plan *Plan, agent *Agent, config *Config, s
 		}
 	}
 
-	// For generate_image: build English prompt from previous task results
+	// For generate_image: use pre-generated prompt (e.g., comic panels) or build from previous results
 	if toolName == "generate_image" {
 		prompt, _ := args["prompt"].(string)
+		// Use pre-generated ImagePrompt if available (from comic plan etc.)
+		if (prompt == "" || len(prompt) < 20) && task.ImagePrompt != "" {
+			args["prompt"] = task.ImagePrompt
+			prompt = task.ImagePrompt
+			sendEvent(modelThinkingEvent(fmt.Sprintf("Image prompt: %s", prompt), config, false))
+		}
+		// For comic panels: prepend character description from describe_image task for consistency
+		// Only for panel tasks (not the character reference image itself)
+		if task.ID >= 4 { // Tasks 4-7 are comic panels in the new pipeline
+			for _, t := range plan.Tasks {
+				if t.Tool == "describe_image" && t.Status == "completed" && t.Result != "" {
+					// Prepend vision-extracted character description to the prompt
+					charPrefix := fmt.Sprintf("Characters: %s. ", t.Result)
+					if len(charPrefix) > 500 {
+						charPrefix = charPrefix[:500] + "... "
+					}
+					prompt = charPrefix + prompt
+					args["prompt"] = prompt
+					fmt.Printf("[siki] Comic panel %d: prepended character description (%d bytes)\n", task.ID, len(charPrefix))
+					break
+				}
+			}
+		}
 		if prompt == "" || len(prompt) < 20 {
 			// Collect all previous task results as context
 			var prevData strings.Builder
@@ -3558,7 +4027,7 @@ func executePlanTask(task *PlanTask, plan *Plan, agent *Agent, config *Config, s
 					imgPrompt = imgPrompt[1 : len(imgPrompt)-1]
 				}
 				args["prompt"] = imgPrompt
-				sendEvent(StreamEvent{Type: "thinking", Content: fmt.Sprintf("Image prompt: %s", imgPrompt)})
+				sendEvent(modelThinkingEvent(fmt.Sprintf("Image prompt: %s", imgPrompt), config, hasSubAgent(config)))
 			} else {
 				// Fallback: use task description directly
 				args["prompt"] = "Modern infographic about " + plan.Goal + ", data visualization, professional design, dark theme"
@@ -3579,6 +4048,55 @@ func executePlanTask(task *PlanTask, plan *Plan, agent *Agent, config *Config, s
 	sendEvent(StreamEvent{Type: "tool_call", Name: toolName, Result: displayResult})
 
 	return result, nil
+}
+
+// verifyGoalFulfillment checks if a plan actually fulfilled the user's request.
+// Returns true if the essential tasks completed successfully.
+func verifyGoalFulfillment(plan *Plan, userMsg string) bool {
+	if plan == nil {
+		return false
+	}
+
+	totalTasks := len(plan.Tasks)
+	if totalTasks == 0 {
+		return false
+	}
+
+	completedCount := 0
+	failedCount := 0
+	imageTaskCount := 0
+	imageCompletedCount := 0
+
+	for _, t := range plan.Tasks {
+		switch t.Status {
+		case "completed":
+			completedCount++
+		case "failed":
+			failedCount++
+		}
+		if t.Tool == "generate_image" {
+			imageTaskCount++
+			if t.Status == "completed" {
+				imageCompletedCount++
+			}
+		}
+	}
+
+	// For comic requests: at least some images must have been generated
+	if isComicRequest(userMsg) {
+		if imageTaskCount > 0 && imageCompletedCount == 0 {
+			fmt.Printf("[siki] Goal check: comic request but 0/%d images generated\n", imageTaskCount)
+			return false
+		}
+	}
+
+	// General: if more than half the tasks failed, goal is not met
+	if failedCount > totalTasks/2 {
+		fmt.Printf("[siki] Goal check: %d/%d tasks failed\n", failedCount, totalTasks)
+		return false
+	}
+
+	return true
 }
 
 // (ws *WebServer) executePlan runs all tasks in a plan sequentially
@@ -3635,17 +4153,24 @@ func (ws *WebServer) executePlan(ctx context.Context, plan *Plan, planID string,
 		savePlan(plan, planID)
 
 		// Send updated progress
-		sendEvent(StreamEvent{
-			Type:    "plan_progress",
-			Content: fmt.Sprintf("タスク %d/%d 完了 ✅", task.ID, len(plan.Tasks)),
-		})
+		if task.Status == "failed" {
+			sendEvent(StreamEvent{
+				Type:    "plan_progress",
+				Content: fmt.Sprintf("タスク %d/%d 失敗 ❌: %s", task.ID, len(plan.Tasks), task.Result),
+			})
+		} else {
+			sendEvent(StreamEvent{
+				Type:    "plan_progress",
+				Content: fmt.Sprintf("タスク %d/%d 完了 ✅", task.ID, len(plan.Tasks)),
+			})
+		}
 	}
 
 	plan.Status = "completed"
 	savePlan(plan, planID)
 
 	// Generate final summary
-	sendEvent(StreamEvent{Type: "thinking", Content: "全タスク完了。最終まとめを生成中..."})
+	sendEvent(modelThinkingEvent("全タスク完了。最終まとめを生成中...", ws.config, hasSubAgent(ws.config)))
 	summary, err := streamSubModelSummarize(plan.Goal, "plan", allResults.String(), ws.config, sendEvent)
 	if err != nil || summary == "" {
 		summary = allResults.String()
@@ -3662,7 +4187,7 @@ func (ws *WebServer) executePlan(ctx context.Context, plan *Plan, planID string,
 
 	// Auto-generate infographic if image server is available
 	if imageServerReady && ws.config.ImageEnabled {
-		sendEvent(StreamEvent{Type: "thinking", Content: "インフォグラフィックを生成中..."})
+		sendEvent(modelThinkingEvent("インフォグラフィックを生成中...", ws.config, hasSubAgent(ws.config)))
 		// Generate English image prompt from summary using sub-model
 		if ws.config.SubModel != "" {
 			imgPromptReq := fmt.Sprintf(`以下のまとめ内容を表現するインフォグラフィック画像の英語プロンプトを生成せよ。
@@ -3696,6 +4221,11 @@ func (ws *WebServer) executePlan(ctx context.Context, plan *Plan, planID string,
 // No model call — deterministic, always Japanese, zero latency.
 func quickAck(userMsg string, config *Config) string {
 	lower := strings.ToLower(userMsg)
+
+	// Comic requests get a special ack (takes priority over "描いて"/"書いて" match)
+	if isComicRequest(userMsg) {
+		return "4コマ漫画を作成しますね！シナリオとキャラクターをデザイン中..."
+	}
 
 	type ackRule struct {
 		keywords []string
@@ -3766,7 +4296,18 @@ func subModelOrchestrate(userMsg string, messages []Message, config *Config) (*O
 - read_file: ファイル読込。引数: {"path": "ファイルパス"}
 - write_file: ファイル書込。引数: {"path": "パス", "content": "内容"}
 - generate_image: AI画像生成（Flux Klein 4B）。インフォグラフィック・イラスト・コンセプトアート。引数: {"prompt": "英語の詳細プロンプト"}
+- search_threads: 過去の全スレッド横断で会話ログを検索。引数: {"query": "検索キーワード"}
+- search_conversation: 現在のスレッド内の会話を検索。引数: {"query": "検索キーワード"}
+- recall_context: 現スレッドの会話ログから文脈を思い出す。引数: {"query": "検索キーワード"}
 - plan: 複雑なタスクを複数ステップに分解して順次実行。引数: {"goal": "ユーザーのリクエストそのまま"}
+- self_status: 自分の現在の状態・バージョン・ルール・ベンチマークスコアを確認。引数: {}
+- self_modify_prompt: 自分のシステムプロンプトを変更。引数: {"action": "replace|append|replace_section", "content": "新しい内容", "reason": "理由"}
+- self_modify_params: 自分のパラメータ変更。引数: {"params": "{\"temperature\":0.5}", "reason": "理由"}
+- self_add_rule: 自分にルールを追加。引数: {"rule": "ルール内容", "reason": "理由"}
+- self_remove_rule: ルールを無効化。引数: {"rule_id": "ルールID"}
+- self_rollback: 以前のバージョンに戻す。引数: {"version": バージョン番号}
+- self_benchmark: 自己評価ベンチマーク。引数: {"categories": "all"}
+- self_evolve: ソースコード自己進化。引数: {"action": "view_source|patch|build_test|deploy|status|abort"}
 
 ## 会話履歴
 %s
@@ -3778,17 +4319,21 @@ func subModelOrchestrate(userMsg string, messages []Message, config *Config) (*O
 - run_codeはゲーム・シミュレーション・インタラクティブUI等のプログラム実行専用
 - generate_imageはインフォグラフィック・イラスト・ポスター等の画像生成専用（run_codeと混同するな）
 - web_searchの場合、適切な検索クエリを指定
+- 「過去の会話」「前に話した」「さっきの」「会話ログ」等の場合はsearch_threadsかrecall_contextを使え（web_searchではない）
 - 複数のツールを組み合わせる必要がある複雑なリクエスト（調査→分析→可視化など）には plan を使え
 - planのgoalにはユーザーのリクエストをそのまま入れろ。実装方法（HTML等）を勝手に追加するな
 - 単純な1ステップの作業にはplanを使うな
 - ツール不要（挨拶・計算・知識質問）なら直接回答
+- 「システムプロンプト変更」「自分を変えろ」「ルール追加」等の自己改変リクエストにはself_modify_prompt/self_add_rule等を使え
+- 「自分の状態」「ステータス」にはself_statusを使え
 
 以下のJSON形式のみ出力せよ（他の文章は絶対に書くな）:
 ツール使用: {"tool":"ツール名","args":{引数}}
 直接回答: {"tool":"none","response":"回答テキスト"}`,
 		ctx.String(), userMsg, now.Year(), int(now.Month()), now.Day())
 
-	response, err := callOllamaGenerate(config.SubModel, prompt, 4096, 600*time.Second, config)
+	fmt.Printf("[siki] Orchestrator model: %s (backend: %s)\n", config.orchestratorModel(), config.orchestratorBackend())
+	response, err := callOrchestratorGenerate(prompt, 4096, 600*time.Second, config)
 	if err != nil {
 		return nil, fmt.Errorf("orchestration failed: %w", err)
 	}
@@ -3890,13 +4435,50 @@ func needsToolButDidnt(userMsg, response string) bool {
 			break
 		}
 	}
-	if !needsRealTime {
-		return false
+	if needsRealTime {
+		// If response doesn't contain any real URLs, it's likely hallucinated
+		hasURL := strings.Contains(response, "http://") || strings.Contains(response, "https://")
+		if !hasURL && len(response) > 100 {
+			return true
+		}
 	}
-	// If response doesn't contain any real URLs, it's likely hallucinated
-	hasURL := strings.Contains(response, "http://") || strings.Contains(response, "https://")
-	if !hasURL && len(response) > 100 {
+
+	// 「できない」「情報がない」系の応答を検出
+	refusalPatterns := []string{
+		"できません", "わかりません", "情報がありません", "提供することができません",
+		"ツール結果が", "利用できるツール", "申し訳ありません",
+		"お手数ですが", "再度送付", "情報を提供することが",
+	}
+	responseLower := strings.ToLower(response)
+	for _, pat := range refusalPatterns {
+		if strings.Contains(responseLower, pat) {
+			return true // 拒否応答 → ツールでリトライすべき
+		}
+	}
+
+	// ユーザーが「予測」「分析」「調べ」等を求めているのに応答が短すぎる
+	analysisKeywords := []string{"予測", "予想", "分析", "調べ", "検索", "過去の", "履歴"}
+	needsAnalysis := false
+	for _, kw := range analysisKeywords {
+		if strings.Contains(lower, kw) {
+			needsAnalysis = true
+			break
+		}
+	}
+	if needsAnalysis && len(response) < 200 {
 		return true
+	}
+
+	return false
+}
+
+// containsConversationKeywords checks if the message references past conversations or predictions.
+func containsConversationKeywords(msg string) bool {
+	keywords := []string{"会話", "過去", "ログ", "履歴", "前に", "さっき", "やり取り", "予測", "予想", "次に何"}
+	for _, kw := range keywords {
+		if strings.Contains(msg, kw) {
+			return true
+		}
 	}
 	return false
 }
@@ -3910,7 +4492,7 @@ func (ws *WebServer) executeToolAndSummarize(agent *Agent, userMsg, toolName str
 
 	// Generate DOT code for diagram
 	if toolName == "diagram" {
-		sendEvent(StreamEvent{Type: "thinking", Content: "図のDOTコードを生成中..."})
+		sendEvent(modelThinkingEvent("図のDOTコードを生成中...", ws.config, false))
 		prompt := fmt.Sprintf("以下のリクエストに対して、Graphviz DOTコードのみ出力せよ（説明不要、コードフェンスも不要）。\nリクエスト: %s", userMsg)
 		_, genDot, err := callSubModel(prompt, ws.config)
 		if err == nil && len(genDot) > 10 {
@@ -4015,7 +4597,7 @@ func (ws *WebServer) executeToolAndSummarize(agent *Agent, userMsg, toolName str
 		}
 	}
 
-	sendEvent(StreamEvent{Type: "thinking", Content: "再回答を生成中..."})
+	sendEvent(modelThinkingEvent("再回答を生成中...", ws.config, hasSubAgent(ws.config)))
 	finalResponse, err := streamSubModelSummarize(userMsg, toolName, result, ws.config, sendEvent)
 	if err != nil || finalResponse == "" {
 		return ""
@@ -4059,7 +4641,9 @@ func detectToolFromKeywords(userMsg string) string {
 		tool     string
 	}
 	rules := []toolRule{
+		{[]string{"4コマ", "４コマ", "漫画", "マンガ", "コミック", "comic"}, "plan"},
 		{[]string{"画像生成", "イラスト描", "インフォグラフィック", "image generat", "generate image", "画像を生成", "画像を作"}, "generate_image"},
+		{[]string{"過去の会話", "会話ログ", "過去ログ", "前の会話", "さっきの会話", "会話履歴", "スレッド検索", "やり取り"}, "search_threads"},
 		{[]string{"ニュース", "news", "最新", "速報", "トレンド"}, "web_search"},
 		{[]string{"調べて", "検索", "教えて", "について", "とは"}, "web_search"},
 		{[]string{"http://", "https://"}, "web_fetch"},
@@ -4067,6 +4651,10 @@ func detectToolFromKeywords(userMsg string) string {
 		{[]string{"図", "ダイアグラム", "アーキテクチャ", "関係図", "構成図"}, "diagram"},
 		{[]string{"ファイル", "読んで", "開いて"}, "read_file"},
 		{[]string{"コマンド", "実行して", "install", "apt ", "pip "}, "execute_command"},
+		{[]string{"システムプロンプト変更", "プロンプト変更", "プロンプト修正", "自分を変え", "自己改変", "自分の設定", "ルール追加", "ルール変更"}, "self_modify_prompt"},
+		{[]string{"自分の状態", "自己診断", "ステータス確認", "self status"}, "self_status"},
+		{[]string{"ベンチマーク", "自己評価", "self benchmark"}, "self_benchmark"},
+		{[]string{"ロールバック", "元に戻して", "前のバージョン"}, "self_rollback"},
 	}
 
 	for _, rule := range rules {
@@ -4436,9 +5024,10 @@ func streamSubModelSummarize(userMsg, toolName, toolResult string, config *Confi
 			break
 		}
 
-		// Skip thinking tokens (chain-of-thought)
+		// Capture thinking tokens as thinking events (instead of discarding)
 		if chunk.Thinking != "" {
 			inThinking = true
+			sendEvent(StreamEvent{Type: "thinking", Content: chunk.Thinking})
 			continue
 		}
 		if inThinking && chunk.Response != "" {
@@ -4446,9 +5035,19 @@ func streamSubModelSummarize(userMsg, toolName, toolResult string, config *Confi
 		}
 
 		if chunk.Response != "" {
-			// Strip <think> tags from streamed content
 			text := chunk.Response
-			if strings.Contains(text, "<think>") || strings.Contains(text, "</think>") {
+			// Handle inline <think> tags
+			if strings.Contains(text, "<think>") {
+				inThinking = true
+				sendEvent(StreamEvent{Type: "thinking", Content: text})
+				continue
+			}
+			if strings.Contains(text, "</think>") {
+				inThinking = false
+				continue
+			}
+			if inThinking {
+				sendEvent(StreamEvent{Type: "thinking", Content: text})
 				continue
 			}
 			fullResponse.WriteString(text)
@@ -4463,9 +5062,174 @@ func streamSubModelSummarize(userMsg, toolName, toolResult string, config *Confi
 	return fullResponse.String(), nil
 }
 
+// isDissatisfied checks if the user message expresses dissatisfaction with the previous response.
+func isDissatisfied(msg string) bool {
+	lower := strings.ToLower(msg)
+	keywords := []string{
+		"だめ", "ダメ", "駄目", "やり直し", "違う", "もっと良く", "いまいち", "再生成",
+		"改善して", "修正して", "直して", "やりなおし", "もう一度", "もっといい",
+		"よくない", "不満", "気に入らない", "ちがう", "ちゃんとして", "もっとちゃんと",
+		"redo", "try again", "not good", "wrong", "fix it", "improve",
+		"do it again", "retry", "bad", "terrible", "ひどい", "使えない",
+	}
+	for _, kw := range keywords {
+		if strings.Contains(lower, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+// retryWithEscalation retries the last tool execution with a more powerful model or enhanced prompt.
+// Returns the new response, or empty string if escalation is not possible.
+func (ws *WebServer) retryWithEscalation(ctx context.Context, convID string, agent *Agent, userMsg string, sendEvent func(StreamEvent), saveMsg func(Message, string)) string {
+	ws.mu.RLock()
+	last := ws.lastExec[convID]
+	ws.mu.RUnlock()
+	if last == nil {
+		return ""
+	}
+
+	fmt.Printf("[siki] Dissatisfaction detected, escalating. Previous tool: %s, usedAgent: %v\n", last.ToolName, last.UsedAgent)
+
+	// For visual tools (run_code, diagram, generate_image), re-execute the tool with feedback
+	if last.ToolName == "run_code" || last.ToolName == "diagram" || last.ToolName == "generate_image" {
+		sendEvent(modelThinkingEvent("前回の結果を改善中...", ws.config, hasSubAgent(ws.config)))
+
+		// Generate improved args via sub-agent/sub-model
+		feedbackPrompt := fmt.Sprintf(`前回のユーザーリクエスト: %s
+前回のツール: %s
+ユーザーのフィードバック: %s
+
+ユーザーの不満を踏まえて、改善した結果を生成してください。`, last.UserMsg, last.ToolName, userMsg)
+
+		if last.ToolName == "generate_image" {
+			// Re-generate with enhanced prompt
+			sendEvent(StreamEvent{Type: "tool_start", Name: "generate_image"})
+			enhancePrompt := fmt.Sprintf(`前回の画像生成プロンプトの結果にユーザーが不満です。
+前回のリクエスト: %s
+ユーザーのフィードバック: %s
+
+より良い英語の画像生成プロンプトを1つだけ出力せよ。`, last.UserMsg, userMsg)
+			_, enhanced, err := callSubAgent(enhancePrompt, ws.config)
+			if err == nil && len(enhanced) > 10 {
+				enhanced = strings.TrimSpace(enhanced)
+				enhanced = strings.TrimPrefix(enhanced, "```")
+				enhanced = strings.TrimSuffix(enhanced, "```")
+				enhanced = strings.TrimSpace(enhanced)
+				if len(enhanced) > 2 && enhanced[0] == '"' && enhanced[len(enhanced)-1] == '"' {
+					enhanced = enhanced[1 : len(enhanced)-1]
+				}
+				args := map[string]interface{}{"prompt": enhanced}
+				result, err := agent.executeTool("generate_image", args)
+				if err == nil {
+					sendEvent(StreamEvent{Type: "tool_call", Name: "generate_image", Result: result})
+					finalMsg := Message{Role: "assistant", Content: result}
+					agent.messages = append(agent.messages, finalMsg)
+					saveMsg(finalMsg, "")
+					return result
+				}
+			}
+		} else if last.ToolName == "run_code" {
+			// Regenerate code with feedback
+			sendEvent(StreamEvent{Type: "tool_start", Name: "run_code"})
+			newHTML, err := generateCodeWithSubModel(feedbackPrompt, ws.config)
+			if err == nil && len(newHTML) > 50 {
+				args := map[string]interface{}{"html": newHTML}
+				result, err := agent.executeTool("run_code", args)
+				if err == nil {
+					sendEvent(StreamEvent{Type: "tool_call", Name: "run_code", Result: result})
+					finalMsg := Message{Role: "assistant", Content: result}
+					agent.messages = append(agent.messages, finalMsg)
+					saveMsg(finalMsg, "")
+					return result
+				}
+			}
+		}
+		// For diagram, fall through to re-summarize
+	}
+
+	// For text-based results: escalate to sub-agent if not already used
+	if hasSubAgent(ws.config) && !last.UsedAgent {
+		fmt.Printf("[siki] Escalating to sub-agent: %s\n", ws.config.SubAgent)
+		sendEvent(modelThinkingEvent("より強力なモデルで再処理中...", ws.config, true))
+
+		escalatePrompt := fmt.Sprintf(`## 前回の回答に対するユーザーの不満
+ユーザーのフィードバック: %s
+
+## 元のリクエスト
+%s
+
+## 前回使用したツール: %s
+## ツール結果:
+%s
+
+上記のツール結果に基づき、ユーザーの不満を踏まえてより良い回答を日本語で生成せよ。`, userMsg, last.UserMsg, last.ToolName, last.ToolResult)
+
+		resp, err := streamSubAgentGenerate(escalatePrompt, ws.config, sendEvent)
+		if err == nil && len(strings.TrimSpace(resp)) > 20 {
+			finalMsg := Message{Role: "assistant", Content: resp}
+			agent.messages = append(agent.messages, finalMsg)
+			saveMsg(finalMsg, "")
+			// Update lastExec to reflect sub-agent usage
+			ws.mu.Lock()
+			ws.lastExec[convID] = &LastToolExecution{
+				UserMsg:    last.UserMsg,
+				ToolName:   last.ToolName,
+				Args:       last.Args,
+				ToolResult: last.ToolResult,
+				Response:   resp,
+				UsedAgent:  true,
+			}
+			ws.mu.Unlock()
+			return resp
+		}
+	}
+
+	// Same model retry with feedback-enhanced prompt
+	if last.ToolResult != "" {
+		sendEvent(modelThinkingEvent("フィードバックを反映して再生成中...", ws.config, hasSubAgent(ws.config)))
+		feedbackResult := last.ToolResult + fmt.Sprintf("\n\n## ユーザーフィードバック:\nユーザーは前回の回答に不満です: %s\nこのフィードバックを踏まえて、より良い回答を生成せよ。", userMsg)
+		resp, err := streamSubModelSummarize(last.UserMsg, last.ToolName, feedbackResult, ws.config, sendEvent)
+		if err == nil && len(strings.TrimSpace(resp)) > 20 {
+			finalMsg := Message{Role: "assistant", Content: resp}
+			agent.messages = append(agent.messages, finalMsg)
+			saveMsg(finalMsg, "")
+			ws.mu.Lock()
+			ws.lastExec[convID] = &LastToolExecution{
+				UserMsg:    last.UserMsg,
+				ToolName:   last.ToolName,
+				Args:       last.Args,
+				ToolResult: last.ToolResult,
+				Response:   resp,
+				UsedAgent:  last.UsedAgent,
+			}
+			ws.mu.Unlock()
+			return resp
+		}
+	}
+
+	return ""
+}
+
 // dualModelPipeline coordinates lfm (fast ack) and gpt-oss (real orchestration).
 // Returns the final assistant reply text.
-func (ws *WebServer) dualModelPipeline(ctx context.Context, agent *Agent, userMsg string, sendEvent func(StreamEvent), saveMsg func(Message, string)) string {
+func (ws *WebServer) dualModelPipeline(ctx context.Context, agent *Agent, userMsg string, sendEvent func(StreamEvent), saveMsg func(Message, string), convID ...string) string {
+	// Resolve conversation ID (optional parameter for backwards compatibility)
+	cID := ""
+	if len(convID) > 0 {
+		cID = convID[0]
+	}
+
+	// Check for dissatisfaction and attempt escalation recovery
+	if cID != "" && isDissatisfied(userMsg) {
+		escalated := ws.retryWithEscalation(ctx, cID, agent, userMsg, sendEvent, saveMsg)
+		if escalated != "" {
+			return escalated
+		}
+		// Fall through to normal pipeline if escalation didn't work
+	}
+
 	// Phase 1: Quick ack from lfm (parallel with Phase 2)
 	ackCh := make(chan string, 1)
 	go func() {
@@ -4492,10 +5256,10 @@ func (ws *WebServer) dualModelPipeline(ctx context.Context, agent *Agent, userMs
 	case <-time.After(1 * time.Second):
 	}
 
-	// Show thinking indicator while waiting for gpt-oss (with keepalive)
-	sendEvent(StreamEvent{Type: "thinking", Content: "サブモデルで処理中..."})
+	// Show thinking indicator while waiting for orchestrator (with keepalive)
+	sendEvent(orchestratorThinkingEvent("オーケストレーターで処理中...", ws.config))
 
-	// Wait for gpt-oss decision with periodic keepalive
+	// Wait for orchestrator decision with periodic keepalive
 	var decision *OrchestratorDecision
 	orchTicker := time.NewTicker(2 * time.Second)
 	orchDone := false
@@ -4510,7 +5274,7 @@ func (ws *WebServer) dualModelPipeline(ctx context.Context, agent *Agent, userMs
 			}
 			decision = r.decision
 		case <-orchTicker.C:
-			sendEvent(StreamEvent{Type: "thinking", Content: "処理中..."})
+			sendEvent(orchestratorThinkingEvent("処理中...", ws.config))
 		case <-ctx.Done():
 			orchTicker.Stop()
 			return ""
@@ -4565,7 +5329,7 @@ func (ws *WebServer) dualModelPipeline(ctx context.Context, agent *Agent, userMs
 			ticker.Stop()
 			sendEvent(StreamEvent{Type: "tool_call", Name: "web_fetch", Result: fmt.Sprintf("%d件のページを取得しました", len(prevURLs))})
 
-			sendEvent(StreamEvent{Type: "thinking", Content: "回答を生成中..."})
+			sendEvent(modelThinkingEvent("回答を生成中...", ws.config, hasSubAgent(ws.config)))
 			fetchedStr := fetchedContent.String()
 			finalResponse, err := streamSubModelSummarize(userMsg, "web_fetch", fetchedStr, ws.config, sendEvent)
 			if err != nil || finalResponse == "" {
@@ -4576,7 +5340,7 @@ func (ws *WebServer) dualModelPipeline(ctx context.Context, agent *Agent, userMs
 				isValid, reason, cleaned := validateResponse(userMsg, finalResponse, fetchedStr, ws.config)
 				if !isValid {
 					fmt.Printf("[siki] Follow-up validation failed: %s — retrying\n", reason)
-					sendEvent(StreamEvent{Type: "thinking", Content: fmt.Sprintf("回答品質チェック不合格: %s — 再生成します", reason)})
+					sendEvent(modelThinkingEvent(fmt.Sprintf("回答品質チェック不合格: %s — 再生成します", reason), ws.config, hasSubAgent(ws.config)))
 					retryResponse, retryErr := streamSubModelSummarize(userMsg, "web_fetch", fetchedStr+"\n\n## 前回の回答が不合格だった理由:\n"+reason, ws.config, sendEvent)
 					if retryErr == nil && retryResponse != "" {
 						finalResponse = retryResponse
@@ -4590,6 +5354,11 @@ func (ws *WebServer) dualModelPipeline(ctx context.Context, agent *Agent, userMs
 			saveMsg(finalMsg, "")
 			suggestions := generateSuggestions(userMsg, finalResponse, "web_fetch")
 			sendEvent(StreamEvent{Type: "suggestions", Suggestions: suggestions})
+			if cID != "" {
+				ws.mu.Lock()
+				ws.lastExec[cID] = &LastToolExecution{UserMsg: userMsg, ToolName: "web_fetch", ToolResult: fetchedStr, Response: finalResponse, UsedAgent: hasSubAgent(ws.config)}
+				ws.mu.Unlock()
+			}
 			return finalResponse
 		}
 	}
@@ -4602,6 +5371,12 @@ func (ws *WebServer) dualModelPipeline(ctx context.Context, agent *Agent, userMs
 			decision.Tool = detected
 			decision.Args = nil
 		}
+	}
+
+	// Force plan mode for comic requests (4コマ漫画 requires multi-step: scenario + 4 images)
+	if decision.Tool != "plan" && isComicRequest(userMsg) {
+		fmt.Printf("[siki] Forcing plan mode: comic request detected (was: %s)\n", decision.Tool)
+		decision.Tool = "plan"
 	}
 
 	// Force plan mode for complex requests needing research + specific output (image/code)
@@ -4631,10 +5406,15 @@ func (ws *WebServer) dualModelPipeline(ctx context.Context, agent *Agent, userMs
 			if needsToolButDidnt(userMsg, resp) {
 				fmt.Printf("[siki] Post-response validation failed: response looks hallucinated, retrying with tool\n")
 				retryTool := detectToolFromKeywords(userMsg)
-				if retryTool == "" {
-					retryTool = "web_search"
+				if retryTool == "" || retryTool == "plan" {
+					// 会話検索系キーワードがあれば search_threads を優先
+					if containsConversationKeywords(userMsg) {
+						retryTool = "search_threads"
+					} else {
+						retryTool = "web_search"
+					}
 				}
-				sendEvent(StreamEvent{Type: "thinking", Content: "回答を検証中...ツールで再確認します"})
+				sendEvent(modelThinkingEvent("回答を検証中...ツールで再確認します", ws.config, hasSubAgent(ws.config)))
 				retryResult := ws.executeToolAndSummarize(agent, userMsg, retryTool, sendEvent, saveMsg)
 				if retryResult != "" {
 					return retryResult
@@ -4646,7 +5426,7 @@ func (ws *WebServer) dualModelPipeline(ctx context.Context, agent *Agent, userMs
 				fmt.Printf("[siki] Direct answer validation failed: %s\n", reason)
 				// Try with a tool as fallback
 				retryTool := "web_search"
-				sendEvent(StreamEvent{Type: "thinking", Content: fmt.Sprintf("回答品質チェック不合格: %s — ツールで再検索します", reason)})
+				sendEvent(modelThinkingEvent(fmt.Sprintf("回答品質チェック不合格: %s — ツールで再検索します", reason), ws.config, hasSubAgent(ws.config)))
 				retryResult := ws.executeToolAndSummarize(agent, userMsg, retryTool, sendEvent, saveMsg)
 				if retryResult != "" {
 					return retryResult
@@ -4659,6 +5439,11 @@ func (ws *WebServer) dualModelPipeline(ctx context.Context, agent *Agent, userMs
 			saveMsg(assistantMsg, "")
 			suggestions := generateSuggestions(userMsg, resp, "none")
 			sendEvent(StreamEvent{Type: "suggestions", Suggestions: suggestions})
+			if cID != "" {
+				ws.mu.Lock()
+				ws.lastExec[cID] = &LastToolExecution{UserMsg: userMsg, ToolName: "none", Response: resp, UsedAgent: false}
+				ws.mu.Unlock()
+			}
 			return resp
 		}
 	}
@@ -4666,22 +5451,47 @@ func (ws *WebServer) dualModelPipeline(ctx context.Context, agent *Agent, userMs
 	// Plan mode: create and execute a multi-step plan
 	if decision.Tool == "plan" {
 		fmt.Printf("[siki] Entering plan mode for: %s\n", userMsg)
-		sendEvent(StreamEvent{Type: "thinking", Content: "複雑なタスクを検出。プランを作成中..."})
 
 		// Always use the user's original message as the goal.
 		// Do NOT use decision.Args["goal"] — the sub-model may inject biased
 		// implementation details (e.g., "via HTML") that constrain createPlan.
 		goal := userMsg
 
-		plan, err := createPlan(goal, agent.messages, ws.config)
+		// Use specialized comic plan for 4コマ漫画 requests
+		var plan *Plan
+		var err error
+		if isComicRequest(userMsg) {
+			sendEvent(modelThinkingEvent("4コマ漫画のシナリオを作成中...", ws.config, hasSubAgent(ws.config)))
+			plan, err = createComicPlan(goal, agent.messages, ws.config)
+			// Retry once on failure (LLM may produce invalid JSON on first try)
+			if err != nil {
+				fmt.Printf("[siki] Comic plan first attempt failed: %v, retrying...\n", err)
+				sendEvent(modelThinkingEvent("シナリオ生成を再試行中...", ws.config, hasSubAgent(ws.config)))
+				plan, err = createComicPlan(goal, agent.messages, ws.config)
+			}
+		} else {
+			sendEvent(modelThinkingEvent("複雑なタスクを検出。プランを作成中...", ws.config, hasSubAgent(ws.config)))
+			plan, err = createPlan(goal, agent.messages, ws.config)
+		}
 		if err != nil {
 			fmt.Printf("[siki] Plan creation failed: %v, falling back to direct execution\n", err)
-			sendEvent(StreamEvent{Type: "thinking", Content: "プラン作成失敗。直接実行します..."})
-			// Fall through to normal tool execution with web_search as fallback
-			decision.Tool = detectToolFromKeywords(userMsg)
-			if decision.Tool == "" {
-				decision.Tool = "web_search"
+			// For comic requests: don't fall back to web_search, return error message
+			// so user knows the comic couldn't be generated
+			if isComicRequest(userMsg) {
+				errMsg := fmt.Sprintf("4コマ漫画のシナリオ生成に失敗しました（%v）。もう一度お試しください。", err)
+				sendEvent(StreamEvent{Type: "content", Content: errMsg})
+				finalMsg := Message{Role: "assistant", Content: errMsg}
+				agent.messages = append(agent.messages, finalMsg)
+				saveMsg(finalMsg, "")
+				return errMsg
 			}
+			sendEvent(modelThinkingEvent("プラン作成失敗。直接実行します...", ws.config, false))
+			// Fall through to normal tool execution with web_search as fallback
+			fallbackTool := detectToolFromKeywords(userMsg)
+			if fallbackTool == "" || fallbackTool == "plan" {
+				fallbackTool = "web_search"
+			}
+			decision.Tool = fallbackTool
 			decision.Args = map[string]interface{}{"query": userMsg}
 		} else {
 			planID := fmt.Sprintf("plan_%d", time.Now().UnixMilli())
@@ -4699,6 +5509,26 @@ func (ws *WebServer) dualModelPipeline(ctx context.Context, agent *Agent, userMs
 			savePlan(plan, planID)
 			result := ws.executePlan(ctx, plan, planID, agent, sendEvent, saveMsg)
 
+			// Goal verification: check if the plan actually fulfilled the user's request
+			goalMet := verifyGoalFulfillment(plan, userMsg)
+			if !goalMet {
+				fmt.Printf("[siki] Goal verification FAILED for: %s\n", userMsg)
+				// Collect failure details
+				var failures []string
+				for _, t := range plan.Tasks {
+					if t.Status == "failed" {
+						failures = append(failures, fmt.Sprintf("タスク%d(%s): %s", t.ID, t.Tool, t.Result))
+					}
+				}
+				failMsg := "⚠️ **一部のタスクが完了できませんでした:**\n"
+				for _, f := range failures {
+					failMsg += "- " + f + "\n"
+				}
+				failMsg += "\nもう一度お試しいただくか、別の表現でリクエストしてください。"
+				sendEvent(StreamEvent{Type: "content", Content: "\n\n" + failMsg})
+				result += "\n\n" + failMsg
+			}
+
 			// Save final result
 			finalMsg := Message{Role: "assistant", Content: result}
 			agent.messages = append(agent.messages, finalMsg)
@@ -4706,6 +5536,11 @@ func (ws *WebServer) dualModelPipeline(ctx context.Context, agent *Agent, userMs
 
 			suggestions := generateSuggestions(userMsg, result, "plan")
 			sendEvent(StreamEvent{Type: "suggestions", Suggestions: suggestions})
+			if cID != "" {
+				ws.mu.Lock()
+				ws.lastExec[cID] = &LastToolExecution{UserMsg: userMsg, ToolName: "plan", Response: result, UsedAgent: hasSubAgent(ws.config)}
+				ws.mu.Unlock()
+			}
 			return result
 		}
 	}
@@ -4739,6 +5574,30 @@ func (ws *WebServer) dualModelPipeline(ctx context.Context, agent *Agent, userMs
 		if _, ok := args["query"]; !ok {
 			args["query"] = userMsg
 		}
+	} else if toolName == "search_threads" || toolName == "search_conversation" || toolName == "recall_context" {
+		if _, ok := args["query"]; !ok {
+			args["query"] = userMsg
+		}
+	} else if strings.HasPrefix(toolName, "self_") {
+		// Self-modification tools: ensure args are populated from orchestrator or default
+		if toolName == "self_modify_prompt" {
+			if _, ok := args["action"]; !ok {
+				args["action"] = "append"
+			}
+			if _, ok := args["reason"]; !ok {
+				args["reason"] = userMsg
+			}
+			if _, ok := args["content"]; !ok {
+				args["content"] = userMsg
+			}
+		} else if toolName == "self_add_rule" {
+			if _, ok := args["rule"]; !ok {
+				args["rule"] = userMsg
+			}
+			if _, ok := args["reason"]; !ok {
+				args["reason"] = "ユーザーリクエスト"
+			}
+		}
 	} else if toolName == "web_fetch" {
 		if _, ok := args["url"]; !ok {
 			// Extract URL from user message
@@ -4768,7 +5627,7 @@ func (ws *WebServer) dualModelPipeline(ctx context.Context, agent *Agent, userMs
 		if prompt == "" {
 			// Auto-enhance user's message to English image prompt via sub-agent
 			if ws.config.SubModel != "" || hasSubAgent(ws.config) {
-				sendEvent(StreamEvent{Type: "thinking", Content: "画像プロンプトを生成中..."})
+				sendEvent(modelThinkingEvent("画像プロンプトを生成中...", ws.config, hasSubAgent(ws.config)))
 				enhanceReq := fmt.Sprintf(`以下のユーザーリクエストから、画像生成AI用の英語プロンプトを生成せよ。
 詳細で描写的な英語プロンプトのみを出力し、他の文章は書くな。
 スタイル指定（digital art, infographic, illustration等）を含めること。
@@ -4785,7 +5644,7 @@ func (ws *WebServer) dualModelPipeline(ctx context.Context, agent *Agent, userMs
 						enhanced = enhanced[1 : len(enhanced)-1]
 					}
 					args["prompt"] = enhanced
-					sendEvent(StreamEvent{Type: "thinking", Content: fmt.Sprintf("Prompt: %s", enhanced)})
+					sendEvent(modelThinkingEvent(fmt.Sprintf("Prompt: %s", enhanced), ws.config, hasSubAgent(ws.config)))
 				} else {
 					args["prompt"] = userMsg
 				}
@@ -4803,7 +5662,7 @@ func (ws *WebServer) dualModelPipeline(ctx context.Context, agent *Agent, userMs
 		}
 		if dotCode == "" || !strings.Contains(dotCode, "graph") {
 			fmt.Printf("[siki] diagram: DOT code missing or invalid, generating via sub-model\n")
-			sendEvent(StreamEvent{Type: "thinking", Content: "図のDOTコードを生成中..."})
+			sendEvent(modelThinkingEvent("図のDOTコードを生成中...", ws.config, false))
 			prompt := fmt.Sprintf(`以下のリクエストに対して、Graphviz DOTコードのみ出力せよ。
 説明不要。コードフェンス不要。digraphまたはgraphで始まるDOTコードだけを出力しろ。
 
@@ -4917,6 +5776,11 @@ digraph G {
 		finalMsg := Message{Role: "assistant", Content: result}
 		agent.messages = append(agent.messages, finalMsg)
 		saveMsg(finalMsg, "")
+		if cID != "" {
+			ws.mu.Lock()
+			ws.lastExec[cID] = &LastToolExecution{UserMsg: userMsg, ToolName: toolName, Args: args, ToolResult: result, Response: result, UsedAgent: false}
+			ws.mu.Unlock()
+		}
 		return result
 	}
 
@@ -4971,7 +5835,7 @@ digraph G {
 	}
 
 	// Phase 3: gpt-oss summarizes tool results (streaming)
-	sendEvent(StreamEvent{Type: "thinking", Content: "回答を生成中..."})
+	sendEvent(modelThinkingEvent("回答を生成中...", ws.config, hasSubAgent(ws.config)))
 
 	finalResponse, err := streamSubModelSummarize(userMsg, toolName, result, ws.config, sendEvent)
 	if err != nil {
@@ -5016,6 +5880,12 @@ digraph G {
 	finalMsg := Message{Role: "assistant", Content: finalResponse}
 	agent.messages = append(agent.messages, finalMsg)
 	saveMsg(finalMsg, "")
+
+	if cID != "" {
+		ws.mu.Lock()
+		ws.lastExec[cID] = &LastToolExecution{UserMsg: userMsg, ToolName: toolName, Args: args, ToolResult: result, Response: finalResponse, UsedAgent: hasSubAgent(ws.config)}
+		ws.mu.Unlock()
+	}
 
 	return finalResponse
 }
@@ -6668,15 +7538,627 @@ func (a *Agent) selfBenchmark(args map[string]interface{}) (string, error) {
 	return sb.String(), nil
 }
 
+// ---- User Profile System ----
+
+// UserProfile stores user interests and preferences learned from conversations.
+type UserProfile struct {
+	Interests     []string  `json:"interests"`
+	Occupation    string    `json:"occupation"`
+	TechLevel     string    `json:"tech_level"`
+	Preferences   []string  `json:"preferences"`
+	FrequentTools []string  `json:"frequent_tools"`
+	LastUpdated   time.Time `json:"last_updated"`
+}
+
+func userProfilePath() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".siki", "user_profile.json")
+}
+
+func loadUserProfile() *UserProfile {
+	data, err := os.ReadFile(userProfilePath())
+	if err != nil {
+		return nil
+	}
+	var p UserProfile
+	if err := json.Unmarshal(data, &p); err != nil {
+		return nil
+	}
+	return &p
+}
+
+func saveUserProfile(p *UserProfile) error {
+	p.LastUpdated = time.Now()
+	data, err := json.MarshalIndent(p, "", "  ")
+	if err != nil {
+		return err
+	}
+	dir := filepath.Dir(userProfilePath())
+	os.MkdirAll(dir, 0755)
+	return os.WriteFile(userProfilePath(), data, 0644)
+}
+
+// mergeProfile merges new profile data into existing, adding new items without duplicates.
+func mergeProfile(existing, incoming *UserProfile) *UserProfile {
+	if existing == nil {
+		return incoming
+	}
+	if incoming == nil {
+		return existing
+	}
+	addUnique := func(base, additions []string) []string {
+		seen := make(map[string]bool)
+		for _, s := range base {
+			seen[s] = true
+		}
+		result := append([]string{}, base...)
+		for _, s := range additions {
+			if !seen[s] && s != "" {
+				result = append(result, s)
+				seen[s] = true
+			}
+		}
+		return result
+	}
+	existing.Interests = addUnique(existing.Interests, incoming.Interests)
+	existing.Preferences = addUnique(existing.Preferences, incoming.Preferences)
+	existing.FrequentTools = addUnique(existing.FrequentTools, incoming.FrequentTools)
+	if incoming.Occupation != "" {
+		existing.Occupation = incoming.Occupation
+	}
+	if incoming.TechLevel != "" {
+		existing.TechLevel = incoming.TechLevel
+	}
+	return existing
+}
+
+func (ws *WebServer) updateUserProfile() {
+	threads, err := listThreads()
+	if err != nil || len(threads) == 0 {
+		return
+	}
+
+	// Collect user messages from last 24h
+	cutoff := time.Now().Add(-24 * time.Hour)
+	var userMsgs strings.Builder
+	msgCount := 0
+	for _, t := range threads {
+		if !t.UpdatedAt.After(cutoff) {
+			continue
+		}
+		thread, err := loadThread(t.ID)
+		if err != nil {
+			continue
+		}
+		for _, m := range thread.Messages {
+			if m.Role == "user" && m.Content != "" {
+				userMsgs.WriteString("- " + truncateString(m.Content, 200) + "\n")
+				msgCount++
+			}
+		}
+	}
+	if msgCount < 3 {
+		return // Not enough data
+	}
+
+	prompt := fmt.Sprintf(`以下のユーザー発言から、ユーザーのプロファイルを分析せよ。
+JSON形式で出力:
+{"interests":["興味1","興味2"],"occupation":"推定職業","tech_level":"beginner|intermediate|advanced|expert","preferences":["傾向1"],"frequent_tools":["よく使うツール"]}
+
+ユーザー発言:
+%s
+
+JSONのみ出力せよ。`, userMsgs.String())
+
+	_, response, err := callSubModel(prompt, ws.config)
+	if err != nil {
+		fmt.Printf("[siki] User profile analysis failed: %v\n", err)
+		return
+	}
+
+	start := strings.Index(response, "{")
+	end := strings.LastIndex(response, "}")
+	if start < 0 || end <= start {
+		return
+	}
+
+	var incoming UserProfile
+	if err := json.Unmarshal([]byte(response[start:end+1]), &incoming); err != nil {
+		fmt.Printf("[siki] User profile parse failed: %v\n", err)
+		return
+	}
+
+	existing := loadUserProfile()
+	merged := mergeProfile(existing, &incoming)
+	if err := saveUserProfile(merged); err != nil {
+		fmt.Printf("[siki] User profile save failed: %v\n", err)
+		return
+	}
+	fmt.Printf("[siki] User profile updated: interests=%v, occupation=%s\n", merged.Interests, merged.Occupation)
+}
+
+// ---- Email Digest System ----
+
+// DigestConfig is the persistable subset of digest/email settings.
+type DigestConfig struct {
+	EmailTo       string `json:"email_to"`
+	EmailFrom     string `json:"email_from"`
+	SMTPHost      string `json:"smtp_host"`
+	SMTPPort      int    `json:"smtp_port"`
+	SMTPUser      string `json:"smtp_user"`
+	SMTPPass      string `json:"smtp_pass"`
+	DigestEnabled bool   `json:"digest_enabled"`
+	DigestHours   []int  `json:"digest_hours"`
+}
+
+func digestConfigPath() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".siki", "digest_config.json")
+}
+
+func loadDigestConfig() *DigestConfig {
+	data, err := os.ReadFile(digestConfigPath())
+	if err != nil {
+		return nil
+	}
+	var dc DigestConfig
+	if err := json.Unmarshal(data, &dc); err != nil {
+		return nil
+	}
+	return &dc
+}
+
+func saveDigestConfig(dc *DigestConfig) error {
+	data, err := json.MarshalIndent(dc, "", "  ")
+	if err != nil {
+		return err
+	}
+	dir := filepath.Dir(digestConfigPath())
+	os.MkdirAll(dir, 0755)
+	return os.WriteFile(digestConfigPath(), data, 0644)
+}
+
+// applyDigestConfig loads saved digest settings into the running config.
+func applyDigestConfig(config *Config) {
+	dc := loadDigestConfig()
+	if dc == nil {
+		return
+	}
+	config.EmailTo = dc.EmailTo
+	config.EmailFrom = dc.EmailFrom
+	config.SMTPHost = dc.SMTPHost
+	config.SMTPPort = dc.SMTPPort
+	config.SMTPUser = dc.SMTPUser
+	config.SMTPPass = dc.SMTPPass
+	config.DigestEnabled = dc.DigestEnabled
+	config.DigestHours = dc.DigestHours
+}
+
+func (ws *WebServer) digestLoop() {
+	ticker := time.NewTicker(10 * time.Minute)
+	defer ticker.Stop()
+	var lastSentHour int = -1
+	for range ticker.C {
+		if !ws.config.DigestEnabled || ws.config.EmailTo == "" {
+			continue
+		}
+		now := time.Now()
+		hour := now.Hour()
+		digestHours := ws.config.DigestHours
+		if len(digestHours) == 0 {
+			digestHours = []int{9, 18}
+		}
+		shouldSend := false
+		for _, h := range digestHours {
+			if hour == h && lastSentHour != hour {
+				shouldSend = true
+				break
+			}
+		}
+		if !shouldSend {
+			continue
+		}
+		lastSentHour = hour
+		ws.sendDigestEmail()
+	}
+}
+
+func (ws *WebServer) sendDigestEmail() {
+	fmt.Println("[siki] Digest: starting...")
+
+	// 1. Load user profile for interests
+	profile := loadUserProfile()
+	var interests []string
+	if profile != nil && len(profile.Interests) > 0 {
+		interests = profile.Interests
+	} else {
+		interests = []string{"AI", "テクノロジー", "プログラミング"}
+	}
+	fmt.Printf("[siki] Digest: interests=%v\n", interests)
+
+	// 2. Generate search queries from interests (with current date for freshness)
+	now := time.Now()
+	dateStr := fmt.Sprintf("%d年%d月", now.Year(), int(now.Month()))
+	fmt.Println("[siki] Digest: generating search queries...")
+	queryPrompt := fmt.Sprintf(`以下のユーザーの興味分野に基づいて、%sの最新ニュース検索クエリを3個生成せよ。
+各クエリには必ず「%s」を含めること。具体的で検索に適した形式にすること。
+
+興味分野: %s
+
+JSON配列のみ出力: ["クエリ1","クエリ2","クエリ3"]`, dateStr, dateStr, strings.Join(interests, ", "))
+
+	_, queryResp, err := callSubModel(queryPrompt, ws.config)
+	if err != nil {
+		fmt.Printf("[siki] Digest: query generation failed: %v\n", err)
+		return
+	}
+	fmt.Printf("[siki] Digest: LLM response: %s\n", truncateString(queryResp, 200))
+
+	start := strings.Index(queryResp, "[")
+	end := strings.LastIndex(queryResp, "]")
+	if start < 0 || end <= start {
+		fmt.Printf("[siki] Digest: failed to parse queries from: %s\n", truncateString(queryResp, 200))
+		return
+	}
+	var queries []string
+	if err := json.Unmarshal([]byte(queryResp[start:end+1]), &queries); err != nil {
+		fmt.Printf("[siki] Digest: query parse failed: %v\n", err)
+		return
+	}
+	if len(queries) > 3 {
+		queries = queries[:3]
+	}
+	fmt.Printf("[siki] Digest: queries=%v\n", queries)
+
+	// 3. Execute web searches (with per-query timeout)
+	tempAgent := &Agent{config: ws.config}
+	var allResults strings.Builder
+	for i, q := range queries {
+		fmt.Printf("[siki] Digest: searching %d/%d: %s\n", i+1, len(queries), q)
+		done := make(chan struct{})
+		var result string
+		var searchErr error
+		go func() {
+			result, searchErr = tempAgent.webSearch(q)
+			close(done)
+		}()
+		select {
+		case <-done:
+			if searchErr != nil {
+				fmt.Printf("[siki] Digest: search failed for '%s': %v\n", q, searchErr)
+				continue
+			}
+			allResults.WriteString(fmt.Sprintf("## 検索: %s\n%s\n\n", q, truncateString(result, 2000)))
+		case <-time.After(30 * time.Second):
+			fmt.Printf("[siki] Digest: search timeout for '%s'\n", q)
+		}
+	}
+
+	if allResults.Len() == 0 {
+		fmt.Println("[siki] Digest: no search results, aborting")
+		return
+	}
+	fmt.Printf("[siki] Digest: collected %d bytes of search results\n", allResults.Len())
+
+	// 4. Freshness verification — filter out stale information
+	fmt.Println("[siki] Digest: verifying freshness of results...")
+	freshnessPrompt := fmt.Sprintf(`今日は%s%d日です。
+以下の検索結果から、%s以降の新しい情報のみを抽出せよ。
+2024年以前の古い情報、日付が不明で古そうな情報は全て除外せよ。
+
+検索結果:
+%s
+
+新しい情報のみ残して、同じフォーマットで出力せよ。古い情報しかない場合は「なし」と出力せよ。`,
+		dateStr, now.Day(), dateStr, truncateString(allResults.String(), 6000))
+
+	_, freshResults, err := callSubModel(freshnessPrompt, ws.config)
+	if err != nil {
+		fmt.Printf("[siki] Digest: freshness check failed: %v, using raw results\n", err)
+		freshResults = allResults.String()
+	}
+	if strings.TrimSpace(freshResults) == "なし" || len(strings.TrimSpace(freshResults)) < 50 {
+		fmt.Println("[siki] Digest: no fresh information found, aborting")
+		return
+	}
+	fmt.Printf("[siki] Digest: fresh results: %d bytes\n", len(freshResults))
+
+	// 5. Summarize with LLM
+	fmt.Println("[siki] Digest: summarizing results...")
+	summaryPrompt := fmt.Sprintf(`今日は%s%d日です。以下の検索結果をもとに、ユーザーにとって有益な最新情報を選んでダイジェストにまとめよ。
+古い情報（%d年以前）は絶対に含めるな。
+HTMLメール本文として出力せよ（<html>タグ不要、本文のみ）。
+見出し（<h2>）、段落（<p>）、リンク（<a href>）を使って読みやすくすること。
+各項目に日付を明記すること。
+
+検索結果:
+%s
+
+HTML本文のみ出力せよ。`, dateStr, now.Day(), now.Year(), truncateString(freshResults, 6000))
+
+	_, htmlBody, err := callSubModel(summaryPrompt, ws.config)
+	if err != nil {
+		fmt.Printf("[siki] Digest: summary failed: %v\n", err)
+		return
+	}
+	fmt.Printf("[siki] Digest: summary generated (%d bytes)\n", len(htmlBody))
+
+	// 6. Send email
+	subject := fmt.Sprintf("siki ダイジェスト — %s", now.Format("2006/01/02 15:00"))
+	fmt.Printf("[siki] Digest: sending email to %s...\n", ws.config.EmailTo)
+	if err := sendEmail(ws.config, subject, htmlBody); err != nil {
+		fmt.Printf("[siki] Digest: email send failed: %v\n", err)
+		return
+	}
+	fmt.Printf("[siki] Digest: email sent to %s\n", ws.config.EmailTo)
+
+	// 7. Save digest as a thread
+	digestThreadID := fmt.Sprintf("digest-%d", now.Unix())
+	digestMsg := Message{Role: "assistant", Content: fmt.Sprintf("# %s\n\n%s", subject, htmlBody)}
+	appendMessageToThread(digestThreadID, digestMsg, "")
+	saveThreadMeta(&Thread{ID: digestThreadID, Title: subject, CreatedAt: now, UpdatedAt: now, MessageCount: 1})
+}
+
+func sendEmail(config *Config, subject, htmlBody string) error {
+	from := config.EmailFrom
+	if from == "" {
+		from = config.SMTPUser
+	}
+	if from == "" {
+		from = "siki@localhost"
+	}
+	host := config.SMTPHost
+	if host == "" {
+		host = "smtp.gmail.com"
+	}
+	port := config.SMTPPort
+	if port == 0 {
+		port = 587
+	}
+
+	msg := fmt.Sprintf("From: %s\r\nTo: %s\r\nSubject: =?UTF-8?B?%s?=\r\nMIME-Version: 1.0\r\nContent-Type: text/html; charset=UTF-8\r\n\r\n%s",
+		from, config.EmailTo, base64.StdEncoding.EncodeToString([]byte(subject)), htmlBody)
+
+	addr := fmt.Sprintf("%s:%d", host, port)
+
+	conn, err := net.DialTimeout("tcp", addr, 10*time.Second)
+	if err != nil {
+		return fmt.Errorf("SMTP connect failed: %w", err)
+	}
+
+	c, err := smtp.NewClient(conn, host)
+	if err != nil {
+		conn.Close()
+		return fmt.Errorf("SMTP client failed: %w", err)
+	}
+	defer c.Close()
+
+	tlsConfig := &tls.Config{ServerName: host}
+	if err = c.StartTLS(tlsConfig); err != nil {
+		return fmt.Errorf("STARTTLS failed: %w", err)
+	}
+
+	if config.SMTPUser != "" {
+		auth := smtp.PlainAuth("", config.SMTPUser, config.SMTPPass, host)
+		if err = c.Auth(auth); err != nil {
+			return fmt.Errorf("SMTP auth failed: %w", err)
+		}
+	}
+
+	if err = c.Mail(from); err != nil {
+		return fmt.Errorf("SMTP MAIL FROM failed: %w", err)
+	}
+	if err = c.Rcpt(config.EmailTo); err != nil {
+		return fmt.Errorf("SMTP RCPT TO failed: %w", err)
+	}
+	w, err := c.Data()
+	if err != nil {
+		return fmt.Errorf("SMTP DATA failed: %w", err)
+	}
+	_, err = w.Write([]byte(msg))
+	if err != nil {
+		return fmt.Errorf("SMTP write failed: %w", err)
+	}
+	return w.Close()
+}
+
+// formatDigestEmailBody wraps raw HTML content into a complete email HTML document.
+func formatDigestEmailBody(subject, body string) string {
+	return fmt.Sprintf(`<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"><title>%s</title></head>
+<body style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+<h1 style="color: #6f42c1; border-bottom: 2px solid #6f42c1; padding-bottom: 10px;">%s</h1>
+%s
+<hr style="margin-top: 30px; border: 1px solid #eee;">
+<p style="color: #999; font-size: 12px;">Generated by siki (式神)</p>
+</body>
+</html>`, subject, subject, body)
+}
+
 // ---- Self-Improvement Loop ----
 
+// tryPromptImprovement autonomously attempts to improve the system prompt
+// and evaluates response quality before/after with a test question.
+func (ws *WebServer) tryPromptImprovement() {
+	// Only attempt every ~3 cycles (randomized)
+	if rand.Intn(3) != 0 {
+		return
+	}
+
+	fmt.Println("[siki] Auto-improvement: evaluating system prompt...")
+
+	// 1. Get current prompt
+	selfMu.RLock()
+	currentPrompt := ""
+	if currentSelf != nil && currentSelf.Prompt != "" {
+		currentPrompt = currentSelf.Prompt
+	} else {
+		currentPrompt = ws.config.SystemPrompt
+	}
+	version := 0
+	if currentSelf != nil {
+		version = currentSelf.Version
+	}
+	selfMu.RUnlock()
+
+	if len(currentPrompt) < 50 {
+		return
+	}
+
+	// 2. Collect recent user dissatisfaction patterns
+	threads, err := listThreads()
+	if err != nil {
+		return
+	}
+	cutoff := time.Now().Add(-24 * time.Hour)
+	var issues strings.Builder
+	for _, t := range threads {
+		if !t.UpdatedAt.After(cutoff) {
+			continue
+		}
+		thread, err := loadThread(t.ID)
+		if err != nil {
+			continue
+		}
+		for _, m := range thread.Messages {
+			if m.Role == "user" {
+				lower := strings.ToLower(m.Content)
+				if strings.Contains(lower, "違う") || strings.Contains(lower, "ダメ") ||
+					strings.Contains(lower, "できてない") || strings.Contains(lower, "間違") ||
+					strings.Contains(lower, "もういい") || strings.Contains(lower, "使えない") {
+					issues.WriteString("- " + truncateString(m.Content, 100) + "\n")
+				}
+			}
+		}
+	}
+
+	// 3. Ask LLM to suggest prompt improvements
+	improvementPrompt := fmt.Sprintf(`あなたはAIシステムの改良エンジニアです。
+以下の現在のシステムプロンプト（一部）を分析し、改善案を提案せよ。
+
+## 現在のプロンプト（先頭1000文字）:
+%s
+
+## ユーザーからの不満（最近24時間）:
+%s
+
+## タスク
+1. プロンプトの問題点を1〜2個指摘
+2. 改善内容をappendする短いテキスト（200文字以内）を提案
+3. 改善不要なら空文字
+
+以下のJSON形式で出力:
+{"needs_change": true/false, "append_text": "追加するテキスト", "reason": "理由"}`,
+		truncateString(currentPrompt, 1000),
+		issues.String())
+
+	_, resp, err := callSubModel(improvementPrompt, ws.config)
+	if err != nil {
+		fmt.Printf("[siki] Auto-improvement: LLM failed: %v\n", err)
+		return
+	}
+
+	start := strings.Index(resp, "{")
+	end := strings.LastIndex(resp, "}")
+	if start < 0 || end <= start {
+		return
+	}
+
+	var suggestion struct {
+		NeedsChange bool   `json:"needs_change"`
+		AppendText  string `json:"append_text"`
+		Reason      string `json:"reason"`
+	}
+	if err := json.Unmarshal([]byte(resp[start:end+1]), &suggestion); err != nil {
+		return
+	}
+
+	if !suggestion.NeedsChange || suggestion.AppendText == "" {
+		fmt.Println("[siki] Auto-improvement: no changes needed")
+		return
+	}
+
+	// 4. Test the improvement with a sample question
+	testQuestion := "最新のAIニュースを教えて"
+	fmt.Printf("[siki] Auto-improvement: testing proposed change: %s\n", truncateString(suggestion.Reason, 100))
+
+	// Before: generate response with current prompt
+	beforePrompt := fmt.Sprintf("%s\n\nユーザー: %s\n短く回答せよ（100文字以内）。", currentPrompt, testQuestion)
+	_, beforeResp, err := callSubModel(beforePrompt, ws.config)
+	if err != nil {
+		return
+	}
+
+	// After: generate response with improved prompt
+	newPrompt := currentPrompt + "\n" + suggestion.AppendText
+	afterPrompt := fmt.Sprintf("%s\n\nユーザー: %s\n短く回答せよ（100文字以内）。", newPrompt, testQuestion)
+	_, afterResp, err := callSubModel(afterPrompt, ws.config)
+	if err != nil {
+		return
+	}
+
+	// 5. Judge which is better
+	judgePrompt := fmt.Sprintf(`2つのAI応答を比較し、どちらが良いか判定せよ。
+
+質問: %s
+
+回答A（変更前）: %s
+回答B（変更後）: %s
+
+JSON形式で出力: {"winner": "A" or "B", "reason": "理由"}`, testQuestion,
+		truncateString(beforeResp, 300), truncateString(afterResp, 300))
+
+	_, judgeResp, err := callSubModel(judgePrompt, ws.config)
+	if err != nil {
+		return
+	}
+
+	jStart := strings.Index(judgeResp, "{")
+	jEnd := strings.LastIndex(judgeResp, "}")
+	if jStart < 0 || jEnd <= jStart {
+		return
+	}
+	var judgment struct {
+		Winner string `json:"winner"`
+		Reason string `json:"reason"`
+	}
+	if err := json.Unmarshal([]byte(judgeResp[jStart:jEnd+1]), &judgment); err != nil {
+		return
+	}
+
+	if judgment.Winner != "B" {
+		fmt.Printf("[siki] Auto-improvement: proposed change did not improve quality (winner=%s), skipping\n", judgment.Winner)
+		return
+	}
+
+	// 6. Apply the improvement
+	fmt.Printf("[siki] Auto-improvement: applying improvement (v%d → v%d): %s\n", version, version+1, suggestion.Reason)
+	selfMu.Lock()
+	if currentSelf == nil {
+		selfMu.Unlock()
+		return
+	}
+	// Snapshot before modification
+	createSnapshot(currentSelf, "auto-improvement: "+suggestion.Reason)
+	currentSelf.Version++
+	if currentSelf.Prompt == "" {
+		currentSelf.Prompt = ws.config.SystemPrompt
+	}
+	currentSelf.Prompt += "\n" + suggestion.AppendText
+	saveSelfState(currentSelf)
+	selfMu.Unlock()
+
+	fmt.Printf("[siki] Auto-improvement: system prompt updated to v%d. Reason: %s\n", currentSelf.Version, suggestion.Reason)
+}
+
 func (ws *WebServer) selfImproveLoop() {
-	ticker := time.NewTicker(5 * time.Minute)
+	ticker := time.NewTicker(3 * time.Minute)
 	defer ticker.Stop()
 
 	for range ticker.C {
 		ws.mu.RLock()
-		idle := time.Since(ws.lastActivity) > 5*time.Minute
+		idle := time.Since(ws.lastActivity) > 3*time.Minute
 		ws.mu.RUnlock()
 
 		if !idle {
@@ -6689,6 +8171,10 @@ func (ws *WebServer) selfImproveLoop() {
 
 		fmt.Println("[siki] Self-improvement loop: analyzing recent conversations...")
 		ws.runSelfImprovement()
+		ws.updateUserProfile()
+		ws.tryPromptImprovement()
+		ws.runAutonomousThinking()
+		ws.runProactiveExecution()
 		ws.improveMu.Unlock()
 	}
 }
@@ -6789,6 +8275,500 @@ If no improvements needed: []`, threadSummaries.String(), version, lastBench*100
 	}
 
 	fmt.Println("[siki] Self-improvement cycle complete")
+}
+
+// ---- Autonomous Idle Thinking ----
+
+// broadcastIdleEvent sends an event to all connected idle SSE clients (non-blocking).
+func (ws *WebServer) broadcastIdleEvent(event StreamEvent) {
+	ws.idleClientMu.Lock()
+	defer ws.idleClientMu.Unlock()
+	for ch := range ws.idleClients {
+		select {
+		case ch <- event:
+		default: // skip slow clients
+		}
+	}
+}
+
+// handleIdleStream is an SSE endpoint for idle thinking events.
+func (ws *WebServer) handleIdleStream(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "Streaming not supported", http.StatusInternalServerError)
+		return
+	}
+
+	ch := make(chan StreamEvent, 16)
+	ws.idleClientMu.Lock()
+	ws.idleClients[ch] = true
+	ws.idleClientMu.Unlock()
+
+	defer func() {
+		ws.idleClientMu.Lock()
+		delete(ws.idleClients, ch)
+		ws.idleClientMu.Unlock()
+	}()
+
+	ctx := r.Context()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case event := <-ch:
+			data, _ := json.Marshal(event)
+			fmt.Fprintf(w, "data: %s\n\n", data)
+			flusher.Flush()
+		}
+	}
+}
+
+// autonomousTasks defines the pool of idle thinking tasks.
+var autonomousTasks = []struct {
+	Name       string
+	PromptFunc func(summary string) string
+}{
+	{
+		Name: "ユーザー分析",
+		PromptFunc: func(summary string) string {
+			return fmt.Sprintf(`以下の会話履歴を分析し、ユーザーの特徴を簡潔にまとめてください。
+- 職業・技術レベルの推定
+- 主な興味・関心分野
+- コミュニケーションスタイルの特徴
+
+会話サマリ:
+%s
+
+日本語で3-5行で回答してください。`, summary)
+		},
+	},
+	{
+		Name: "ニーズ予測",
+		PromptFunc: func(summary string) string {
+			return fmt.Sprintf(`以下の会話履歴から、ユーザーが次に求めそうなことを予測してください。
+- 直近の会話の流れから推測される次のアクション
+- まだ解決されていない潜在的な課題
+- 提案できそうなこと
+
+会話サマリ:
+%s
+
+日本語で3-5行で回答してください。`, summary)
+		},
+	},
+	{
+		Name: "興味分野リサーチ",
+		PromptFunc: func(summary string) string {
+			return fmt.Sprintf(`以下の会話履歴からユーザーの興味分野を特定し、関連する有用な情報や最新トレンドを調べてください。
+
+会話サマリ:
+%s
+
+ユーザーに役立ちそうな情報を日本語で3-5行で提供してください。`, summary)
+		},
+	},
+	{
+		Name: "会話パターン分析",
+		PromptFunc: func(summary string) string {
+			return fmt.Sprintf(`以下の会話履歴を分析し、パターンを見つけてください。
+- よく使われるツールや機能
+- 繰り返し出てくる質問やテーマ
+- 改善提案
+
+会話サマリ:
+%s
+
+日本語で3-5行で回答してください。`, summary)
+		},
+	},
+}
+
+const idleThreadTitle = "sikiの思考ログ"
+const idleThreadIDPrefix = "idle-thoughts-"
+
+// getOrCreateIdleThread returns the thread ID for the dedicated idle thoughts thread.
+// Creates the thread if it doesn't exist.
+func getOrCreateIdleThread() string {
+	if err := initThreadDir(); err != nil {
+		return ""
+	}
+
+	// Look for existing idle thread
+	threads, err := listThreads()
+	if err == nil {
+		for _, t := range threads {
+			if strings.HasPrefix(t.ID, idleThreadIDPrefix) {
+				return t.ID
+			}
+		}
+	}
+
+	// Create new idle thread
+	id := idleThreadIDPrefix + fmt.Sprintf("%d", time.Now().UnixMilli())
+	t := &Thread{
+		ID:        id,
+		Title:     idleThreadTitle,
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+	}
+	if err := saveThreadMeta(t); err != nil {
+		fmt.Printf("[siki] Failed to create idle thread: %v\n", err)
+		return ""
+	}
+	fmt.Printf("[siki] Created idle thoughts thread: %s\n", id)
+	return id
+}
+
+// runAutonomousThinking executes one idle thinking task and broadcasts results.
+func (ws *WebServer) runAutonomousThinking() {
+	// Skip if no one is watching
+	ws.idleClientMu.Lock()
+	clientCount := len(ws.idleClients)
+	ws.idleClientMu.Unlock()
+	if clientCount == 0 {
+		return
+	}
+
+	// Gather recent conversation summaries (last 24h)
+	threads, err := listThreads()
+	if err != nil || len(threads) == 0 {
+		return
+	}
+	cutoff := time.Now().Add(-24 * time.Hour)
+	var summaryBuilder strings.Builder
+	for _, t := range threads {
+		if t.UpdatedAt.After(cutoff) {
+			summaryBuilder.WriteString(fmt.Sprintf("- '%s' (%d messages)\n", t.Title, t.MessageCount))
+		}
+	}
+	summary := summaryBuilder.String()
+	if summary == "" {
+		return
+	}
+
+	// Pick a random task (different from last one)
+	var task struct {
+		Name       string
+		PromptFunc func(string) string
+	}
+	for attempts := 0; attempts < 10; attempts++ {
+		idx := rand.Intn(len(autonomousTasks))
+		candidate := autonomousTasks[idx]
+		if candidate.Name != ws.lastIdleTask || len(autonomousTasks) == 1 {
+			task = candidate
+			break
+		}
+	}
+	if task.Name == "" {
+		task = autonomousTasks[0]
+	}
+	ws.lastIdleTask = task.Name
+
+	// Create cancellable context
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	ws.mu.Lock()
+	ws.idleCancel = cancel
+	ws.mu.Unlock()
+	defer func() {
+		cancel()
+		ws.mu.Lock()
+		ws.idleCancel = nil
+		ws.mu.Unlock()
+	}()
+
+	model := ws.config.SubModel
+	if model == "" {
+		model = ws.config.ModelName
+	}
+
+	fmt.Printf("[siki] Autonomous thinking: starting '%s' with model %s\n", task.Name, model)
+	ws.broadcastIdleEvent(StreamEvent{Type: "idle_start", Content: task.Name, Model: model})
+
+	// Build prompt and call LLM with context
+	prompt := task.PromptFunc(summary)
+	result, err := callOllamaGenerateWithCtx(ctx, model, prompt, 1024, 2*time.Minute, ws.config)
+	if err != nil {
+		if ctx.Err() != nil {
+			fmt.Printf("[siki] Autonomous thinking: '%s' interrupted\n", task.Name)
+			ws.broadcastIdleEvent(StreamEvent{Type: "idle_interrupted"})
+			return
+		}
+		fmt.Printf("[siki] Autonomous thinking: '%s' failed: %v\n", task.Name, err)
+		return
+	}
+
+	fmt.Printf("[siki] Autonomous thinking: '%s' complete (%d bytes)\n", task.Name, len(result))
+	ws.broadcastIdleEvent(StreamEvent{Type: "idle_result", Content: result, Name: task.Name})
+
+	// Save result to the dedicated idle thoughts thread
+	idleThreadID := getOrCreateIdleThread()
+	if idleThreadID != "" {
+		appendToLog(idleThreadID, ThreadMessage{
+			Role:      "assistant",
+			Content:   fmt.Sprintf("【自律思考: %s】\n%s", task.Name, result),
+			Timestamp: time.Now().Unix(),
+		})
+		// Update thread metadata
+		metaPath := filepath.Join(threadDir, idleThreadID+".json")
+		var thread Thread
+		if data, err := os.ReadFile(metaPath); err == nil {
+			json.Unmarshal(data, &thread)
+		}
+		thread.MessageCount++
+		thread.UpdatedAt = time.Now()
+		saveThreadMeta(&thread)
+		fmt.Printf("[siki] Autonomous thinking: saved to idle thread %s\n", idleThreadID)
+	}
+}
+
+// callOllamaGenerateWithCtx is like callOllamaGenerate but accepts a context for cancellation.
+func callOllamaGenerateWithCtx(ctx context.Context, model, prompt string, maxTokens int, timeout time.Duration, config *Config) (string, error) {
+	endpoint := subModelEndpoint(config)
+
+	if isSubModelVLLM(config) {
+		// For vllm, use OpenAI-compatible API with context
+		reqBody := map[string]interface{}{
+			"model":      model,
+			"prompt":     prompt,
+			"max_tokens": maxTokens,
+		}
+		body, err := json.Marshal(reqBody)
+		if err != nil {
+			return "", fmt.Errorf("marshal error: %w", err)
+		}
+		req, err := http.NewRequestWithContext(ctx, "POST", endpoint+"/v1/completions", bytes.NewReader(body))
+		if err != nil {
+			return "", fmt.Errorf("create request error: %w", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		client := &http.Client{Timeout: timeout}
+		resp, err := client.Do(req)
+		if err != nil {
+			return "", fmt.Errorf("request error: %w", err)
+		}
+		defer resp.Body.Close()
+		var result struct {
+			Choices []struct {
+				Text string `json:"text"`
+			} `json:"choices"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			return "", fmt.Errorf("decode error: %w", err)
+		}
+		if len(result.Choices) > 0 {
+			return strings.TrimSpace(result.Choices[0].Text), nil
+		}
+		return "", fmt.Errorf("no choices returned")
+	}
+
+	// Ollama native API with context
+	reqBody := map[string]interface{}{
+		"model":      model,
+		"prompt":     prompt,
+		"stream":     false,
+		"keep_alive": -1,
+		"options": map[string]interface{}{
+			"num_predict": maxTokens,
+		},
+	}
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", fmt.Errorf("marshal error: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, "POST", endpoint+"/api/generate", bytes.NewReader(body))
+	if err != nil {
+		return "", fmt.Errorf("create request error: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	client := &http.Client{Timeout: timeout}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("generate request error: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var genResp struct {
+		Response string `json:"response"`
+		Thinking string `json:"thinking"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&genResp); err != nil {
+		return "", fmt.Errorf("decode error: %w", err)
+	}
+
+	content := genResp.Response
+	if content == "" && genResp.Thinking != "" {
+		content = genResp.Thinking
+	}
+	// Strip inline <think> tags
+	if idx := strings.Index(content, "</think>"); idx >= 0 {
+		content = strings.TrimSpace(content[idx+len("</think>"):])
+	}
+	return content, nil
+}
+
+// ---- Proactive Execution (predict and pre-execute user's next request) ----
+
+const proactiveThreadIDPrefix = "proactive-"
+
+// runProactiveExecution predicts what the user might ask next and executes it in a new thread.
+func (ws *WebServer) runProactiveExecution() {
+	// Check if still idle
+	ws.mu.RLock()
+	idle := time.Since(ws.lastActivity) > 3*time.Minute
+	ws.mu.RUnlock()
+	if !idle {
+		return
+	}
+
+	// Gather recent conversation summaries
+	threads, err := listThreads()
+	if err != nil || len(threads) == 0 {
+		return
+	}
+
+	// Skip if we already have a recent proactive thread (avoid spam)
+	for _, t := range threads {
+		if t.Proactive && t.Unread && time.Since(t.UpdatedAt) < 30*time.Minute {
+			return // already have a recent unread proactive thread
+		}
+	}
+
+	cutoff := time.Now().Add(-24 * time.Hour)
+	var summaryBuilder strings.Builder
+	for _, t := range threads {
+		if t.UpdatedAt.After(cutoff) && !strings.HasPrefix(t.ID, idleThreadIDPrefix) && !strings.HasPrefix(t.ID, proactiveThreadIDPrefix) {
+			summaryBuilder.WriteString(fmt.Sprintf("- '%s' (%d messages)\n", t.Title, t.MessageCount))
+		}
+	}
+	summary := summaryBuilder.String()
+	if summary == "" {
+		return
+	}
+
+	// Create cancellable context
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	ws.mu.Lock()
+	ws.idleCancel = cancel
+	ws.mu.Unlock()
+	defer func() {
+		cancel()
+		ws.mu.Lock()
+		ws.idleCancel = nil
+		ws.mu.Unlock()
+	}()
+
+	model := ws.config.SubModel
+	if model == "" {
+		model = ws.config.ModelName
+	}
+
+	// Step 1: Predict what the user might ask next
+	predictPrompt := fmt.Sprintf(`あなたはユーザーの行動を予測するAIです。以下の会話履歴から、ユーザーが次に聞きそうな質問やリクエストを1つだけ予測してください。
+
+## 最近の会話:
+%s
+
+## ルール:
+- ユーザーの興味・関心に基づいて、自然な次のリクエストを予測すること
+- 具体的で実行可能な質問/リクエストにすること
+- 回答は予測される質問/リクエストのみを出力すること（説明不要）
+- 日本語で回答すること`, summary)
+
+	fmt.Printf("[siki] Proactive: predicting next user request...\n")
+	ws.broadcastIdleEvent(StreamEvent{Type: "idle_start", Content: "次のリクエストを予測中...", Model: model})
+
+	predictedTask, err := callOllamaGenerateWithCtx(ctx, model, predictPrompt, 256, 2*time.Minute, ws.config)
+	if err != nil {
+		if ctx.Err() != nil {
+			ws.broadcastIdleEvent(StreamEvent{Type: "idle_interrupted"})
+		}
+		fmt.Printf("[siki] Proactive: prediction failed: %v\n", err)
+		return
+	}
+	predictedTask = strings.TrimSpace(predictedTask)
+	if predictedTask == "" || len(predictedTask) < 5 {
+		return
+	}
+
+	fmt.Printf("[siki] Proactive: predicted task: %s\n", predictedTask)
+
+	// Check if still idle before executing
+	ws.mu.RLock()
+	idle = time.Since(ws.lastActivity) > 3*time.Minute
+	ws.mu.RUnlock()
+	if !idle {
+		ws.broadcastIdleEvent(StreamEvent{Type: "idle_interrupted"})
+		return
+	}
+
+	// Step 2: Execute the predicted task
+	ws.broadcastIdleEvent(StreamEvent{Type: "idle_start", Content: fmt.Sprintf("先行実行: %s", predictedTask), Model: model})
+
+	executePrompt := fmt.Sprintf(`以下のユーザーのリクエストに対して、詳しく回答してください。
+
+リクエスト: %s
+
+## 注意:
+- 詳しく有用な回答を提供すること
+- 日本語で回答すること
+- 具体的な情報や例を含めること`, predictedTask)
+
+	result, err := callOllamaGenerateWithCtx(ctx, model, executePrompt, 2048, 3*time.Minute, ws.config)
+	if err != nil {
+		if ctx.Err() != nil {
+			ws.broadcastIdleEvent(StreamEvent{Type: "idle_interrupted"})
+		}
+		fmt.Printf("[siki] Proactive: execution failed: %v\n", err)
+		return
+	}
+	result = strings.TrimSpace(result)
+	if result == "" {
+		return
+	}
+
+	// Step 3: Create a new thread with the result
+	threadID := proactiveThreadIDPrefix + fmt.Sprintf("%d", time.Now().UnixMilli())
+	title := predictedTask
+	if len(title) > 50 {
+		title = title[:50] + "..."
+	}
+	t := &Thread{
+		ID:        threadID,
+		Title:     "💡 " + title,
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+		Unread:    true,
+		Proactive: true,
+	}
+	if err := saveThreadMeta(t); err != nil {
+		fmt.Printf("[siki] Proactive: failed to create thread: %v\n", err)
+		return
+	}
+
+	// Save the predicted question as user message and result as assistant message
+	appendToLog(threadID, ThreadMessage{
+		Role:      "user",
+		Content:   predictedTask,
+		Timestamp: time.Now().Unix(),
+	})
+	appendToLog(threadID, ThreadMessage{
+		Role:      "assistant",
+		Content:   result,
+		Timestamp: time.Now().Unix(),
+	})
+	t.MessageCount = 2
+	saveThreadMeta(t)
+
+	fmt.Printf("[siki] Proactive: created thread '%s' with result (%d bytes)\n", threadID, len(result))
+	ws.broadcastIdleEvent(StreamEvent{Type: "idle_result", Content: fmt.Sprintf("先行実行完了: %s", title), Name: "proactive"})
+
+	// Notify idle clients about new unread thread
+	ws.broadcastIdleEvent(StreamEvent{Type: "new_thread", Content: threadID, Name: t.Title})
 }
 
 // ============================================================================
@@ -7773,6 +9753,8 @@ type Thread struct {
 	Messages     []ThreadMessage `json:"messages,omitempty"` // omitempty: metadata JSON has no messages
 	MessageCount int             `json:"message_count,omitempty"`
 	Summary      string          `json:"summary,omitempty"`
+	Unread       bool            `json:"unread,omitempty"`    // true if user hasn't viewed this thread
+	Proactive    bool            `json:"proactive,omitempty"` // true if auto-created by siki
 }
 
 type ThreadMessage struct {
@@ -7785,6 +9767,8 @@ type ThreadMessage struct {
 	ToolName   string     `json:"tool_name,omitempty"`
 	Summarized bool       `json:"summarized,omitempty"`
 	Timestamp  int64      `json:"timestamp"`
+	EventType  string     `json:"event_type,omitempty"` // display-only: "thinking", "tool_start", "plan_progress", "suggestions"
+	Model      string     `json:"model,omitempty"`      // model name for thinking events
 }
 
 type ThreadListItem struct {
@@ -7794,6 +9778,8 @@ type ThreadListItem struct {
 	UpdatedAt    time.Time `json:"updated_at"`
 	MessageCount int       `json:"message_count"`
 	Summary      string    `json:"summary,omitempty"`
+	Unread       bool      `json:"unread,omitempty"`
+	Proactive    bool      `json:"proactive,omitempty"`
 }
 
 func initThreadDir() error {
@@ -7821,6 +9807,8 @@ func saveThreadMeta(t *Thread) error {
 		UpdatedAt:    t.UpdatedAt,
 		MessageCount: t.MessageCount,
 		Summary:      t.Summary,
+		Unread:       t.Unread,
+		Proactive:    t.Proactive,
 	}
 	data, err := json.MarshalIndent(meta, "", "  ")
 	if err != nil {
@@ -7988,6 +9976,8 @@ func listThreads() ([]ThreadListItem, error) {
 					UpdatedAt:    t.UpdatedAt,
 					MessageCount: t.MessageCount,
 					Summary:      t.Summary,
+					Unread:       t.Unread,
+					Proactive:    t.Proactive,
 				})
 			}
 			continue
@@ -8008,6 +9998,8 @@ func listThreads() ([]ThreadListItem, error) {
 			UpdatedAt:    t.UpdatedAt,
 			MessageCount: t.MessageCount,
 			Summary:      t.Summary,
+			Unread:       t.Unread,
+			Proactive:    t.Proactive,
 		})
 	}
 	return items, nil
@@ -8970,7 +10962,18 @@ func (a *Agent) searchAllThreads(query string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+
+	// Extract keywords from query (split by spaces, filter short words)
 	queryLower := strings.ToLower(query)
+	words := strings.Fields(queryLower)
+	var keywords []string
+	for _, w := range words {
+		// Skip common particles and short words
+		if len(w) >= 3 && w != "して" && w != "ください" && w != "について" && w != "から" && w != "ので" && w != "です" && w != "ます" {
+			keywords = append(keywords, w)
+		}
+	}
+
 	var results []string
 	for _, item := range items {
 		thread, err := loadThread(item.ID)
@@ -8980,18 +10983,60 @@ func (a *Agent) searchAllThreads(query string) (string, error) {
 		matchCount := 0
 		var lastMatch string
 		for _, m := range thread.Messages {
-			if strings.Contains(strings.ToLower(m.Content), queryLower) {
-				matchCount++
-				lastMatch = truncateString(m.Content, 200)
+			if m.EventType != "" || m.Role == "system" {
+				continue
+			}
+			contentLower := strings.ToLower(m.Content)
+			// Match any keyword
+			for _, kw := range keywords {
+				if strings.Contains(contentLower, kw) {
+					matchCount++
+					lastMatch = truncateString(m.Content, 200)
+					break
+				}
 			}
 		}
 		if matchCount > 0 {
 			results = append(results, fmt.Sprintf("**Thread: %s** (%s) - %d matches\nLast match: %s", item.Title, item.ID, matchCount, lastMatch))
 		}
 	}
+
+	// If keyword search found nothing, return summaries of recent threads
 	if len(results) == 0 {
-		return fmt.Sprintf("No matches found for '%s' across any thread.", query), nil
+		var summaries []string
+		limit := 20
+		if len(items) < limit {
+			limit = len(items)
+		}
+		for i := 0; i < limit; i++ {
+			item := items[i]
+			thread, err := loadThread(item.ID)
+			if err != nil {
+				continue
+			}
+			// Collect user messages as thread summary
+			var userMsgs []string
+			for _, m := range thread.Messages {
+				if m.Role == "user" && m.Content != "" && m.EventType == "" {
+					userMsgs = append(userMsgs, truncateString(m.Content, 100))
+				}
+			}
+			if len(userMsgs) == 0 {
+				continue
+			}
+			summary := strings.Join(userMsgs, " / ")
+			if len(summary) > 300 {
+				summary = summary[:300] + "..."
+			}
+			ts := item.UpdatedAt.Format("2006-01-02 15:04")
+			summaries = append(summaries, fmt.Sprintf("**%s** (%s) [%s]\nユーザー発言: %s", item.Title, item.ID, ts, summary))
+		}
+		if len(summaries) == 0 {
+			return "過去のスレッドが見つかりません。", nil
+		}
+		return fmt.Sprintf("最近の%dスレッド一覧（キーワード検索結果なし、代わりに概要を表示）:\n\n%s", len(summaries), strings.Join(summaries, "\n\n---\n")), nil
 	}
+
 	return fmt.Sprintf("Found matches in %d threads:\n\n%s", len(results), strings.Join(results, "\n\n---\n")), nil
 }
 
@@ -9538,12 +11583,27 @@ func runQuickstart(config *Config) error {
 // Web GUI Server
 // ============================================================================
 
+// LastToolExecution tracks the previous tool execution for dissatisfaction recovery.
+type LastToolExecution struct {
+	UserMsg    string
+	ToolName   string
+	Args       map[string]interface{}
+	ToolResult string
+	Response   string
+	UsedAgent  bool // true if sub-agent was used for summarization
+}
+
 type WebServer struct {
 	config        *Config
 	conversations map[string]*Agent
 	mu            sync.RWMutex
 	lastActivity  time.Time
 	improveMu     sync.Mutex
+	lastExec      map[string]*LastToolExecution // keyed by conversation ID
+	idleCancel    context.CancelFunc            // cancel autonomous thinking
+	idleClients   map[chan StreamEvent]bool      // idle SSE clients
+	idleClientMu  sync.Mutex
+	lastIdleTask  string // previous idle task name (avoid repeats)
 }
 
 type ChatAPIRequest struct {
@@ -9573,6 +11633,8 @@ type StatusResponse struct {
 	DockerAvailable  bool       `json:"docker_available"`
 	DockerImageReady bool       `json:"docker_image_ready"`
 	VisionModel      string     `json:"vision_model,omitempty"`
+	Orchestrator     string     `json:"orchestrator,omitempty"`
+	OrchestratorBackend string  `json:"orchestrator_backend,omitempty"`
 }
 
 type SettingsRequest struct {
@@ -9591,6 +11653,8 @@ func NewWebServer(config *Config) *WebServer {
 		config:        config,
 		conversations: make(map[string]*Agent),
 		lastActivity:  time.Now(),
+		lastExec:      make(map[string]*LastToolExecution),
+		idleClients:   make(map[chan StreamEvent]bool),
 	}
 }
 
@@ -9658,6 +11722,23 @@ When modifying yourself:
 4. Prefer small, incremental changes
 5. For code evolution: always build_test before deploy
 `)
+
+	// Inject user profile if available
+	if profile := loadUserProfile(); profile != nil {
+		sb.WriteString("\n\n## ユーザー情報\n")
+		if len(profile.Interests) > 0 {
+			sb.WriteString(fmt.Sprintf("- 興味: %s\n", strings.Join(profile.Interests, ", ")))
+		}
+		if profile.Occupation != "" {
+			sb.WriteString(fmt.Sprintf("- 職業: %s\n", profile.Occupation))
+		}
+		if profile.TechLevel != "" {
+			sb.WriteString(fmt.Sprintf("- 技術レベル: %s\n", profile.TechLevel))
+		}
+		if len(profile.Preferences) > 0 {
+			sb.WriteString(fmt.Sprintf("- 傾向: %s\n", strings.Join(profile.Preferences, ", ")))
+		}
+	}
 
 	// Inject ACE playbook context
 	sb.WriteString(buildPlaybookContext())
@@ -9739,6 +11820,10 @@ func (ws *WebServer) getOrCreateAgent(convID string) *Agent {
 		var contextMsgs []ThreadMessage
 		for _, tm := range thread.Messages {
 			if tm.Summarized {
+				continue
+			}
+			// Skip display-only event messages (not part of LLM context)
+			if tm.EventType != "" {
 				continue
 			}
 			// Skip legacy [tool_calls:] text markers (old format without ToolCalls field)
@@ -9876,6 +11961,7 @@ func (ws *WebServer) handleIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
 	w.Write(content)
 }
 
@@ -10130,6 +12216,89 @@ func (ws *WebServer) handleImages(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (ws *WebServer) handleDigestSettings(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	switch r.Method {
+	case http.MethodGet:
+		hours := ws.config.DigestHours
+		if hours == nil {
+			hours = []int{9, 18}
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"email_to":       ws.config.EmailTo,
+			"email_from":     ws.config.EmailFrom,
+			"smtp_host":      ws.config.SMTPHost,
+			"smtp_port":      ws.config.SMTPPort,
+			"smtp_user":      ws.config.SMTPUser,
+			"digest_enabled": ws.config.DigestEnabled,
+			"digest_hours":   hours,
+		})
+	case http.MethodPost:
+		var req struct {
+			EmailTo       string `json:"email_to"`
+			EmailFrom     string `json:"email_from"`
+			SMTPHost      string `json:"smtp_host"`
+			SMTPPort      int    `json:"smtp_port"`
+			SMTPUser      string `json:"smtp_user"`
+			SMTPPass      string `json:"smtp_pass"`
+			DigestEnabled bool   `json:"digest_enabled"`
+			DigestHours   []int  `json:"digest_hours"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		ws.mu.Lock()
+		ws.config.EmailTo = req.EmailTo
+		ws.config.EmailFrom = req.EmailFrom
+		ws.config.SMTPHost = req.SMTPHost
+		if req.SMTPPort > 0 {
+			ws.config.SMTPPort = req.SMTPPort
+		}
+		ws.config.SMTPUser = req.SMTPUser
+		if req.SMTPPass != "" {
+			ws.config.SMTPPass = req.SMTPPass
+		}
+		ws.config.DigestEnabled = req.DigestEnabled
+		if len(req.DigestHours) > 0 {
+			ws.config.DigestHours = req.DigestHours
+		}
+		// Persist to file
+		dc := &DigestConfig{
+			EmailTo:       ws.config.EmailTo,
+			EmailFrom:     ws.config.EmailFrom,
+			SMTPHost:      ws.config.SMTPHost,
+			SMTPPort:      ws.config.SMTPPort,
+			SMTPUser:      ws.config.SMTPUser,
+			SMTPPass:      ws.config.SMTPPass,
+			DigestEnabled: ws.config.DigestEnabled,
+			DigestHours:   ws.config.DigestHours,
+		}
+		ws.mu.Unlock()
+		if err := saveDigestConfig(dc); err != nil {
+			fmt.Printf("[siki] Failed to save digest config: %v\n", err)
+		}
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (ws *WebServer) handleDigestTest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if ws.config.EmailTo == "" {
+		http.Error(w, "Email address not configured", http.StatusBadRequest)
+		return
+	}
+	go ws.sendDigestEmail()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "sending"})
+}
+
 func (ws *WebServer) handleThreads(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
@@ -10293,6 +12462,11 @@ func (ws *WebServer) handleThreads(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, "Thread not found", http.StatusNotFound)
 				return
 			}
+			// Mark as read when user views the thread
+			if t.Unread {
+				t.Unread = false
+				saveThreadMeta(t)
+			}
 			json.NewEncoder(w).Encode(t)
 		case http.MethodDelete:
 			if err := deleteThread(threadID); err != nil {
@@ -10340,18 +12514,87 @@ func (ws *WebServer) handleThreads(w http.ResponseWriter, r *http.Request) {
 func (ws *WebServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 	pp := ws.config.primaryProvider()
 	resp := StatusResponse{
-		Model:            pp.Model,
-		Backend:          pp.Backend,
-		Endpoint:         pp.Endpoint,
-		Version:          Version,
-		HasAPIKey:        pp.APIKey != "",
-		Providers:        ws.config.Providers,
-		DockerAvailable:  isDockerAvailable(),
-		DockerImageReady: isDockerAvailable() && isDockerImageAvailable(),
-		VisionModel:      ws.config.VisionModel,
+		Model:               pp.Model,
+		Backend:             pp.Backend,
+		Endpoint:            pp.Endpoint,
+		Version:             Version,
+		HasAPIKey:           pp.APIKey != "",
+		Providers:           ws.config.Providers,
+		DockerAvailable:     isDockerAvailable(),
+		DockerImageReady:    isDockerAvailable() && isDockerImageAvailable(),
+		VisionModel:         ws.config.VisionModel,
+		Orchestrator:        ws.config.orchestratorModel(),
+		OrchestratorBackend: ws.config.orchestratorBackend(),
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
+}
+
+// handleOrchestrator allows GET (current orchestrator info) and POST (change orchestrator model).
+func (ws *WebServer) handleOrchestrator(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	if r.Method == http.MethodGet {
+		ws.mu.RLock()
+		info := map[string]string{
+			"model":    ws.config.orchestratorModel(),
+			"backend":  ws.config.orchestratorBackend(),
+			"endpoint": ws.config.orchestratorEndpoint(),
+		}
+		ws.mu.RUnlock()
+		json.NewEncoder(w).Encode(info)
+		return
+	}
+
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Model    string `json:"model"`
+		Backend  string `json:"backend"`
+		Endpoint string `json:"endpoint"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	ws.mu.Lock()
+	if req.Model != "" {
+		ws.config.Orchestrator = req.Model
+	}
+	if req.Backend != "" {
+		ws.config.OrchestratorBackend = req.Backend
+	}
+	if req.Endpoint != "" {
+		ws.config.OrchestratorEndpoint = req.Endpoint
+	}
+	newModel := ws.config.orchestratorModel()
+	newBackend := ws.config.orchestratorBackend()
+	ws.mu.Unlock()
+
+	fmt.Printf("[siki] Orchestrator changed to: %s (backend: %s)\n", newModel, newBackend)
+
+	// Pre-warm the new orchestrator model
+	if newBackend == "ollama" {
+		go func() {
+			fmt.Printf("[siki] Pre-warming orchestrator: %s ...\n", newModel)
+			start := time.Now()
+			_, err := callOrchestratorGenerate("Say OK.", 5, 600*time.Second, ws.config)
+			if err != nil {
+				fmt.Printf("[siki] Orchestrator warm-up failed: %v\n", err)
+			} else {
+				fmt.Printf("[siki] Orchestrator ready (%.1fs)\n", time.Since(start).Seconds())
+			}
+		}()
+	}
+
+	json.NewEncoder(w).Encode(map[string]string{
+		"status": "ok",
+		"model":  newModel,
+	})
 }
 
 func (ws *WebServer) handleSettings(w http.ResponseWriter, r *http.Request) {
@@ -10551,6 +12794,23 @@ type StreamEvent struct {
 	Result      string   `json:"result,omitempty"`
 	Error       string   `json:"error,omitempty"`
 	Suggestions []string `json:"suggestions,omitempty"`
+	Model       string   `json:"model,omitempty"`
+}
+
+// modelThinkingEvent creates a thinking StreamEvent with the appropriate model name.
+func modelThinkingEvent(content string, config *Config, useSubAgent bool) StreamEvent {
+	model := ""
+	if useSubAgent && hasSubAgent(config) {
+		model = config.SubAgent
+	} else if config.SubModel != "" {
+		model = config.SubModel
+	}
+	return StreamEvent{Type: "thinking", Content: content, Model: model}
+}
+
+// orchestratorThinkingEvent creates a thinking event showing the orchestrator model name.
+func orchestratorThinkingEvent(content string, config *Config) StreamEvent {
+	return StreamEvent{Type: "thinking", Content: content, Model: config.orchestratorModel()}
 }
 
 func (ws *WebServer) handleChatStream(w http.ResponseWriter, r *http.Request) {
@@ -10591,13 +12851,112 @@ func (ws *WebServer) handleChatStream(w http.ResponseWriter, r *http.Request) {
 	// Track activity for self-improvement idle detection
 	ws.mu.Lock()
 	ws.lastActivity = time.Now()
+	// Cancel autonomous thinking immediately
+	if ws.idleCancel != nil {
+		ws.idleCancel()
+		ws.idleCancel = nil
+	}
 	ws.mu.Unlock()
+	ws.broadcastIdleEvent(StreamEvent{Type: "idle_interrupted"})
 
 	agent := ws.getOrCreateAgent(req.ConversationID)
 
 	// Helper: save a message to thread log immediately
 	threadID := req.ConversationID
+
+	// Accumulate thinking and content for dedup with saved messages
+	var thinkingBuf strings.Builder
+	var contentBuf strings.Builder
+
+	// flushContentBuf saves accumulated content as an event_type message
+	// (for intermediate content like quick ack that precedes tool/thinking events)
+	flushContentBuf := func() {
+		if contentBuf.Len() > 0 {
+			text := strings.TrimSpace(contentBuf.String())
+			if text != "" {
+				appendToLog(threadID, ThreadMessage{
+					EventType: "content",
+					Role:      "assistant",
+					Content:   text,
+					Timestamp: time.Now().Unix(),
+				})
+			}
+			contentBuf.Reset()
+		}
+	}
+
+	// Wrap sendEvent to persist ALL events for thread replay
+	origSendEvent := sendEvent
+	sendEvent = func(event StreamEvent) {
+		origSendEvent(event)
+		switch event.Type {
+		case "content":
+			// Accumulate content; will be flushed when non-content event arrives
+			contentBuf.WriteString(event.Content)
+		case "thinking":
+			// Flush any preceding content (e.g. quick ack) before thinking
+			flushContentBuf()
+			if event.Content != "" {
+				thinkingBuf.WriteString(event.Content)
+				appendToLog(threadID, ThreadMessage{
+					EventType: "thinking",
+					Role:      "assistant",
+					Content:   event.Content,
+					Model:     event.Model,
+					Timestamp: time.Now().Unix(),
+				})
+			}
+		case "tool_start":
+			flushContentBuf()
+			appendToLog(threadID, ThreadMessage{
+				EventType: "tool_start",
+				Role:      "assistant",
+				ToolName:  event.Name,
+				Content:   event.Name,
+				Timestamp: time.Now().Unix(),
+			})
+		case "tool_call":
+			flushContentBuf()
+			appendToLog(threadID, ThreadMessage{
+				EventType: "tool_call",
+				Role:      "assistant",
+				ToolName:  event.Name,
+				Content:   event.Result,
+				Timestamp: time.Now().Unix(),
+			})
+		case "plan_progress":
+			flushContentBuf()
+			appendToLog(threadID, ThreadMessage{
+				EventType: "plan_progress",
+				Role:      "assistant",
+				Content:   event.Content,
+				Timestamp: time.Now().Unix(),
+			})
+		case "suggestions":
+			flushContentBuf()
+			if len(event.Suggestions) > 0 {
+				data, _ := json.Marshal(event.Suggestions)
+				appendToLog(threadID, ThreadMessage{
+					EventType: "suggestions",
+					Role:      "assistant",
+					Content:   string(data),
+					Timestamp: time.Now().Unix(),
+				})
+			}
+		}
+	}
+
+	// Wrap saveMsg to clear duplicates (already saved as events)
 	saveMsg := func(msg Message, toolName string) {
+		if msg.Role == "assistant" {
+			// Thinking was already saved as event_type messages
+			if thinkingBuf.Len() > 0 {
+				msg.Thinking = ""
+				thinkingBuf.Reset()
+			}
+			// Content was streamed; clear contentBuf (the message has the final content)
+			contentBuf.Reset()
+		}
 		appendMessageToThread(threadID, msg, toolName)
 	}
 
@@ -10611,7 +12970,7 @@ func (ws *WebServer) handleChatStream(w http.ResponseWriter, r *http.Request) {
 	userContent := req.Message
 	userImages := req.Images
 	if len(req.Images) > 0 && ws.config.VisionModel != "" {
-		sendEvent(StreamEvent{Type: "thinking", Content: "画像を解析中..."})
+		sendEvent(StreamEvent{Type: "thinking", Content: "画像を解析中...", Model: ws.config.VisionModel})
 		endpoint := ws.config.primaryProvider().Endpoint
 		imageDesc := describeImages(req.Images, ws.config.VisionModel, endpoint)
 		if imageDesc != "" {
@@ -10655,7 +13014,7 @@ func (ws *WebServer) handleChatStream(w http.ResponseWriter, r *http.Request) {
 
 	if ws.config.SubModel != "" {
 		// Dual-model pipeline: lfm (quick ack) + gpt-oss (real orchestration)
-		lastAssistantReply = ws.dualModelPipeline(ctx, agent, req.Message, sendEvent, saveMsg)
+		lastAssistantReply = ws.dualModelPipeline(ctx, agent, req.Message, sendEvent, saveMsg, req.ConversationID)
 	} else {
 		// Fallback: single model agent loop (lfm only, with tool overrides)
 		for turn := 0; turn < ws.config.MaxTurns; turn++ {
@@ -10664,7 +13023,7 @@ func (ws *WebServer) handleChatStream(w http.ResponseWriter, r *http.Request) {
 					sendEvent(StreamEvent{Type: "content", Content: content})
 				},
 				OnThinking: func(thinking string) {
-					sendEvent(StreamEvent{Type: "thinking", Content: thinking})
+					sendEvent(StreamEvent{Type: "thinking", Content: thinking, Model: ws.config.ModelName})
 				},
 			})
 
@@ -10890,6 +13249,9 @@ func saveUploadedFile(fh *multipart.FileHeader, destDir string) error {
 }
 
 func runWeb(config *Config, host string, port int) error {
+	// Load persisted digest settings
+	applyDigestConfig(config)
+
 	ws := NewWebServer(config)
 
 	initStaticDir()
@@ -10910,6 +13272,10 @@ func runWeb(config *Config, host string, port int) error {
 	http.HandleFunc("/api/docker/exec", ws.handleDockerExec)
 	http.HandleFunc("/api/docker/status", ws.handleDockerStatus)
 	http.HandleFunc("/api/upload", ws.handleUpload)
+	http.HandleFunc("/api/idle/stream", ws.handleIdleStream)
+	http.HandleFunc("/api/orchestrator", ws.handleOrchestrator)
+	http.HandleFunc("/api/digest/settings", ws.handleDigestSettings)
+	http.HandleFunc("/api/digest/test", ws.handleDigestTest)
 
 	// Initialize directories
 	if err := initThreadDir(); err != nil {
@@ -10974,6 +13340,14 @@ func runWeb(config *Config, host string, port int) error {
 		}
 		fmt.Printf("Sub Agent: %s (%s, %s)\n", config.SubAgent, backend, endpoint)
 	}
+	// Orchestrator model info
+	orchModel := config.orchestratorModel()
+	orchBackend := config.orchestratorBackend()
+	if config.Orchestrator != "" {
+		fmt.Printf("Orchestrator: %s (%s)\n", orchModel, orchBackend)
+	} else {
+		fmt.Printf("Orchestrator: %s (%s) [= sub-model]\n", orchModel, orchBackend)
+	}
 	// Image generation status
 	if config.ImageEnabled {
 		vram := detectVRAM()
@@ -11018,6 +13392,9 @@ func runWeb(config *Config, host string, port int) error {
 
 	// Start self-improvement background loop
 	go ws.selfImproveLoop()
+
+	// Start email digest loop
+	go ws.digestLoop()
 
 	// Open browser automatically (only for localhost)
 	if host != "0.0.0.0" {
@@ -11250,9 +13627,31 @@ func main() {
 				i += 2
 				continue
 			}
+		case "--orchestrator":
+			if i+1 < len(args) {
+				config.Orchestrator = args[i+1]
+				i += 2
+				continue
+			}
+		case "--orchestrator-backend":
+			if i+1 < len(args) {
+				config.OrchestratorBackend = args[i+1]
+				i += 2
+				continue
+			}
+		case "--orchestrator-endpoint":
+			if i+1 < len(args) {
+				config.OrchestratorEndpoint = args[i+1]
+				i += 2
+				continue
+			}
 		case "-h", "--help":
 			printHelp()
 			return
+		default:
+			// Non-flag argument (subcommand like "web", "chat") — just skip and keep parsing
+			i++
+			continue
 		}
 		break
 	}
@@ -11268,8 +13667,24 @@ func main() {
 		}}
 	}
 
-	// Get remaining args as command
-	remaining := args[i:]
+	// Get remaining args: collect non-flag arguments, skipping flag values
+	var remaining []string
+	flagsWithValue := map[string]bool{
+		"--backend": true, "--api-key": true, "--model": true, "--endpoint": true,
+		"--vision-model": true, "--sub-model": true, "--sub-backend": true,
+		"--sub-endpoint": true, "--sub-agent": true, "--sub-agent-endpoint": true,
+		"--orchestrator": true, "--orchestrator-backend": true, "--orchestrator-endpoint": true,
+		"--port": true, "--host": true, "--workspace": true,
+	}
+	for j := 0; j < len(args); j++ {
+		if strings.HasPrefix(args[j], "-") {
+			if flagsWithValue[args[j]] && j+1 < len(args) {
+				j++ // skip the value
+			}
+			continue
+		}
+		remaining = append(remaining, args[j])
+	}
 
 	if len(remaining) == 0 {
 		// Default to chat

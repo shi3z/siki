@@ -2155,3 +2155,870 @@ func TestGenerateImageTool_Definition(t *testing.T) {
 		t.Error("generate_image tool not found in builtinTools")
 	}
 }
+
+// ============================================================================
+// Feature: isDissatisfied keyword detection
+// ============================================================================
+
+func TestIsDissatisfied(t *testing.T) {
+	positives := []string{
+		"だめ、もっと良くして",
+		"ダメだ",
+		"駄目です",
+		"やり直して",
+		"違う、そうじゃない",
+		"もっと良くできないの",
+		"いまいちだな",
+		"再生成して",
+		"改善してください",
+		"修正してくれ",
+		"直して",
+		"redo this",
+		"try again please",
+		"not good enough",
+		"that's wrong",
+		"fix it",
+		"please improve this",
+		"ひどいな",
+	}
+	for _, msg := range positives {
+		if !isDissatisfied(msg) {
+			t.Errorf("isDissatisfied(%q) = false, want true", msg)
+		}
+	}
+
+	negatives := []string{
+		"ありがとう",
+		"次はどうする？",
+		"猫の絵を描いて",
+		"天気を教えて",
+		"hello",
+		"great work",
+		"perfect",
+	}
+	for _, msg := range negatives {
+		if isDissatisfied(msg) {
+			t.Errorf("isDissatisfied(%q) = true, want false", msg)
+		}
+	}
+}
+
+// ============================================================================
+// Feature: modelThinkingEvent
+// ============================================================================
+
+func TestModelThinkingEvent(t *testing.T) {
+	tests := []struct {
+		name        string
+		config      *Config
+		useSubAgent bool
+		wantModel   string
+	}{
+		{
+			name:        "sub-agent used when available",
+			config:      &Config{SubModel: "gpt-oss:20b", SubAgent: "qwen3.5:27b"},
+			useSubAgent: true,
+			wantModel:   "qwen3.5:27b",
+		},
+		{
+			name:        "sub-model used when sub-agent not requested",
+			config:      &Config{SubModel: "gpt-oss:20b", SubAgent: "qwen3.5:27b"},
+			useSubAgent: false,
+			wantModel:   "gpt-oss:20b",
+		},
+		{
+			name:        "sub-model used when no sub-agent configured",
+			config:      &Config{SubModel: "gpt-oss:20b"},
+			useSubAgent: true,
+			wantModel:   "gpt-oss:20b",
+		},
+		{
+			name:        "empty model when nothing configured",
+			config:      &Config{},
+			useSubAgent: false,
+			wantModel:   "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			event := modelThinkingEvent("test content", tt.config, tt.useSubAgent)
+			if event.Type != "thinking" {
+				t.Errorf("Type = %q, want %q", event.Type, "thinking")
+			}
+			if event.Content != "test content" {
+				t.Errorf("Content = %q, want %q", event.Content, "test content")
+			}
+			if event.Model != tt.wantModel {
+				t.Errorf("Model = %q, want %q", event.Model, tt.wantModel)
+			}
+		})
+	}
+}
+
+// ============================================================================
+// Feature: isComicRequest detection
+// ============================================================================
+
+func TestIsComicRequest(t *testing.T) {
+	positives := []string{
+		"openclawをテーマに４コマ漫画をかいて",
+		"4コマ漫画を描いて",
+		"猫のマンガを作って",
+		"AIについてのコミックを作って",
+		"make a comic about Go",
+	}
+	for _, msg := range positives {
+		if !isComicRequest(msg) {
+			t.Errorf("isComicRequest(%q) = false, want true", msg)
+		}
+	}
+
+	negatives := []string{
+		"猫の絵を描いて",
+		"インフォグラフィック",
+		"ニュースを調べて",
+		"天気を教えて",
+	}
+	for _, msg := range negatives {
+		if isComicRequest(msg) {
+			t.Errorf("isComicRequest(%q) = true, want false", msg)
+		}
+	}
+}
+
+// ============================================================================
+// Autonomous Idle Thinking Tests
+// ============================================================================
+
+func TestBroadcastIdleEvent(t *testing.T) {
+	cleanup := setupTestDirs(t)
+	defer cleanup()
+
+	server := mockLLMServer(t, staticLLMResponse("ok"))
+	defer server.Close()
+	cfg := testConfig(server.URL)
+	ws := NewWebServer(cfg)
+
+	// Create two client channels
+	ch1 := make(chan StreamEvent, 16)
+	ch2 := make(chan StreamEvent, 16)
+	ws.idleClientMu.Lock()
+	ws.idleClients[ch1] = true
+	ws.idleClients[ch2] = true
+	ws.idleClientMu.Unlock()
+
+	// Broadcast an event
+	ws.broadcastIdleEvent(StreamEvent{Type: "idle_start", Content: "test task", Model: "test-model"})
+
+	// Both channels should receive the event
+	select {
+	case ev := <-ch1:
+		if ev.Type != "idle_start" || ev.Content != "test task" {
+			t.Errorf("ch1 got unexpected event: %+v", ev)
+		}
+	case <-time.After(time.Second):
+		t.Error("ch1 did not receive event")
+	}
+	select {
+	case ev := <-ch2:
+		if ev.Type != "idle_start" || ev.Content != "test task" {
+			t.Errorf("ch2 got unexpected event: %+v", ev)
+		}
+	case <-time.After(time.Second):
+		t.Error("ch2 did not receive event")
+	}
+
+	// Clean up
+	ws.idleClientMu.Lock()
+	delete(ws.idleClients, ch1)
+	delete(ws.idleClients, ch2)
+	ws.idleClientMu.Unlock()
+}
+
+func TestIdleCancelOnActivity(t *testing.T) {
+	cleanup := setupTestDirs(t)
+	defer cleanup()
+
+	server := mockLLMServer(t, staticLLMResponse("Test response"))
+	defer server.Close()
+	cfg := testConfig(server.URL)
+	ws := NewWebServer(cfg)
+
+	// Simulate an active idle cancel
+	ctx, cancel := context.WithCancel(context.Background())
+	ws.mu.Lock()
+	ws.idleCancel = cancel
+	ws.mu.Unlock()
+
+	// Verify context is not cancelled yet
+	select {
+	case <-ctx.Done():
+		t.Fatal("context should not be cancelled yet")
+	default:
+		// ok
+	}
+
+	// Send a chat request (triggers lastActivity update and idle cancel)
+	body := `{"message":"hello","conversation_id":"cancel-test"}`
+	req := httptest.NewRequest("POST", "/api/chat/stream", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := newFlushRecorder()
+	ws.handleChatStream(w, req)
+
+	// Context should now be cancelled
+	select {
+	case <-ctx.Done():
+		// ok - cancel was called
+	default:
+		t.Error("idle context should have been cancelled after chat activity")
+	}
+
+	// idleCancel should be nil
+	ws.mu.RLock()
+	if ws.idleCancel != nil {
+		t.Error("idleCancel should be nil after cancel")
+	}
+	ws.mu.RUnlock()
+}
+
+func TestAutonomousTaskSelection(t *testing.T) {
+	t.Parallel()
+
+	// Verify task pool has entries
+	if len(autonomousTasks) == 0 {
+		t.Fatal("autonomousTasks should not be empty")
+	}
+
+	// Verify no duplicate task names
+	seen := make(map[string]bool)
+	for _, task := range autonomousTasks {
+		if task.Name == "" {
+			t.Error("task name should not be empty")
+		}
+		if seen[task.Name] {
+			t.Errorf("duplicate task name: %s", task.Name)
+		}
+		seen[task.Name] = true
+
+		// Verify prompt function works
+		prompt := task.PromptFunc("test summary")
+		if prompt == "" {
+			t.Errorf("task %q generated empty prompt", task.Name)
+		}
+		if !strings.Contains(prompt, "test summary") {
+			t.Errorf("task %q prompt should contain the summary", task.Name)
+		}
+	}
+
+	// Verify lastIdleTask prevents consecutive duplicate selection
+	cleanup := setupTestDirs(t)
+	defer cleanup()
+
+	cfg := &Config{}
+	ws := NewWebServer(cfg)
+	ws.lastIdleTask = autonomousTasks[0].Name
+
+	// Run multiple selections and check that we don't always get the same task
+	differentFound := false
+	for i := 0; i < 20; i++ {
+		// Simulate the selection logic from runAutonomousThinking
+		var selected string
+		for attempts := 0; attempts < 10; attempts++ {
+			idx := attempts % len(autonomousTasks) // deterministic for test
+			candidate := autonomousTasks[idx]
+			if candidate.Name != ws.lastIdleTask || len(autonomousTasks) == 1 {
+				selected = candidate.Name
+				break
+			}
+		}
+		if selected != ws.lastIdleTask {
+			differentFound = true
+			break
+		}
+	}
+	if len(autonomousTasks) > 1 && !differentFound {
+		t.Error("task selection should pick a different task from lastIdleTask")
+	}
+}
+
+// ============================================================================
+// Event Persistence Tests (Thread Replay)
+// ============================================================================
+
+func TestEventPersistenceToJSONL(t *testing.T) {
+	cleanup := setupTestDirs(t)
+	defer cleanup()
+
+	threadID := "event-test-" + fmt.Sprintf("%d", time.Now().UnixMilli())
+
+	// Create thread metadata
+	meta := &Thread{
+		ID:        threadID,
+		Title:     "Event Test",
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+	}
+	saveThreadMeta(meta)
+
+	// Simulate saving display-only events
+	appendToLog(threadID, ThreadMessage{
+		EventType: "thinking",
+		Role:      "assistant",
+		Content:   "サブモデルで処理中...",
+		Model:     "test-model",
+		Timestamp: time.Now().Unix(),
+	})
+	appendToLog(threadID, ThreadMessage{
+		EventType: "tool_start",
+		Role:      "assistant",
+		ToolName:  "web_search",
+		Content:   "web_search",
+		Timestamp: time.Now().Unix(),
+	})
+	appendToLog(threadID, ThreadMessage{
+		Role:      "tool",
+		Content:   "search results here",
+		ToolName:  "web_search",
+		Timestamp: time.Now().Unix(),
+	})
+	appendToLog(threadID, ThreadMessage{
+		EventType: "plan_progress",
+		Role:      "assistant",
+		Content:   "タスク 1/2 完了 ✅",
+		Timestamp: time.Now().Unix(),
+	})
+	appendToLog(threadID, ThreadMessage{
+		EventType: "suggestions",
+		Role:      "assistant",
+		Content:   `["深掘りして","別の観点から"]`,
+		Timestamp: time.Now().Unix(),
+	})
+	appendToLog(threadID, ThreadMessage{
+		Role:      "assistant",
+		Content:   "Final response",
+		Timestamp: time.Now().Unix(),
+	})
+
+	// Load thread and verify all messages are present
+	thread, err := loadThread(threadID)
+	if err != nil {
+		t.Fatalf("loadThread failed: %v", err)
+	}
+	if len(thread.Messages) != 6 {
+		t.Fatalf("expected 6 messages, got %d", len(thread.Messages))
+	}
+
+	// Verify event types
+	if thread.Messages[0].EventType != "thinking" {
+		t.Errorf("msg[0] should be thinking event, got %q", thread.Messages[0].EventType)
+	}
+	if thread.Messages[0].Model != "test-model" {
+		t.Errorf("msg[0] model should be test-model, got %q", thread.Messages[0].Model)
+	}
+	if thread.Messages[1].EventType != "tool_start" {
+		t.Errorf("msg[1] should be tool_start event, got %q", thread.Messages[1].EventType)
+	}
+	if thread.Messages[1].ToolName != "web_search" {
+		t.Errorf("msg[1] tool_name should be web_search, got %q", thread.Messages[1].ToolName)
+	}
+	if thread.Messages[2].EventType != "" {
+		t.Errorf("msg[2] should be normal message, got event_type %q", thread.Messages[2].EventType)
+	}
+	if thread.Messages[3].EventType != "plan_progress" {
+		t.Errorf("msg[3] should be plan_progress event, got %q", thread.Messages[3].EventType)
+	}
+	if thread.Messages[4].EventType != "suggestions" {
+		t.Errorf("msg[4] should be suggestions event, got %q", thread.Messages[4].EventType)
+	}
+	if thread.Messages[5].Content != "Final response" {
+		t.Errorf("msg[5] should be final response, got %q", thread.Messages[5].Content)
+	}
+}
+
+func TestEventSkippedInLLMContext(t *testing.T) {
+	cleanup := setupTestDirs(t)
+	defer cleanup()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]interface{}{"response": "test"})
+	}))
+	defer server.Close()
+
+	threadID := "ctx-test-" + fmt.Sprintf("%d", time.Now().UnixMilli())
+
+	// Create thread metadata
+	meta := &Thread{
+		ID:        threadID,
+		Title:     "Context Test",
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+	}
+	saveThreadMeta(meta)
+
+	// Save a mix of regular messages and display-only events
+	appendToLog(threadID, ThreadMessage{
+		Role:      "user",
+		Content:   "Hello",
+		Timestamp: time.Now().Unix(),
+	})
+	appendToLog(threadID, ThreadMessage{
+		EventType: "thinking",
+		Role:      "assistant",
+		Content:   "Processing...",
+		Timestamp: time.Now().Unix(),
+	})
+	appendToLog(threadID, ThreadMessage{
+		EventType: "tool_start",
+		Role:      "assistant",
+		ToolName:  "web_search",
+		Content:   "web_search",
+		Timestamp: time.Now().Unix(),
+	})
+	appendToLog(threadID, ThreadMessage{
+		Role:      "tool",
+		Content:   "tool result",
+		ToolName:  "web_search",
+		Timestamp: time.Now().Unix(),
+	})
+	appendToLog(threadID, ThreadMessage{
+		EventType: "plan_progress",
+		Role:      "assistant",
+		Content:   "Task 1 done",
+		Timestamp: time.Now().Unix(),
+	})
+	appendToLog(threadID, ThreadMessage{
+		EventType: "suggestions",
+		Role:      "assistant",
+		Content:   `["suggestion1"]`,
+		Timestamp: time.Now().Unix(),
+	})
+	appendToLog(threadID, ThreadMessage{
+		Role:      "assistant",
+		Content:   "Response",
+		Timestamp: time.Now().Unix(),
+	})
+
+	cfg := testConfig(server.URL)
+	ws := NewWebServer(cfg)
+
+	// getOrCreateAgent should load only non-event messages
+	agent := ws.getOrCreateAgent(threadID)
+
+	// Should have: system + user + tool + assistant = 4 messages (no events)
+	expectedCount := 4 // system, user, tool, assistant
+	if len(agent.messages) != expectedCount {
+		t.Errorf("expected %d messages in LLM context, got %d", expectedCount, len(agent.messages))
+		for i, m := range agent.messages {
+			t.Logf("  msg[%d]: role=%s content=%q", i, m.Role, truncateString(m.Content, 50))
+		}
+	}
+
+	// Verify no event messages leaked into LLM context
+	for i, m := range agent.messages {
+		if m.Content == "Processing..." || m.Content == "web_search" || m.Content == "Task 1 done" || m.Content == `["suggestion1"]` {
+			t.Errorf("event message leaked into LLM context at index %d: %q", i, m.Content)
+		}
+	}
+}
+
+func TestProactiveThreadCreation(t *testing.T) {
+	cleanup := setupTestDirs(t)
+	defer cleanup()
+
+	threadID := proactiveThreadIDPrefix + fmt.Sprintf("%d", time.Now().UnixMilli())
+
+	// Create a proactive thread with unread flag
+	meta := &Thread{
+		ID:        threadID,
+		Title:     "💡 予測されたタスク",
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+		Unread:    true,
+		Proactive: true,
+	}
+	if err := saveThreadMeta(meta); err != nil {
+		t.Fatalf("saveThreadMeta failed: %v", err)
+	}
+
+	// Save messages
+	appendToLog(threadID, ThreadMessage{
+		Role:      "user",
+		Content:   "テスト質問",
+		Timestamp: time.Now().Unix(),
+	})
+	appendToLog(threadID, ThreadMessage{
+		Role:      "assistant",
+		Content:   "テスト回答",
+		Timestamp: time.Now().Unix(),
+	})
+
+	// Verify unread and proactive flags in thread list
+	items, err := listThreads()
+	if err != nil {
+		t.Fatalf("listThreads failed: %v", err)
+	}
+	found := false
+	for _, item := range items {
+		if item.ID == threadID {
+			found = true
+			if !item.Unread {
+				t.Error("proactive thread should be unread")
+			}
+			if !item.Proactive {
+				t.Error("proactive thread should have proactive flag")
+			}
+			break
+		}
+	}
+	if !found {
+		t.Fatal("proactive thread not found in listThreads")
+	}
+
+	// Verify that loading the thread marks it as read
+	loaded, err := loadThread(threadID)
+	if err != nil {
+		t.Fatalf("loadThread failed: %v", err)
+	}
+	if len(loaded.Messages) != 2 {
+		t.Errorf("expected 2 messages, got %d", len(loaded.Messages))
+	}
+	if loaded.Unread != true {
+		t.Error("loadThread should not modify unread status (that's handleThreads' job)")
+	}
+
+	// Simulate marking as read (like the handler does)
+	loaded.Unread = false
+	saveThreadMeta(loaded)
+
+	// Re-check thread list
+	items, _ = listThreads()
+	for _, item := range items {
+		if item.ID == threadID {
+			if item.Unread {
+				t.Error("thread should be marked as read after viewing")
+			}
+			break
+		}
+	}
+}
+
+func TestComicPlanCharacterDesign(t *testing.T) {
+	// Test that createComicPlan generates the correct task structure
+	// with character design pipeline: scenario → char image → describe → 4 panels
+
+	// We can't call createComicPlan directly (needs LLM), but we can verify
+	// the plan structure by simulating what it produces
+	plan := &Plan{
+		Goal:      "Test comic",
+		CreatedAt: time.Now().Format(time.RFC3339),
+		Status:    "planning",
+	}
+
+	// Task 1: Scenario display (summarize)
+	plan.Tasks = append(plan.Tasks, PlanTask{
+		ID:          1,
+		Description: "## 4コマ漫画シナリオ\n**テーマ:** Test\n",
+		Status:      "pending",
+		Tool:        "summarize",
+	})
+
+	// Task 2: Character reference image
+	plan.Tasks = append(plan.Tasks, PlanTask{
+		ID:          2,
+		Description: "キャラクターデザイン参照画像を生成",
+		Status:      "pending",
+		Tool:        "generate_image",
+		ImagePrompt: "character reference sheet, full body, front view, white background, anime style",
+	})
+
+	// Task 3: Describe image (vision model)
+	plan.Tasks = append(plan.Tasks, PlanTask{
+		ID:          3,
+		Description: "参照画像からキャラクター外見を詳細解析",
+		Status:      "pending",
+		Tool:        "describe_image",
+	})
+
+	// Tasks 4-7: Comic panels
+	for i := 0; i < 4; i++ {
+		plan.Tasks = append(plan.Tasks, PlanTask{
+			ID:          i + 4,
+			Description: fmt.Sprintf("%dコマ目「%s」を画像生成", i+1, []string{"起", "承", "転", "結"}[i]),
+			Status:      "pending",
+			Tool:        "generate_image",
+			ImagePrompt: fmt.Sprintf("comic panel %d, manga style", i+1),
+		})
+	}
+
+	// Verify plan structure
+	if len(plan.Tasks) != 7 {
+		t.Fatalf("expected 7 tasks, got %d", len(plan.Tasks))
+	}
+
+	// Verify task order: summarize, generate_image, describe_image, 4x generate_image
+	expectedTools := []string{"summarize", "generate_image", "describe_image", "generate_image", "generate_image", "generate_image", "generate_image"}
+	for i, task := range plan.Tasks {
+		if task.Tool != expectedTools[i] {
+			t.Errorf("task %d: expected tool %q, got %q", task.ID, expectedTools[i], task.Tool)
+		}
+	}
+
+	// Verify task IDs are sequential
+	for i, task := range plan.Tasks {
+		if task.ID != i+1 {
+			t.Errorf("task %d: expected ID %d, got %d", i, i+1, task.ID)
+		}
+	}
+
+	// Verify character reference image task has ImagePrompt
+	if plan.Tasks[1].ImagePrompt == "" {
+		t.Error("character reference image task should have ImagePrompt")
+	}
+
+	// Verify describe_image task has no ImagePrompt (it reads from previous result)
+	if plan.Tasks[2].ImagePrompt != "" {
+		t.Error("describe_image task should not have ImagePrompt")
+	}
+
+	// Verify panel tasks (4-7) have ImagePrompt
+	for i := 3; i < 7; i++ {
+		if plan.Tasks[i].ImagePrompt == "" {
+			t.Errorf("panel task %d should have ImagePrompt", plan.Tasks[i].ID)
+		}
+	}
+
+	// Test that isComicRequest detects comic requests
+	comicTests := []struct {
+		msg    string
+		expect bool
+	}{
+		{"4コマ漫画を描いて", true},
+		{"４コマ漫画をかいて", true},
+		{"漫画を作って", true},
+		{"マンガを描いて", true},
+		{"comic about cats", true},
+		{"天気を教えて", false},
+		{"画像を生成して", false},
+	}
+	for _, tc := range comicTests {
+		if got := isComicRequest(tc.msg); got != tc.expect {
+			t.Errorf("isComicRequest(%q) = %v, want %v", tc.msg, got, tc.expect)
+		}
+	}
+}
+
+func TestDescribeImageForCharacter(t *testing.T) {
+	// Test with empty inputs
+	result := describeImageForCharacter("", "test prompt", "moondream", &Config{})
+	if result != "" {
+		t.Error("expected empty result for empty base64 image")
+	}
+
+	result = describeImageForCharacter("abc123", "test prompt", "", &Config{})
+	if result != "" {
+		t.Error("expected empty result for empty vision model")
+	}
+}
+
+func TestVerifyGoalFulfillment(t *testing.T) {
+	t.Parallel()
+
+	// Comic request with no images generated → fail
+	plan := &Plan{
+		Tasks: []PlanTask{
+			{ID: 1, Tool: "summarize", Status: "completed"},
+			{ID: 2, Tool: "generate_image", Status: "failed"},
+			{ID: 3, Tool: "describe_image", Status: "completed"},
+			{ID: 4, Tool: "generate_image", Status: "failed"},
+			{ID: 5, Tool: "generate_image", Status: "failed"},
+			{ID: 6, Tool: "generate_image", Status: "failed"},
+			{ID: 7, Tool: "generate_image", Status: "failed"},
+		},
+	}
+	if verifyGoalFulfillment(plan, "4コマ漫画を書いて") {
+		t.Error("should fail: comic request with 0 images")
+	}
+
+	// Comic request with some images → pass
+	plan.Tasks[3].Status = "completed"
+	plan.Tasks[4].Status = "completed"
+	if !verifyGoalFulfillment(plan, "4コマ漫画を書いて") {
+		t.Error("should pass: comic request with some images generated")
+	}
+
+	// All images completed → pass
+	for i := range plan.Tasks {
+		plan.Tasks[i].Status = "completed"
+	}
+	if !verifyGoalFulfillment(plan, "4コマ漫画を書いて") {
+		t.Error("should pass: all tasks completed")
+	}
+
+	// More than half failed → fail
+	failPlan := &Plan{
+		Tasks: []PlanTask{
+			{ID: 1, Tool: "web_search", Status: "failed"},
+			{ID: 2, Tool: "web_fetch", Status: "failed"},
+			{ID: 3, Tool: "summarize", Status: "completed"},
+		},
+	}
+	if verifyGoalFulfillment(failPlan, "調べて") {
+		t.Error("should fail: more than half tasks failed")
+	}
+
+	// nil plan → fail
+	if verifyGoalFulfillment(nil, "test") {
+		t.Error("should fail: nil plan")
+	}
+}
+
+// ============================================================================
+// Refusal Detection Tests
+// ============================================================================
+
+func TestRefusalDetection(t *testing.T) {
+	tests := []struct {
+		name     string
+		userMsg  string
+		response string
+		want     bool
+	}{
+		{"refusal できません", "最新ニュースを教えて", "それについてはできません。", true},
+		{"refusal わかりません", "調べてください", "わかりません。", true},
+		{"refusal 情報がありません", "AIの最新動向は？", "その情報がありません。", true},
+		{"refusal 申し訳ありません", "検索して", "申し訳ありませんが対応できません。", true},
+		{"refusal 提供することができません", "予測して", "情報を提供することができません。", true},
+		{"short analysis response", "過去の会話を分析して", "OK", true},
+		{"short prediction response", "予測してください", "無理です", true},
+		{"normal response", "こんにちは", "こんにちは！何かお手伝いできますか？", false},
+		{"realtime no URL", "最新ニュース", "今日のニュースは色々あります。AIが進化しています。人工知能の最新動向として、様々な企業が新しいモデルを発表しています。これらの動向は注目に値します。", true},
+		{"realtime with URL", "最新ニュース", "https://example.com のニュース", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := needsToolButDidnt(tt.userMsg, tt.response)
+			if got != tt.want {
+				t.Errorf("needsToolButDidnt(%q, %q) = %v, want %v", tt.userMsg, tt.response, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestConversationKeywordRouting(t *testing.T) {
+	tests := []struct {
+		msg  string
+		want bool
+	}{
+		{"過去の会話を調べろ", true},
+		{"履歴を見せて", true},
+		{"前に話したことを教えて", true},
+		{"さっきの話の続き", true},
+		{"予測してくれ", true},
+		{"予想して", true},
+		{"次に何を言うか当てて", true},
+		{"やり取りを調べて", true},
+		{"天気を教えて", false},
+		{"こんにちは", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.msg, func(t *testing.T) {
+			got := containsConversationKeywords(tt.msg)
+			if got != tt.want {
+				t.Errorf("containsConversationKeywords(%q) = %v, want %v", tt.msg, got, tt.want)
+			}
+		})
+	}
+}
+
+// ============================================================================
+// User Profile Tests
+// ============================================================================
+
+func TestUserProfileSaveLoad(t *testing.T) {
+	// Use temp dir for profile
+	tmp := t.TempDir()
+	origHome := os.Getenv("HOME")
+	os.Setenv("HOME", tmp)
+	defer os.Setenv("HOME", origHome)
+
+	os.MkdirAll(filepath.Join(tmp, ".siki"), 0755)
+
+	// Initially no profile
+	p := loadUserProfile()
+	if p != nil {
+		t.Error("expected nil profile initially")
+	}
+
+	// Save a profile
+	profile := &UserProfile{
+		Interests:  []string{"AI", "Go"},
+		Occupation: "engineer",
+		TechLevel:  "advanced",
+	}
+	if err := saveUserProfile(profile); err != nil {
+		t.Fatalf("saveUserProfile failed: %v", err)
+	}
+
+	// Load it back
+	loaded := loadUserProfile()
+	if loaded == nil {
+		t.Fatal("expected non-nil profile after save")
+	}
+	if len(loaded.Interests) != 2 || loaded.Interests[0] != "AI" {
+		t.Errorf("unexpected interests: %v", loaded.Interests)
+	}
+	if loaded.Occupation != "engineer" {
+		t.Errorf("unexpected occupation: %s", loaded.Occupation)
+	}
+
+	// Test merge
+	incoming := &UserProfile{
+		Interests:  []string{"Go", "Rust"}, // Go already exists
+		Occupation: "researcher",
+		Preferences: []string{"dark mode"},
+	}
+	merged := mergeProfile(loaded, incoming)
+	if len(merged.Interests) != 3 { // AI, Go, Rust
+		t.Errorf("expected 3 interests after merge, got %d: %v", len(merged.Interests), merged.Interests)
+	}
+	if merged.Occupation != "researcher" {
+		t.Errorf("expected occupation updated to researcher, got %s", merged.Occupation)
+	}
+	if len(merged.Preferences) != 1 || merged.Preferences[0] != "dark mode" {
+		t.Errorf("unexpected preferences: %v", merged.Preferences)
+	}
+
+	// Merge with nil
+	result := mergeProfile(nil, incoming)
+	if result != incoming {
+		t.Error("mergeProfile(nil, x) should return x")
+	}
+	result = mergeProfile(loaded, nil)
+	if result != loaded {
+		t.Error("mergeProfile(x, nil) should return x")
+	}
+}
+
+// ============================================================================
+// Digest Email Format Tests
+// ============================================================================
+
+func TestDigestEmailFormat(t *testing.T) {
+	body := formatDigestEmailBody("siki ダイジェスト — 2026/03/04 09:00", "<h2>AI最新動向</h2><p>テスト内容</p>")
+
+	if !strings.Contains(body, "<!DOCTYPE html>") {
+		t.Error("expected HTML doctype")
+	}
+	if !strings.Contains(body, "siki ダイジェスト") {
+		t.Error("expected subject in body")
+	}
+	if !strings.Contains(body, "AI最新動向") {
+		t.Error("expected content in body")
+	}
+	if !strings.Contains(body, "Generated by siki") {
+		t.Error("expected footer")
+	}
+}

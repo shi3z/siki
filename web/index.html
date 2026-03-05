@@ -321,6 +321,17 @@
             gap: 0.4rem;
         }
 
+        .message.thinking .thinking-model {
+            font-size: 0.65rem;
+            color: var(--accent);
+            opacity: 0.7;
+            background: rgba(233, 69, 96, 0.1);
+            padding: 0.1rem 0.4rem;
+            border-radius: 3px;
+            font-weight: 500;
+            margin-left: 0.3rem;
+        }
+
         .message.thinking .thinking-header .toggle-icon {
             transition: transform 0.2s;
             font-size: 0.6rem;
@@ -338,6 +349,68 @@
 
         .message.thinking.collapsed .thinking-body {
             display: none;
+        }
+
+        /* Idle autonomous thinking floating container */
+        .idle-thinking-container {
+            position: fixed;
+            bottom: 100px;
+            right: 24px;
+            z-index: 1000;
+            max-width: 360px;
+            pointer-events: none;
+            transition: opacity 0.3s ease, transform 0.3s ease;
+        }
+        .idle-thinking-container.hidden {
+            opacity: 0;
+            transform: translateY(10px);
+            pointer-events: none;
+        }
+        .idle-thinking-bubble {
+            background: rgba(59, 130, 246, 0.08);
+            border: 1px solid rgba(59, 130, 246, 0.25);
+            border-radius: 12px;
+            padding: 0.7rem 1rem;
+            font-size: 0.82rem;
+            color: var(--text-secondary);
+            animation: idle-pulse 2.5s ease-in-out infinite;
+            pointer-events: auto;
+            backdrop-filter: blur(8px);
+        }
+        .idle-thinking-bubble .idle-header {
+            display: flex;
+            align-items: center;
+            gap: 0.4rem;
+            font-weight: 600;
+            color: #3b82f6;
+            font-size: 0.75rem;
+            margin-bottom: 0.3rem;
+        }
+        .idle-thinking-bubble .idle-model {
+            font-size: 0.65rem;
+            background: rgba(59, 130, 246, 0.12);
+            padding: 0.1rem 0.4rem;
+            border-radius: 3px;
+            color: #3b82f6;
+        }
+        .idle-thinking-bubble .idle-body {
+            white-space: pre-wrap;
+            line-height: 1.5;
+            max-height: 200px;
+            overflow-y: auto;
+        }
+        @keyframes idle-pulse {
+            0%, 100% { border-color: rgba(59, 130, 246, 0.2); }
+            50% { border-color: rgba(59, 130, 246, 0.5); }
+        }
+        .idle-spinner {
+            display: inline-block;
+            width: 10px;
+            height: 10px;
+            border: 2px solid rgba(59, 130, 246, 0.3);
+            border-top-color: #3b82f6;
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
         }
 
         .message.tool {
@@ -1169,6 +1242,42 @@
         .thread-item .thread-actions button.del-btn:hover {
             color: #ff4a4a;
         }
+        .thread-item.idle-thread {
+            border-left: 2px solid rgba(59, 130, 246, 0.5);
+        }
+        .thread-item.idle-thread .thread-title {
+            color: #3b82f6;
+        }
+        .idle-thread-icon {
+            font-size: 0.75rem;
+        }
+        /* Unread thread indicator */
+        .thread-item.unread {
+            border-left: 3px solid #3b82f6;
+        }
+        .thread-item.unread .thread-title {
+            font-weight: 700;
+        }
+        .unread-badge {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #3b82f6;
+            margin-left: 6px;
+            vertical-align: middle;
+            animation: unread-pulse 2s ease-in-out infinite;
+        }
+        @keyframes unread-pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.4; }
+        }
+        .thread-item.proactive-thread {
+            border-left: 3px solid #f59e0b;
+        }
+        .thread-item.proactive-thread .thread-title {
+            color: #f59e0b;
+        }
     </style>
 </head>
 <body>
@@ -1270,6 +1379,88 @@
             <h3 style="margin: 1rem 0 0.5rem; border-bottom: 1px solid var(--border-color); padding-bottom: 0.5rem;">Providers</h3>
             <div id="providers-list" style="margin-bottom: 0.5rem;"></div>
             <button class="btn-secondary" onclick="addProviderRow()" style="margin-bottom: 1rem; font-size: 0.8rem;">+ Add Provider</button>
+
+            <h3 style="margin: 1rem 0 0.5rem; border-bottom: 1px solid var(--border-color); padding-bottom: 0.5rem;">Orchestrator</h3>
+            <div style="display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; margin-bottom: 1rem;">
+                <div class="form-group" style="flex: 2; min-width: 180px; margin: 0;">
+                    <label style="font-size: 0.75rem;">Model</label>
+                    <input type="text" id="setting-orchestrator-model" placeholder="e.g. qwen3.5:9b" style="width: 100%; padding: 0.4rem; font-size: 0.85rem;">
+                </div>
+                <div class="form-group" style="flex: 1; min-width: 100px; margin: 0;">
+                    <label style="font-size: 0.75rem;">Backend</label>
+                    <select id="setting-orchestrator-backend" style="width: 100%; padding: 0.4rem; font-size: 0.85rem;">
+                        <option value="ollama">ollama</option>
+                        <option value="vllm">vllm</option>
+                    </select>
+                </div>
+                <div class="form-group" style="flex: 2; min-width: 150px; margin: 0;">
+                    <label style="font-size: 0.75rem;">Endpoint (optional)</label>
+                    <input type="text" id="setting-orchestrator-endpoint" placeholder="default" style="width: 100%; padding: 0.4rem; font-size: 0.85rem;">
+                </div>
+            </div>
+            <div id="orchestrator-status" style="font-size: 0.75rem; color: var(--text-secondary); margin-bottom: 0.5rem;"></div>
+
+            <h3 style="margin: 1rem 0 0.5rem; border-bottom: 1px solid var(--border-color); padding-bottom: 0.5rem;">
+                Email Digest
+                <span onclick="document.getElementById('gmail-help').style.display = document.getElementById('gmail-help').style.display === 'none' ? 'block' : 'none'"
+                      style="font-size: 0.75rem; font-weight: normal; color: var(--accent-color); cursor: pointer; margin-left: 0.5rem;">Gmail設定ヘルプ ▼</span>
+            </h3>
+            <div id="gmail-help" style="display: none; background: var(--bg-secondary, #f5f5f5); border: 1px solid var(--border-color); border-radius: 6px; padding: 0.8rem; margin-bottom: 0.8rem; font-size: 0.8rem; line-height: 1.6;">
+                <strong>Gmailで使う場合の設定手順：</strong>
+                <ol style="margin: 0.4rem 0 0; padding-left: 1.2rem;">
+                    <li>Googleアカウントで<strong>2段階認証</strong>を有効化<br>
+                        <a href="https://myaccount.google.com/signinoptions/two-step-verification" target="_blank" style="color: var(--accent-color);">→ 2段階認証の設定</a></li>
+                    <li><strong>アプリパスワード</strong>を生成（通常のパスワードは使えません）<br>
+                        <a href="https://myaccount.google.com/apppasswords" target="_blank" style="color: var(--accent-color);">→ アプリパスワードの生成</a></li>
+                    <li>以下の値を入力：
+                        <table style="margin: 0.3rem 0; font-size: 0.78rem; border-collapse: collapse;">
+                            <tr><td style="padding: 2px 8px 2px 0; font-weight: bold;">SMTP Host</td><td><code>smtp.gmail.com</code></td></tr>
+                            <tr><td style="padding: 2px 8px 2px 0; font-weight: bold;">Port</td><td><code>587</code></td></tr>
+                            <tr><td style="padding: 2px 8px 2px 0; font-weight: bold;">SMTP User</td><td>あなたのGmailアドレス</td></tr>
+                            <tr><td style="padding: 2px 8px 2px 0; font-weight: bold;">SMTP Password</td><td>手順2で生成した16文字のアプリパスワード</td></tr>
+                        </table>
+                    </li>
+                    <li><strong>Save</strong> → <strong>Test Send</strong> で確認</li>
+                </ol>
+                <button class="btn-secondary" onclick="fillGmailDefaults()" style="font-size: 0.75rem; margin-top: 0.4rem; padding: 0.2rem 0.6rem;">Gmail設定を自動入力</button>
+            </div>
+            <div style="margin-bottom: 1rem;">
+                <div style="display: flex; gap: 0.5rem; align-items: center; margin-bottom: 0.5rem;">
+                    <label style="font-size: 0.85rem; display: flex; align-items: center; gap: 0.3rem; cursor: pointer;">
+                        <input type="checkbox" id="setting-digest-enabled"> Enable Digest
+                    </label>
+                </div>
+                <div class="form-group" style="margin: 0 0 0.5rem 0;">
+                    <label style="font-size: 0.75rem;">Email To</label>
+                    <input type="email" id="setting-digest-email" placeholder="your@email.com" style="width: 100%; padding: 0.4rem; font-size: 0.85rem;">
+                </div>
+                <div style="display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 0.5rem;">
+                    <div class="form-group" style="flex: 2; min-width: 150px; margin: 0;">
+                        <label style="font-size: 0.75rem;">SMTP Host</label>
+                        <input type="text" id="setting-smtp-host" placeholder="smtp.gmail.com" style="width: 100%; padding: 0.4rem; font-size: 0.85rem;">
+                    </div>
+                    <div class="form-group" style="flex: 1; min-width: 70px; margin: 0;">
+                        <label style="font-size: 0.75rem;">Port</label>
+                        <input type="number" id="setting-smtp-port" placeholder="587" style="width: 100%; padding: 0.4rem; font-size: 0.85rem;">
+                    </div>
+                </div>
+                <div style="display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 0.5rem;">
+                    <div class="form-group" style="flex: 1; min-width: 120px; margin: 0;">
+                        <label style="font-size: 0.75rem;">SMTP User</label>
+                        <input type="text" id="setting-smtp-user" placeholder="user@gmail.com" style="width: 100%; padding: 0.4rem; font-size: 0.85rem;">
+                    </div>
+                    <div class="form-group" style="flex: 1; min-width: 120px; margin: 0;">
+                        <label style="font-size: 0.75rem;">SMTP Password</label>
+                        <input type="password" id="setting-smtp-pass" placeholder="アプリパスワード(16文字)" style="width: 100%; padding: 0.4rem; font-size: 0.85rem;">
+                    </div>
+                </div>
+                <div class="form-group" style="margin: 0 0 0.5rem 0;">
+                    <label style="font-size: 0.75rem;">Send Hours (comma-separated, e.g. 9,18)</label>
+                    <input type="text" id="setting-digest-hours" placeholder="9,18" style="width: 100%; padding: 0.4rem; font-size: 0.85rem;">
+                </div>
+                <button class="btn-secondary" onclick="testDigest()" style="font-size: 0.8rem;">Test Send</button>
+                <span id="digest-test-status" style="font-size: 0.75rem; color: var(--text-secondary); margin-left: 0.5rem;"></span>
+            </div>
 
             <div class="modal-actions">
                 <button class="btn-secondary" onclick="hideSettings()" data-i18n="cancel">Cancel</button>
@@ -1968,10 +2159,11 @@
             return div;
         }
 
-        function createThinkingMessage() {
+        function createThinkingMessage(model) {
             const div = document.createElement('div');
             div.className = 'message thinking';
-            div.innerHTML = `<div class="thinking-header" onclick="this.parentElement.classList.toggle('collapsed')"><span class="toggle-icon">&#9660;</span> 考え中...</div><div class="thinking-body"><span class="streaming-cursor"></span></div>`;
+            const modelLabel = model ? `<span class="thinking-model">${model}</span>` : '';
+            div.innerHTML = `<div class="thinking-header" onclick="this.parentElement.classList.toggle('collapsed')"><span class="toggle-icon">&#9660;</span> 考え中...${modelLabel}</div><div class="thinking-body"><span class="streaming-cursor"></span></div>`;
             chatContainer.appendChild(div);
             chatContainer.scrollTop = chatContainer.scrollHeight;
             return div;
@@ -2116,11 +2308,21 @@
 
             for (const t of sorted) {
                 const div = document.createElement('div');
-                div.className = 'thread-item' + (t.id === conversationId ? ' active' : '');
+                const isIdleThread = t.id && t.id.startsWith('idle-thoughts-');
+                const isProactive = t.proactive || (t.id && t.id.startsWith('proactive-'));
+                const isUnread = t.unread;
+                let cls = 'thread-item';
+                if (t.id === conversationId) cls += ' active';
+                if (isIdleThread) cls += ' idle-thread';
+                if (isProactive) cls += ' proactive-thread';
+                if (isUnread) cls += ' unread';
+                div.className = cls;
                 const date = new Date(t.updated_at);
                 const dateStr = date.toLocaleDateString() + ' ' + date.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+                const titleIcon = isIdleThread ? '<span class="idle-thread-icon" title="sikiの自律思考ログ">&#128161;</span> ' : '';
+                const unreadBadge = isUnread ? '<span class="unread-badge" title="未読"></span>' : '';
                 div.innerHTML = `
-                    <div class="thread-title">${escapeHtml(t.title || 'New thread')}</div>
+                    <div class="thread-title">${titleIcon}${escapeHtml(t.title || 'New thread')}${unreadBadge}</div>
                     <div class="thread-meta">${t.message_count || 0} msgs &middot; ${dateStr}</div>
                     <div class="thread-actions">
                         <button onclick="event.stopPropagation(); renameThread('${t.id}')" title="Rename">&#9998;</button>
@@ -2138,6 +2340,12 @@
             conversationId = threadId;
             localStorage.setItem('siki-current-thread', threadId);
             chatContainer.innerHTML = '';
+            // Mark as read in local state
+            const t = threads.find(th => th.id === threadId);
+            if (t && t.unread) {
+                t.unread = false;
+                renderThreadList();
+            }
             // Clear search
             document.getElementById('thread-search-input').value = '';
             threadSearchResults = null;
@@ -2148,8 +2356,84 @@
                 const thread = await resp.json();
 
                 if (thread.messages && thread.messages.length > 0) {
-                    for (const m of thread.messages) {
+                    const msgs = thread.messages;
+                    for (let idx = 0; idx < msgs.length; idx++) {
+                        const m = msgs[idx];
                         if (m.role === 'system') continue;
+
+                        // Handle display-only event messages (agent reactions replay)
+                        if (m.event_type) {
+                            if (m.event_type === 'content') {
+                                // Intermediate content (e.g. quick ack before tools)
+                                addMessage('assistant', m.content);
+                            } else if (m.event_type === 'thinking') {
+                                // Group consecutive thinking events into one collapsed bubble
+                                let thinkingTexts = [m.content];
+                                let model = m.model || '';
+                                while (idx + 1 < msgs.length && msgs[idx + 1].event_type === 'thinking') {
+                                    idx++;
+                                    thinkingTexts.push(msgs[idx].content);
+                                    if (!model && msgs[idx].model) model = msgs[idx].model;
+                                }
+                                const div = document.createElement('div');
+                                div.className = 'message thinking collapsed';
+                                const modelLabel = model ? `<span class="thinking-model">${model}</span>` : '';
+                                div.innerHTML = `<div class="thinking-header" onclick="this.parentElement.classList.toggle('collapsed')"><span class="toggle-icon">&#9660;</span> 処理ログ ${modelLabel}</div><div class="thinking-body">${renderMarkdown(thinkingTexts.join('\n'))}</div>`;
+                                chatContainer.appendChild(div);
+                            } else if (m.event_type === 'tool_start') {
+                                // Check if next message is tool_call with result
+                                let toolResult = null;
+                                if (idx + 1 < msgs.length && msgs[idx + 1].event_type === 'tool_call') {
+                                    idx++;
+                                    toolResult = msgs[idx].content;
+                                }
+                                const div = document.createElement('div');
+                                div.className = 'message thinking collapsed';
+                                if (toolResult) {
+                                    div.innerHTML = `<div class="thinking-header" onclick="this.parentElement.classList.toggle('collapsed')"><span class="toggle-icon">&#9654;</span> &#128295; ${escapeHtml(m.tool_name || m.content)} を実行</div><div class="thinking-body">${renderMarkdown(toolResult)}</div>`;
+                                } else {
+                                    div.innerHTML = `<div class="thinking-header" onclick="this.parentElement.classList.toggle('collapsed')"><span class="toggle-icon">&#9654;</span> &#128295; ${escapeHtml(m.tool_name || m.content)} を実行</div>`;
+                                }
+                                chatContainer.appendChild(div);
+                            } else if (m.event_type === 'tool_call') {
+                                // Standalone tool_call (not preceded by tool_start)
+                                const div = document.createElement('div');
+                                div.className = 'message thinking collapsed';
+                                div.innerHTML = `<div class="thinking-header" onclick="this.parentElement.classList.toggle('collapsed')"><span class="toggle-icon">&#9654;</span> &#128295; ${escapeHtml(m.tool_name || 'tool')} 結果</div><div class="thinking-body">${renderMarkdown(m.content)}</div>`;
+                                chatContainer.appendChild(div);
+                            } else if (m.event_type === 'plan_progress') {
+                                const div = document.createElement('div');
+                                div.className = 'message tool';
+                                div.style.cssText = 'padding:0.3rem 0.8rem;font-size:0.82rem;opacity:0.8;';
+                                div.innerHTML = `<span>${escapeHtml(m.content)}</span>`;
+                                chatContainer.appendChild(div);
+                            } else if (m.event_type === 'suggestions') {
+                                try {
+                                    const suggestions = JSON.parse(m.content);
+                                    if (suggestions && suggestions.length > 0) {
+                                        const sugDiv = document.createElement('div');
+                                        sugDiv.className = 'message assistant';
+                                        let html = '<div style="color:var(--text-secondary);font-size:0.85rem;margin-bottom:0.4rem;">他に知りたいことはありますか？</div>';
+                                        html += '<div class="suggestions-container">';
+                                        for (const s of suggestions) {
+                                            html += `<button class="suggestion-btn" data-suggestion="${s.replace(/"/g, '&quot;')}">${escapeHtml(s)}</button>`;
+                                        }
+                                        html += '</div>';
+                                        sugDiv.innerHTML = html;
+                                        chatContainer.appendChild(sugDiv);
+                                        sugDiv.querySelectorAll('.suggestion-btn').forEach(btn => {
+                                            btn.addEventListener('click', function() {
+                                                const text = this.getAttribute('data-suggestion');
+                                                messageInput.value = text;
+                                                sugDiv.remove();
+                                                sendMessage();
+                                            });
+                                        });
+                                    }
+                                } catch(e) {}
+                            }
+                            continue;
+                        }
 
                         // Assistant message with tool_calls but no text content
                         if (m.role === 'assistant' && m.tool_calls && m.tool_calls.length > 0 && !m.content) {
@@ -2404,7 +2688,13 @@
                                 // LLM thinking/reasoning (from <think> tags)
                                 typing.classList.remove('show');
                                 if (!thinkingDiv) {
-                                    thinkingDiv = createThinkingMessage();
+                                    thinkingDiv = createThinkingMessage(event.model);
+                                } else if (event.model) {
+                                    // Update model label if it changed
+                                    const header = thinkingDiv.querySelector('.thinking-header');
+                                    if (header && !header.querySelector('.thinking-model')) {
+                                        header.innerHTML += `<span class="thinking-model">${event.model}</span>`;
+                                    }
                                 }
                                 thinkingContent += event.content;
                                 updateStreamingMessage(thinkingDiv, thinkingContent);
@@ -2562,9 +2852,35 @@
             createNewThread();
         }
 
-        function showSettings() {
+        async function showSettings() {
             document.getElementById('setting-language').value = lang;
             renderProviders();
+            // Load orchestrator settings
+            try {
+                const orchResp = await fetch('/api/orchestrator');
+                const orchData = await orchResp.json();
+                document.getElementById('setting-orchestrator-model').value = orchData.model || '';
+                document.getElementById('setting-orchestrator-backend').value = orchData.backend || 'ollama';
+                document.getElementById('setting-orchestrator-endpoint').value = orchData.endpoint || '';
+                document.getElementById('orchestrator-status').textContent = `Current: ${orchData.model} (${orchData.backend})`;
+            } catch (e) {
+                console.error('Failed to load orchestrator settings:', e);
+            }
+            // Load digest settings
+            try {
+                const digestResp = await fetch('/api/digest/settings');
+                const digestData = await digestResp.json();
+                document.getElementById('setting-digest-enabled').checked = digestData.digest_enabled || false;
+                document.getElementById('setting-digest-email').value = digestData.email_to || '';
+                document.getElementById('setting-smtp-host').value = digestData.smtp_host || '';
+                document.getElementById('setting-smtp-port').value = digestData.smtp_port || '';
+                document.getElementById('setting-smtp-user').value = digestData.smtp_user || '';
+                document.getElementById('setting-smtp-pass').value = '';
+                const hours = digestData.digest_hours || [9, 18];
+                document.getElementById('setting-digest-hours').value = hours.join(',');
+            } catch (e) {
+                console.error('Failed to load digest settings:', e);
+            }
             document.getElementById('settings-modal').classList.add('show');
         }
 
@@ -2631,11 +2947,74 @@
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(settings)
                 });
+
+                // Save orchestrator settings
+                const orchModel = document.getElementById('setting-orchestrator-model').value.trim();
+                const orchBackend = document.getElementById('setting-orchestrator-backend').value;
+                const orchEndpoint = document.getElementById('setting-orchestrator-endpoint').value.trim();
+                if (orchModel) {
+                    await fetch('/api/orchestrator', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            model: orchModel,
+                            backend: orchBackend,
+                            endpoint: orchEndpoint || undefined
+                        })
+                    });
+                }
+
+                // Save digest settings
+                const hoursStr = document.getElementById('setting-digest-hours').value.trim();
+                const digestHours = hoursStr ? hoursStr.split(',').map(h => parseInt(h.trim())).filter(h => !isNaN(h)) : [9, 18];
+                await fetch('/api/digest/settings', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        email_to: document.getElementById('setting-digest-email').value.trim(),
+                        email_from: '',
+                        smtp_host: document.getElementById('setting-smtp-host').value.trim(),
+                        smtp_port: parseInt(document.getElementById('setting-smtp-port').value) || 587,
+                        smtp_user: document.getElementById('setting-smtp-user').value.trim(),
+                        smtp_pass: document.getElementById('setting-smtp-pass').value,
+                        digest_enabled: document.getElementById('setting-digest-enabled').checked,
+                        digest_hours: digestHours
+                    })
+                });
+
                 hideSettings();
                 checkStatus();
             } catch (e) {
                 alert('Failed to save settings: ' + e.message);
             }
+        }
+
+        function fillGmailDefaults() {
+            document.getElementById('setting-smtp-host').value = 'smtp.gmail.com';
+            document.getElementById('setting-smtp-port').value = '587';
+            const email = document.getElementById('setting-digest-email').value;
+            if (email && email.includes('@gmail.com')) {
+                document.getElementById('setting-smtp-user').value = email;
+            }
+            document.getElementById('setting-smtp-pass').focus();
+            document.getElementById('setting-smtp-pass').placeholder = 'ここにアプリパスワードを貼り付け';
+        }
+
+        async function testDigest() {
+            const statusEl = document.getElementById('digest-test-status');
+            statusEl.textContent = 'Sending...';
+            try {
+                const resp = await fetch('/api/digest/test', { method: 'POST' });
+                if (resp.ok) {
+                    statusEl.textContent = 'Test email queued!';
+                } else {
+                    const err = await resp.text();
+                    statusEl.textContent = 'Error: ' + err;
+                }
+            } catch (e) {
+                statusEl.textContent = 'Failed: ' + e.message;
+            }
+            setTimeout(() => { statusEl.textContent = ''; }, 5000);
         }
 
         // Initialize threads and focus input
@@ -2660,6 +3039,70 @@
         }
         initThreads();
         messageInput.focus();
+
+        // ---- Idle Autonomous Thinking SSE ----
+        (function() {
+            const idleContainer = document.createElement('div');
+            idleContainer.id = 'idle-thinking-container';
+            idleContainer.className = 'idle-thinking-container hidden';
+            document.body.appendChild(idleContainer);
+
+            let idleSource = null;
+            function connectIdleStream() {
+                if (idleSource) { idleSource.close(); }
+                idleSource = new EventSource('/api/idle/stream');
+                idleSource.onmessage = function(e) {
+                    try {
+                        const event = JSON.parse(e.data);
+                        handleIdleEvent(event);
+                    } catch (err) {
+                        console.error('Idle SSE parse error:', err);
+                    }
+                };
+                idleSource.onerror = function() {
+                    idleSource.close();
+                    setTimeout(connectIdleStream, 10000);
+                };
+            }
+            connectIdleStream();
+
+            function handleIdleEvent(event) {
+                if (event.type === 'idle_start') {
+                    const modelLabel = event.model ? `<span class="idle-model">${event.model}</span>` : '';
+                    idleContainer.innerHTML = `<div class="idle-thinking-bubble">
+                        <div class="idle-header"><span class="idle-spinner"></span> siki が考え中... ${modelLabel}</div>
+                        <div class="idle-body">${event.content || ''}</div>
+                    </div>`;
+                    idleContainer.classList.remove('hidden');
+                } else if (event.type === 'idle_result') {
+                    idleContainer.classList.add('hidden');
+                    // Add result as assistant message in current thread
+                    if (event.content) {
+                        const label = event.name ? `【自律思考: ${event.name}】\n` : '';
+                        addMessage('assistant', label + event.content);
+                        chatContainer.scrollTop = chatContainer.scrollHeight;
+                    }
+                } else if (event.type === 'idle_interrupted') {
+                    idleContainer.classList.add('hidden');
+                } else if (event.type === 'new_thread') {
+                    // Proactive thread was created — refresh thread list to show unread badge
+                    idleContainer.classList.add('hidden');
+                    loadThreads();
+                }
+            }
+
+            // Clear idle display when user sends a message
+            const origSendMessage = window.sendMessage || sendMessage;
+            const _sendMessageWrapped = function() {
+                idleContainer.classList.add('hidden');
+                return origSendMessage.apply(this, arguments);
+            };
+            // Patch the onclick to also clear idle
+            const sendBtnEl = document.getElementById('send-btn');
+            if (sendBtnEl) {
+                sendBtnEl.onclick = _sendMessageWrapped;
+            }
+        })();
     </script>
 </body>
 </html>
