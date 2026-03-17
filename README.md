@@ -8,7 +8,13 @@
 - **Single Binary** - One portable executable, no dependencies
 - **Web GUI** - Beautiful chat interface with markdown support
 - **Agent Tools** - File operations, command execution, web search, diagram generation
+- **Twitter AI Curation** - Fetch timeline, auto-filter by topic with LLM keyword extraction, evaluate importance (HIGH/MID/LOW), and generate streaming summaries
+- **Tool Result Pane** - Dedicated side panel for full tool output with auto-scroll and click-to-review past results
+- **Real-time Progress** - Live SSE streaming of AI filtering, evaluation, and summarization progress
+- **Multi-Model Pipeline** - LFM2.5 (fast 1.2B) for filtering/evaluation, gpt-oss (20B) for final summarization
 - **Multi-Backend** - Supports Ollama, MLX-LM (Apple Silicon), and vLLM (NVIDIA GPU)
+- **Image Generation** - FLUX.2 Klein 4B for text-to-image generation
+- **Video Generation** - Helios for text-to-video generation
 - **Mac App** - Native .app bundle for macOS
 
 ## Screenshots
@@ -108,6 +114,11 @@ Siki comes with powerful built-in tools:
 | `web_fetch` | Fetch webpage content |
 | `web_images` | Extract images from URLs |
 | `diagram` | Generate diagrams with Graphviz |
+| `twitter_timeline` | Fetch and AI-curate your Twitter timeline |
+| `twitter_search` | Search Twitter with keyword queries |
+| `generate_image` | Generate images with FLUX.2 Klein 4B |
+| `generate_video` | Generate videos with Helios |
+| `run_code` | Execute Python/JS code in sandbox |
 
 ## Backend Support
 
@@ -149,11 +160,27 @@ siki/
 └── .goreleaser.yaml
 ```
 
+## Twitter Integration
+
+Siki can fetch your Twitter timeline, automatically filter tweets by topic, evaluate importance, and generate a curated summary — all locally.
+
+1. Configure Twitter API credentials in the Settings panel (OAuth 1.0a)
+2. Ask: "Twitterのタイムラインからニュースをまとめて"
+3. Siki will:
+   - Fetch your timeline via Twitter API v2
+   - Extract the core topic using LFM2.5
+   - Generate keywords and filter tweets by relevance
+   - Evaluate each tweet's importance (HIGH/MID/LOW)
+   - Generate a streaming summary with gpt-oss
+
+All processing is visible in real-time via the tool result pane.
+
 ## Requirements
 
 - Go 1.21+ (for building)
 - Ollama, MLX-LM, or vLLM (for AI inference)
 - Graphviz (optional, for diagram generation)
+- Twitter API credentials (optional, for Twitter features)
 
 ## License
 
