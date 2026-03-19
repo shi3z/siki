@@ -104,6 +104,16 @@ type Config struct {
 	// Bluesky feed integration
 	BlueskyEnabled      bool     `json:"bluesky_enabled"`
 	BlueskyStarterPacks []string `json:"bluesky_starter_packs"`
+	BlueskyIdentifier   string   `json:"bluesky_identifier"`   // handle or email for auth
+	BlueskyAppPassword  string   `json:"bluesky_app_password"` // app password for auth
+	// Bluesky Jetstream monitoring
+	JetstreamKeywords []string `json:"jetstream_keywords"`
+	// Zeroboot sandbox
+	ZerobootEndpoint string `json:"zeroboot_endpoint"` // default: "https://api.zeroboot.dev"
+	ZerobootAPIKey   string `json:"zeroboot_api_key"`  // default: "zb_demo_hn2026"
+	// External skill API keys
+	BraveAPIKey string `json:"brave_api_key"`
+	GroqAPIKey  string `json:"groq_api_key"`
 }
 
 // primaryProvider returns the first provider, or builds one from legacy config fields
@@ -185,9 +195,9 @@ func defaultConfig() *Config {
 		Workspace:   ".",
 		MaxTurns:    MaxTurns,
 		VisionModel: "moondream",
-		SubModel:        "qwen3.5:latest",
+		SubModel:        "gpt-oss:latest",
 		SubModelBackend: "ollama",
-		Orchestrator:        "qwen3.5:latest",
+		Orchestrator:        "gpt-oss-20b-128k:latest",
 		OrchestratorBackend: "ollama",
 		ImageModel:   "black-forest-labs/FLUX.2-klein-4B",
 		ImageEndpoint: "http://localhost:8100",
@@ -323,6 +333,202 @@ type PluginTool struct {
 type PluginUI struct {
 	JS  string `json:"js"`
 	CSS string `json:"css"`
+}
+
+// Skill system
+type Skill struct {
+	Name        string   `json:"name"`
+	Description string   `json:"description"`
+	Content     string   `json:"content,omitempty"` // SKILL.md full content
+	Files       []string `json:"files,omitempty"`   // supporting files in skill dir
+	Source      string   `json:"source,omitempty"`  // e.g. "superpowers"
+}
+
+var (
+	loadedSkills []Skill
+	skillsMu     sync.RWMutex
+)
+
+func skillsDir() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".siki", "skills")
+}
+
+func loadSkills() []Skill {
+	dir := skillsDir()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	var skills []Skill
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		skillPath := filepath.Join(dir, e.Name(), "SKILL.md")
+		data, err := os.ReadFile(skillPath)
+		if err != nil {
+			continue
+		}
+		content := string(data)
+		name, desc := parseSkillFrontmatter(content)
+		if name == "" {
+			name = e.Name()
+		}
+
+		// List supporting files
+		var files []string
+		subEntries, _ := os.ReadDir(filepath.Join(dir, e.Name()))
+		for _, se := range subEntries {
+			if !se.IsDir() && se.Name() != "SKILL.md" {
+				files = append(files, se.Name())
+			}
+		}
+
+		// Detect source
+		source := ""
+		if _, err := os.Stat(filepath.Join(dir, e.Name(), ".superpowers")); err == nil {
+			source = "superpowers"
+		}
+
+		skills = append(skills, Skill{
+			Name:        name,
+			Description: desc,
+			Content:     content,
+			Files:       files,
+			Source:       source,
+		})
+	}
+	return skills
+}
+
+func parseSkillFrontmatter(content string) (name, description string) {
+	if !strings.HasPrefix(content, "---") {
+		return "", ""
+	}
+	end := strings.Index(content[3:], "---")
+	if end < 0 {
+		return "", ""
+	}
+	frontmatter := content[3 : 3+end]
+	for _, line := range strings.Split(frontmatter, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "name:") {
+			name = strings.TrimSpace(strings.TrimPrefix(line, "name:"))
+			name = strings.Trim(name, "\"'")
+		} else if strings.HasPrefix(line, "description:") {
+			description = strings.TrimSpace(strings.TrimPrefix(line, "description:"))
+			description = strings.Trim(description, "\"'")
+		}
+	}
+	return
+}
+
+func getSkillByName(name string) *Skill {
+	skillsMu.RLock()
+	defer skillsMu.RUnlock()
+	for i := range loadedSkills {
+		if loadedSkills[i].Name == name {
+			return &loadedSkills[i]
+		}
+	}
+	return nil
+}
+
+func getSkillContent(name string) string {
+	skill := getSkillByName(name)
+	if skill == nil {
+		return ""
+	}
+	// Return SKILL.md content without frontmatter
+	content := skill.Content
+	if strings.HasPrefix(content, "---") {
+		if end := strings.Index(content[3:], "---"); end >= 0 {
+			content = strings.TrimSpace(content[3+end+3:])
+		}
+	}
+	// Replace {baseDir} placeholder with actual skill directory path
+	baseDir := filepath.Join(skillsDir(), name)
+	content = strings.ReplaceAll(content, "{baseDir}", baseDir)
+	return content
+}
+
+func getSkillFile(skillName, fileName string) string {
+	path := filepath.Join(skillsDir(), skillName, fileName)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	return string(data)
+}
+
+func installSkillsFromDir(srcDir, source string) (int, error) {
+	destDir := skillsDir()
+	os.MkdirAll(destDir, 0755)
+
+	entries, err := os.ReadDir(srcDir)
+	if err != nil {
+		return 0, err
+	}
+	count := 0
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		skillSrc := filepath.Join(srcDir, e.Name(), "SKILL.md")
+		if _, err := os.Stat(skillSrc); err != nil {
+			continue
+		}
+		destSkillDir := filepath.Join(destDir, e.Name())
+		os.MkdirAll(destSkillDir, 0755)
+
+		// Copy all files in skill directory
+		subEntries, _ := os.ReadDir(filepath.Join(srcDir, e.Name()))
+		for _, se := range subEntries {
+			if se.IsDir() {
+				// Copy subdirectories recursively
+				copyDirRecursive(filepath.Join(srcDir, e.Name(), se.Name()), filepath.Join(destSkillDir, se.Name()))
+				continue
+			}
+			srcFile := filepath.Join(srcDir, e.Name(), se.Name())
+			dstFile := filepath.Join(destSkillDir, se.Name())
+			data, err := os.ReadFile(srcFile)
+			if err != nil {
+				continue
+			}
+			os.WriteFile(dstFile, data, 0644)
+		}
+		// Mark source
+		if source != "" {
+			os.WriteFile(filepath.Join(destSkillDir, "."+source), []byte(source), 0644)
+		}
+		count++
+	}
+	// Reload
+	skillsMu.Lock()
+	loadedSkills = loadSkills()
+	skillsMu.Unlock()
+	return count, nil
+}
+
+func copyDirRecursive(src, dst string) {
+	os.MkdirAll(dst, 0755)
+	entries, err := os.ReadDir(src)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		srcPath := filepath.Join(src, e.Name())
+		dstPath := filepath.Join(dst, e.Name())
+		if e.IsDir() {
+			copyDirRecursive(srcPath, dstPath)
+		} else {
+			data, err := os.ReadFile(srcPath)
+			if err == nil {
+				os.WriteFile(dstPath, data, 0644)
+			}
+		}
+	}
 }
 
 var tools = []Tool{
@@ -485,6 +691,38 @@ var tools = []Tool{
 		},
 	},
 	{
+		Name:        "bluesky_search",
+		Description: "Blueskyでキーワード検索して投稿を取得する。特定のトピック・キーワードでBlueskyの投稿を検索したい場合に使用。",
+		Parameters: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"query": map[string]interface{}{
+					"type":        "string",
+					"description": "検索キーワード",
+				},
+			},
+			"required": []string{"query"},
+		},
+	},
+	{
+		Name:        "jetstream_search",
+		Description: "Bluesky Jetstreamで監視・保存した投稿を検索する。キーワードモニタリングで収集した過去のBluesky投稿をキーワードで検索。",
+		Parameters: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"query": map[string]interface{}{
+					"type":        "string",
+					"description": "検索キーワード",
+				},
+				"days": map[string]interface{}{
+					"type":        "integer",
+					"description": "何日前まで遡るか（デフォルト: 7）",
+				},
+			},
+			"required": []string{"query"},
+		},
+	},
+	{
 		Name:        "web_images",
 		Description: "Extract representative images from a web page (OGP image, main images). Returns markdown image syntax. Include the result directly in your response to display images.",
 		Parameters: map[string]interface{}{
@@ -595,8 +833,30 @@ var tools = []Tool{
 		},
 	},
 	{
+		Name:        "sandbox_exec",
+		Description: "Execute Python or JavaScript code in an isolated Zeroboot VM sandbox (~0.8ms startup). Use for safe code execution, data processing, chart generation. To output files, base64-encode and print as: __FILE:filename:base64data__. The sandbox has numpy available. For PNG image generation, use struct+zlib to build PNG manually or use numpy for pixel data. Use exec(base64.b64decode('...').decode()) for multiline scripts since the sandbox runs python -c.",
+		Parameters: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"code": map[string]interface{}{
+					"type":        "string",
+					"description": "Python or JavaScript code to execute",
+				},
+				"language": map[string]interface{}{
+					"type":        "string",
+					"description": "Language: 'python' (default) or 'node'",
+				},
+				"timeout": map[string]interface{}{
+					"type":        "number",
+					"description": "Timeout in seconds (default: 30, max: 300)",
+				},
+			},
+			"required": []string{"code"},
+		},
+	},
+	{
 		Name:        "docker_exec",
-		Description: "Execute a command inside a GPU-enabled Docker container (siki-worker). The container has CUDA, ffmpeg, Python3, PyTorch, and openai-whisper pre-installed. Files uploaded via /api/upload are available in /workspace. Use this for GPU-intensive tasks like transcription, audio/video processing, and ML inference.",
+		Description: "Execute a command inside a GPU-enabled Docker container (siki-worker). Use for GPU-intensive tasks like ML inference, whisper transcription. Falls back if Docker unavailable.",
 		Parameters: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
@@ -967,7 +1227,36 @@ var pluginManagementTools = []Tool{
 	},
 }
 
-// getAllTools returns built-in tools + plugin tools + plugin management tools
+var skillTools = []Tool{
+	{
+		Name:        "use_skill",
+		Description: "Activate a skill to guide your workflow. Skills provide structured processes for brainstorming, debugging, planning, code review, etc. The skill's instructions will be loaded into context.",
+		Parameters: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"name": map[string]interface{}{
+					"type":        "string",
+					"description": "Skill name to activate (e.g. 'brainstorming', 'systematic-debugging')",
+				},
+				"file": map[string]interface{}{
+					"type":        "string",
+					"description": "Optional: read a supporting file from the skill directory (e.g. 'visual-companion.md')",
+				},
+			},
+			"required": []string{"name"},
+		},
+	},
+	{
+		Name:        "list_skills",
+		Description: "List all installed skills with descriptions",
+		Parameters: map[string]interface{}{
+			"type":       "object",
+			"properties": map[string]interface{}{},
+		},
+	},
+}
+
+// getAllTools returns built-in tools + plugin tools + skill tools + plugin management tools
 func getAllTools() []Tool {
 	all := make([]Tool, len(tools))
 	copy(all, tools)
@@ -985,6 +1274,7 @@ func getAllTools() []Tool {
 	pluginMu.RUnlock()
 
 	all = append(all, pluginManagementTools...)
+	all = append(all, skillTools...)
 	return all
 }
 
@@ -993,6 +1283,7 @@ var coreToolNames = map[string]bool{
 	"web_search": true, "web_fetch": true, "read_file": true,
 	"write_file": true, "list_files": true, "execute_command": true,
 	"search_files": true, "grep": true, "diagram": true, "run_code": true,
+	"use_skill": true, "list_skills": true, "sandbox_exec": true,
 }
 
 // toolTriggers maps keywords in user messages to additional tool names
@@ -1542,7 +1833,7 @@ func (a *Agent) executeTool(name string, args map[string]interface{}) (result st
 		if userIntent == "" {
 			userIntent = a.lastUserMessage()
 		}
-		intentPrompt := fmt.Sprintf(`Extract the search topic from this message. Remove action/instruction words (bluesky, ブルースカイ, フィード, まとめて, etc). Output ONLY the topic, nothing else.
+		intentPrompt := fmt.Sprintf(`Extract the search topic from this message. Remove action/instruction words (bluesky, ブルースカイ, フィード, まとめて, 見せて, 教えて, etc). Output ONLY the topic, nothing else. If no specific topic remains, output "AI・機械学習・テクノロジー".
 Message: %s
 Topic:`, userIntent)
 		if a.sendEvent != nil {
@@ -1557,14 +1848,74 @@ Topic:`, userIntent)
 				userIntent = extractedIntent
 			}
 		}
+		// デフォルトテーマ: 汎用的なリクエスト時はAI/MLテーマを設定
+		if userIntent == "" || len(userIntent) < 3 {
+			userIntent = "AI・機械学習・テクノロジー"
+		}
 		if a.sendEvent != nil {
 			a.sendEvent(StreamEvent{Type: "progress", Content: fmt.Sprintf("テーマ: %s", userIntent)})
 		}
-		filtered := filterBlueskyByIntent(recentPosts, userIntent, a.config, a.sendEvent)
-		if len(filtered) == 0 {
+		evaluated := evaluateBlueskyPostsConcurrently(recentPosts, userIntent, a.config, a.sendEvent)
+		if len(evaluated) == 0 {
 			return fmt.Sprintf("\n\n---\nAI選別結果: %d件中、「%s」に該当する投稿はありませんでした。", len(recentPosts), userIntent), nil
 		}
-		return formatBlueskyPosts(filtered, fmt.Sprintf("\n\n---\n## AI選別結果: %d件中%d件を抽出", len(recentPosts), len(filtered))), nil
+		return formatEvaluatedBlueskyPosts(evaluated, fmt.Sprintf("\n\n---\n## AI選別結果: %d件中%d件を抽出（重要度順）", len(recentPosts), len(evaluated))), nil
+	case "bluesky_search":
+		query, _ := args["query"].(string)
+		if query == "" {
+			// Extract query from user message
+			query = a.lastUserMessage()
+			extractPrompt := fmt.Sprintf(`Extract the Bluesky search keyword from this message. Remove action words (bluesky, ブルースカイ, 検索, 探して, 調べて, etc). Output ONLY the search keyword/phrase, nothing else.
+Message: %s
+Keyword:`, query)
+			if extracted, err := callFastModel(extractPrompt, a.config); err == nil {
+				extracted = strings.TrimSpace(extracted)
+				extracted = strings.Trim(extracted, "「」\"'")
+				if extracted != "" {
+					query = extracted
+				}
+			}
+		}
+		if query == "" {
+			return "", fmt.Errorf("検索キーワードを指定してください")
+		}
+		if a.sendEvent != nil {
+			a.sendEvent(StreamEvent{Type: "progress", Content: fmt.Sprintf("Blueskyで「%s」を検索中...", query)})
+		}
+		posts, err := searchBlueskyPosts(query, a.config)
+		if err != nil {
+			return "", fmt.Errorf("Bluesky検索失敗: %v", err)
+		}
+		if len(posts) == 0 {
+			return fmt.Sprintf("Blueskyで「%s」に該当する投稿は見つかりませんでした。", query), nil
+		}
+		// Show raw results first
+		rawResults := formatBlueskyPosts(posts, fmt.Sprintf("Bluesky検索: 「%s」（%d件）", query, len(posts)))
+		if a.sendEvent != nil {
+			a.sendEvent(StreamEvent{Type: "tool_call", Name: "bluesky_search", Result: rawResults})
+		}
+		// Evaluate each post individually with sub-agents
+		evaluated := evaluateBlueskyPostsConcurrently(posts, query, a.config, a.sendEvent)
+		if len(evaluated) == 0 {
+			return fmt.Sprintf("\n\n---\n検索結果%d件中、重要度の高い投稿はありませんでした。", len(posts)), nil
+		}
+		return formatEvaluatedBlueskyPosts(evaluated, fmt.Sprintf("\n\n---\n## 検索結果分析: %d件中%d件を重要度順にピックアップ", len(posts), len(evaluated))), nil
+
+	case "jetstream_search":
+		query, _ := args["query"].(string)
+		if query == "" {
+			return "", fmt.Errorf("検索キーワードを指定してください")
+		}
+		days := 7
+		if d, ok := args["days"].(float64); ok && d > 0 {
+			days = int(d)
+		}
+		result, count := searchJetstreamPosts(query, days)
+		if count == 0 {
+			return result, nil
+		}
+		return result, nil
+
 	case "twitter_timeline":
 		if !hasTwitterOAuth1a(a.config) {
 			return "", fmt.Errorf("Twitter OAuth 1.0a が設定されていません。設定画面からConsumer Key/Secret, Access Token/Secretを設定してください")
@@ -1701,6 +2052,45 @@ Topic:`, userIntent)
 			return "", fmt.Errorf("html parameter is required")
 		}
 		return a.runCode(html, title)
+	case "sandbox_exec":
+		code, _ := args["code"].(string)
+		if code == "" {
+			return "", fmt.Errorf("code is required")
+		}
+		language, _ := args["language"].(string)
+		timeout := 30
+		if t, ok := args["timeout"].(float64); ok {
+			timeout = int(t)
+		}
+		if timeout > 300 {
+			timeout = 300
+		}
+		result, files, err := zerobootExecWithFiles(code, language, timeout)
+		if err != nil {
+			return "", err
+		}
+		var sb strings.Builder
+		if result.ExitCode != 0 {
+			sb.WriteString(fmt.Sprintf("Exit code: %d\n", result.ExitCode))
+		}
+		sb.WriteString(fmt.Sprintf("(fork: %.1fms, exec: %.1fms)\n", result.ForkTimeMs, result.ExecTimeMs))
+		if result.Stdout != "" {
+			sb.WriteString("\n" + result.Stdout)
+		}
+		if result.Stderr != "" {
+			sb.WriteString("\nSTDERR:\n" + result.Stderr)
+		}
+		// Save any output files to playground
+		for name, data := range files {
+			outPath := filepath.Join(playgroundDir, name)
+			os.WriteFile(outPath, data, 0644)
+			sb.WriteString(fmt.Sprintf("\n\nFile saved: /playground/%s", name))
+			ext := strings.ToLower(filepath.Ext(name))
+			if ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".webp" || ext == ".gif" {
+				sb.WriteString(fmt.Sprintf("\n![%s](/playground/%s)", name, name))
+			}
+		}
+		return sb.String(), nil
 	case "docker_exec":
 		timeout := 300
 		if t, ok := args["timeout"].(float64); ok {
@@ -1757,6 +2147,43 @@ Topic:`, userIntent)
 	case "query_model":
 		systemPrompt, _ := args["system"].(string)
 		return a.queryModel(args["provider"].(string), args["message"].(string), systemPrompt)
+	case "use_skill":
+		skillName, _ := args["name"].(string)
+		fileName, _ := args["file"].(string)
+		if skillName == "" {
+			return "Error: skill name required", nil
+		}
+		if fileName != "" {
+			content := getSkillFile(skillName, fileName)
+			if content == "" {
+				return fmt.Sprintf("Error: file '%s' not found in skill '%s'", fileName, skillName), nil
+			}
+			return fmt.Sprintf("# Skill file: %s/%s\n\n%s", skillName, fileName, content), nil
+		}
+		content := getSkillContent(skillName)
+		if content == "" {
+			return fmt.Sprintf("Error: skill '%s' not found. Use list_skills to see available skills.", skillName), nil
+		}
+		return fmt.Sprintf("# Skill activated: %s\n\nFollow the instructions below:\n\n%s", skillName, content), nil
+	case "list_skills":
+		skillsMu.RLock()
+		defer skillsMu.RUnlock()
+		if len(loadedSkills) == 0 {
+			return "No skills installed. Skills can be installed via the Settings > Skills panel or /api/skills/install API.", nil
+		}
+		var sb strings.Builder
+		sb.WriteString(fmt.Sprintf("## Installed Skills (%d)\n\n", len(loadedSkills)))
+		for _, s := range loadedSkills {
+			src := ""
+			if s.Source != "" {
+				src = fmt.Sprintf(" [%s]", s.Source)
+			}
+			sb.WriteString(fmt.Sprintf("- **%s**%s: %s\n", s.Name, src, s.Description))
+			if len(s.Files) > 0 {
+				sb.WriteString(fmt.Sprintf("  Files: %s\n", strings.Join(s.Files, ", ")))
+			}
+		}
+		return sb.String(), nil
 	case "self_status":
 		return a.selfStatus()
 	case "self_modify_prompt":
@@ -3440,20 +3867,17 @@ func streamOllamaGenerate(model, prompt string, maxTokens int, timeout time.Dura
 }
 
 // alternateSubModels returns the two sub-models available for retry alternation.
-// Primary is config.SubModel (qwen3.5), secondary is gpt-oss.
+// Primary is config.SubModel (gpt-oss), secondary is also gpt-oss.
 func alternateSubModels(config *Config) (primary, secondary string) {
 	primary = config.SubModel
 	if primary == "" {
-		primary = "qwen3.5:latest"
+		primary = "gpt-oss:latest"
 	}
 	secondary = "gpt-oss:latest"
-	if primary == secondary {
-		secondary = "qwen3.5:latest"
-	}
 	return
 }
 
-// pickRetryModel picks a model for retry, alternating between qwen3.5 and gpt-oss.
+// pickRetryModel picks a model for retry.
 // attemptNum 0 = primary model (already tried), 1+ = alternate.
 func pickRetryModel(config *Config, attemptNum int) string {
 	primary, secondary := alternateSubModels(config)
@@ -5251,6 +5675,7 @@ func detectToolFromKeywords(userMsg string) string {
 		{[]string{"画像生成", "イラスト描", "インフォグラフィック", "image generat", "generate image", "画像を生成", "画像を作"}, "generate_image"},
 		{[]string{"過去の会話", "会話ログ", "過去ログ", "前の会話", "さっきの会話", "会話履歴", "スレッド検索", "やり取り"}, "search_threads"},
 		{[]string{"bluesky", "bsky", "ブルースカイ"}, "bluesky_feed"},
+		{[]string{"bluesky検索", "bsky検索", "ブルースカイ検索", "bluesky search"}, "bluesky_search"},
 		{[]string{"タイムライン", "timeline", "フィード", "feed"}, "twitter_timeline"},
 		{[]string{"twitter", "ツイッター", "ツイート", "tweet", "x.com"}, "twitter_search"},
 		{[]string{"ニュース", "news", "最新", "速報", "トレンド"}, "web_search"},
@@ -5851,36 +6276,41 @@ func (ws *WebServer) dualModelPipeline(ctx context.Context, agent *Agent, userMs
 
 	// Fast-path: skip orchestrator for Bluesky requests
 	if containsBlueskyKeywords(userMsg) && ws.config.BlueskyEnabled {
-		fmt.Printf("[siki] Fast-path: bluesky_feed (skipping orchestrator)\n")
+		// Detect if this is a search request
+		bskyTool := "bluesky_feed"
+		if isBlueskySearchRequest(userMsg) {
+			bskyTool = "bluesky_search"
+		}
+		fmt.Printf("[siki] Fast-path: %s (skipping orchestrator)\n", bskyTool)
 		agent.sendEvent = sendEvent
 		args := map[string]interface{}{}
 
-		sendEvent(StreamEvent{Type: "tool_start", Name: "bluesky_feed"})
-		result, err := agent.executeTool("bluesky_feed", args)
+		sendEvent(StreamEvent{Type: "tool_start", Name: bskyTool})
+		result, err := agent.executeTool(bskyTool, args)
 		if err != nil {
 			sendEvent(StreamEvent{Type: "error", Error: fmt.Sprintf("Bluesky error: %v", err)})
 			return ""
 		}
-		sendEvent(StreamEvent{Type: "tool_call", Name: "bluesky_feed", Result: result})
+		sendEvent(StreamEvent{Type: "tool_call", Name: bskyTool, Result: result})
 
 		toolCallID := fmt.Sprintf("fast-%d", time.Now().UnixMilli())
 		argsJSON, _ := json.Marshal(args)
 		assistantMsg := Message{Role: "assistant", ToolCalls: []ToolCall{{ID: toolCallID, Type: "function", Function: struct {
 			Name      string `json:"name"`
 			Arguments string `json:"arguments"`
-		}{Name: "bluesky_feed", Arguments: string(argsJSON)}}}}
+		}{Name: bskyTool, Arguments: string(argsJSON)}}}}
 		agent.messages = append(agent.messages, assistantMsg)
 		saveMsg(assistantMsg, "")
 		toolMsg := Message{Role: "tool", Content: result, ToolCallID: toolCallID}
 		agent.messages = append(agent.messages, toolMsg)
-		saveMsg(toolMsg, "bluesky_feed")
+		saveMsg(toolMsg, bskyTool)
 
 		// Generate summary with gpt-oss
 		summaryInput := result
 		if len([]rune(summaryInput)) > 6000 {
 			summaryInput = string([]rune(summaryInput)[:6000]) + "\n...(省略)"
 		}
-		summaryPrompt := fmt.Sprintf(`あなたはニュースキュレーターです。以下はBluesky AI/MLコミュニティからAIが選別した投稿です。ユーザーの要求「%s」に基づき、重要なニュースや話題をわかりやすくまとめてください。
+		summaryPrompt := fmt.Sprintf(`あなたはニュースキュレーターです。以下はBlueskyから取得した投稿です。ユーザーの要求「%s」に基づき、重要なニュースや話題をわかりやすくまとめてください。
 - 重要度の高い順に整理
 - 各トピックの要点を簡潔に
 - 注目すべきリンクがあれば言及
@@ -5913,7 +6343,7 @@ func (ws *WebServer) dualModelPipeline(ctx context.Context, agent *Agent, userMs
 		sendEvent(StreamEvent{Type: "done"})
 		if cID != "" {
 			ws.mu.Lock()
-			ws.lastExec[cID] = &LastToolExecution{UserMsg: userMsg, ToolName: "bluesky_feed", Args: args, ToolResult: result, Response: summary, UsedAgent: false}
+			ws.lastExec[cID] = &LastToolExecution{UserMsg: userMsg, ToolName: bskyTool, Args: args, ToolResult: result, Response: summary, UsedAgent: false}
 			ws.mu.Unlock()
 		}
 		return summary
@@ -6149,10 +6579,15 @@ func (ws *WebServer) dualModelPipeline(ctx context.Context, agent *Agent, userMs
 		decision.Args = nil
 	}
 
-	// Force bluesky_feed when Bluesky keywords detected
-	if decision.Tool != "bluesky_feed" && containsBlueskyKeywords(userMsg) {
-		fmt.Printf("[siki] Forcing bluesky_feed: Bluesky keyword detected (was: %s)\n", decision.Tool)
-		decision.Tool = "bluesky_feed"
+	// Force bluesky tool when Bluesky keywords detected
+	if decision.Tool != "bluesky_feed" && decision.Tool != "bluesky_search" && containsBlueskyKeywords(userMsg) {
+		if isBlueskySearchRequest(userMsg) {
+			fmt.Printf("[siki] Forcing bluesky_search: Bluesky search keyword detected (was: %s)\n", decision.Tool)
+			decision.Tool = "bluesky_search"
+		} else {
+			fmt.Printf("[siki] Forcing bluesky_feed: Bluesky keyword detected (was: %s)\n", decision.Tool)
+			decision.Tool = "bluesky_feed"
+		}
 		decision.Args = nil
 	}
 
@@ -8489,12 +8924,26 @@ func (a *Agent) selfBenchmark(args map[string]interface{}) (string, error) {
 
 // UserProfile stores user interests and preferences learned from conversations.
 type UserProfile struct {
+	// AI推定フィールド
 	Interests     []string  `json:"interests"`
 	Occupation    string    `json:"occupation"`
 	TechLevel     string    `json:"tech_level"`
 	Preferences   []string  `json:"preferences"`
 	FrequentTools []string  `json:"frequent_tools"`
 	LastUpdated   time.Time `json:"last_updated"`
+	// ユーザー申告フィールド
+	Name       string   `json:"name,omitempty"`
+	Age        int      `json:"age,omitempty"`
+	Company    string   `json:"company,omitempty"`
+	Department string   `json:"department,omitempty"`
+	Role       string   `json:"role,omitempty"`
+	Clients    []string `json:"clients,omitempty"`
+	Skills     []string `json:"skills,omitempty"`
+	Location   string   `json:"location,omitempty"`
+	Bio        string   `json:"bio,omitempty"`
+	// 質問管理
+	AskedFields []string  `json:"asked_fields,omitempty"`
+	LastAsked   time.Time `json:"last_asked,omitempty"`
 }
 
 func userProfilePath() string {
@@ -8511,11 +8960,38 @@ func loadUserProfile() *UserProfile {
 	if err := json.Unmarshal(data, &p); err != nil {
 		return nil
 	}
+	// 読み込み時にも肥大化を防止
+	trimmed := false
+	if len(p.Interests) > 30 {
+		p.Interests = p.Interests[len(p.Interests)-30:]
+		trimmed = true
+	}
+	if len(p.Preferences) > 20 {
+		p.Preferences = p.Preferences[len(p.Preferences)-20:]
+		trimmed = true
+	}
+	if len(p.FrequentTools) > 15 {
+		p.FrequentTools = p.FrequentTools[len(p.FrequentTools)-15:]
+		trimmed = true
+	}
+	if trimmed {
+		saveUserProfile(&p)
+	}
 	return &p
 }
 
 func saveUserProfile(p *UserProfile) error {
 	p.LastUpdated = time.Now()
+	// トリミング: 肥大化防止
+	if len(p.Interests) > 30 {
+		p.Interests = p.Interests[len(p.Interests)-30:]
+	}
+	if len(p.Preferences) > 20 {
+		p.Preferences = p.Preferences[len(p.Preferences)-20:]
+	}
+	if len(p.FrequentTools) > 15 {
+		p.FrequentTools = p.FrequentTools[len(p.FrequentTools)-15:]
+	}
 	data, err := json.MarshalIndent(p, "", "  ")
 	if err != nil {
 		return err
@@ -8556,6 +9032,23 @@ func mergeProfile(existing, incoming *UserProfile) *UserProfile {
 	if incoming.TechLevel != "" {
 		existing.TechLevel = incoming.TechLevel
 	}
+	// 新フィールド: AI推定で判明した場合のみ上書き（ユーザー手動入力を優先）
+	if incoming.Name != "" && existing.Name == "" {
+		existing.Name = incoming.Name
+	}
+	if incoming.Age != 0 && existing.Age == 0 {
+		existing.Age = incoming.Age
+	}
+	if incoming.Company != "" && existing.Company == "" {
+		existing.Company = incoming.Company
+	}
+	if incoming.Role != "" && existing.Role == "" {
+		existing.Role = incoming.Role
+	}
+	if incoming.Location != "" && existing.Location == "" {
+		existing.Location = incoming.Location
+	}
+	existing.Clients = addUnique(existing.Clients, incoming.Clients)
 	return existing
 }
 
@@ -8590,7 +9083,9 @@ func (ws *WebServer) updateUserProfile() {
 
 	prompt := fmt.Sprintf(`以下のユーザー発言から、ユーザーのプロファイルを分析せよ。
 JSON形式で出力:
-{"interests":["興味1","興味2"],"occupation":"推定職業","tech_level":"beginner|intermediate|advanced|expert","preferences":["傾向1"],"frequent_tools":["よく使うツール"]}
+{"interests":["興味1","興味2"],"occupation":"推定職業","tech_level":"beginner|intermediate|advanced|expert","preferences":["傾向1"],"frequent_tools":["よく使うツール"],"name":"判明した名前","age":0,"company":"判明した勤務先","role":"判明した役職","clients":["判明した取引先"],"location":"判明した所在地"}
+
+不明なフィールドは空文字列や空配列、age不明なら0にせよ。
 
 ユーザー発言:
 %s
@@ -8617,11 +9112,153 @@ JSONのみ出力せよ。`, userMsgs.String())
 
 	existing := loadUserProfile()
 	merged := mergeProfile(existing, &incoming)
+
+	// 定期コンパクト化: interests/preferencesが閾値を超えたらLLMで要約統合
+	if len(merged.Interests) > 25 || len(merged.Preferences) > 15 {
+		compacted := compactProfile(merged, ws.config)
+		if compacted != nil {
+			merged = compacted
+		}
+	}
+
 	if err := saveUserProfile(merged); err != nil {
 		fmt.Printf("[siki] User profile save failed: %v\n", err)
 		return
 	}
-	fmt.Printf("[siki] User profile updated: interests=%v, occupation=%s\n", merged.Interests, merged.Occupation)
+	fmt.Printf("[siki] User profile updated: interests=%d, preferences=%d, occupation=%s\n", len(merged.Interests), len(merged.Preferences), merged.Occupation)
+}
+
+// compactProfile uses LLM to consolidate and deduplicate profile lists.
+func compactProfile(p *UserProfile, config *Config) *UserProfile {
+	prompt := fmt.Sprintf(`以下のユーザープロフィールのリストを整理・統合してください。
+重複や類似項目を統合し、重要度の高い順に並べてください。
+
+興味リスト（現在%d件 → 最大15件に要約）:
+%s
+
+傾向リスト（現在%d件 → 最大10件に要約）:
+%s
+
+ツールリスト（現在%d件 → 最大10件に要約）:
+%s
+
+JSON形式で出力:
+{"interests":["要約済み興味1","要約済み興味2"],"preferences":["要約済み傾向1"],"frequent_tools":["ツール1"]}
+
+JSONのみ出力せよ。`,
+		len(p.Interests), strings.Join(p.Interests, ", "),
+		len(p.Preferences), strings.Join(p.Preferences, ", "),
+		len(p.FrequentTools), strings.Join(p.FrequentTools, ", "))
+
+	_, response, err := callSubModel(prompt, config)
+	if err != nil {
+		fmt.Printf("[siki] Profile compaction failed: %v\n", err)
+		return nil
+	}
+
+	start := strings.Index(response, "{")
+	end := strings.LastIndex(response, "}")
+	if start < 0 || end <= start {
+		return nil
+	}
+
+	var compacted struct {
+		Interests     []string `json:"interests"`
+		Preferences   []string `json:"preferences"`
+		FrequentTools []string `json:"frequent_tools"`
+	}
+	if err := json.Unmarshal([]byte(response[start:end+1]), &compacted); err != nil {
+		fmt.Printf("[siki] Profile compaction parse failed: %v\n", err)
+		return nil
+	}
+
+	if len(compacted.Interests) > 0 {
+		p.Interests = compacted.Interests
+	}
+	if len(compacted.Preferences) > 0 {
+		p.Preferences = compacted.Preferences
+	}
+	if len(compacted.FrequentTools) > 0 {
+		p.FrequentTools = compacted.FrequentTools
+	}
+	fmt.Printf("[siki] Profile compacted: interests=%d, preferences=%d, tools=%d\n",
+		len(p.Interests), len(p.Preferences), len(p.FrequentTools))
+	return p
+}
+
+// profileMissingFields returns field names that are important but not yet filled.
+func profileMissingFields(p *UserProfile) []string {
+	var missing []string
+	if p.Name == "" {
+		missing = append(missing, "name")
+	}
+	if p.Occupation == "" {
+		missing = append(missing, "occupation")
+	}
+	if p.Age == 0 {
+		missing = append(missing, "age")
+	}
+	if p.Company == "" {
+		missing = append(missing, "company")
+	}
+	if p.Role == "" {
+		missing = append(missing, "role")
+	}
+	if p.Location == "" {
+		missing = append(missing, "location")
+	}
+	return missing
+}
+
+// handleProfile handles GET/POST /api/profile
+func (ws *WebServer) handleProfile(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case "GET":
+		profile := loadUserProfile()
+		if profile == nil {
+			profile = &UserProfile{}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(profile)
+	case "POST":
+		var input struct {
+			Name       string   `json:"name"`
+			Age        int      `json:"age"`
+			Company    string   `json:"company"`
+			Department string   `json:"department"`
+			Role       string   `json:"role"`
+			Clients    []string `json:"clients"`
+			Skills     []string `json:"skills"`
+			Location   string   `json:"location"`
+			Bio        string   `json:"bio"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		profile := loadUserProfile()
+		if profile == nil {
+			profile = &UserProfile{}
+		}
+		// 手動入力フィールドのみ上書き（AI推定フィールドは触らない）
+		profile.Name = input.Name
+		profile.Age = input.Age
+		profile.Company = input.Company
+		profile.Department = input.Department
+		profile.Role = input.Role
+		profile.Clients = input.Clients
+		profile.Skills = input.Skills
+		profile.Location = input.Location
+		profile.Bio = input.Bio
+		if err := saveUserProfile(profile); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(profile)
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
 }
 
 // ---- Email Digest System ----
@@ -8645,6 +9282,12 @@ type DigestConfig struct {
 	// Bluesky
 	BlueskyEnabled      bool     `json:"bluesky_enabled"`
 	BlueskyStarterPacks []string `json:"bluesky_starter_packs"`
+	BlueskyIdentifier   string   `json:"bluesky_identifier"`
+	BlueskyAppPassword  string   `json:"bluesky_app_password"`
+	JetstreamKeywords   []string `json:"jetstream_keywords"`
+	// External skill API keys
+	BraveAPIKey string `json:"brave_api_key"`
+	GroqAPIKey  string `json:"groq_api_key"`
 }
 
 // digestConfigDir can be overridden in tests to avoid writing to the real ~/.siki/
@@ -8702,6 +9345,23 @@ func applyDigestConfig(config *Config) {
 	config.TwitterAccessSecret = dc.TwitterAccessSecret
 	config.BlueskyEnabled = dc.BlueskyEnabled
 	config.BlueskyStarterPacks = dc.BlueskyStarterPacks
+	if dc.BlueskyIdentifier != "" {
+		config.BlueskyIdentifier = dc.BlueskyIdentifier
+	}
+	if dc.BlueskyAppPassword != "" {
+		config.BlueskyAppPassword = dc.BlueskyAppPassword
+	}
+	if len(dc.JetstreamKeywords) > 0 {
+		config.JetstreamKeywords = dc.JetstreamKeywords
+	}
+	if dc.BraveAPIKey != "" {
+		config.BraveAPIKey = dc.BraveAPIKey
+		os.Setenv("BRAVE_API_KEY", dc.BraveAPIKey)
+	}
+	if dc.GroqAPIKey != "" {
+		config.GroqAPIKey = dc.GroqAPIKey
+		os.Setenv("GROQ_API_KEY", dc.GroqAPIKey)
+	}
 }
 
 func (ws *WebServer) digestLoop() {
@@ -9309,6 +9969,262 @@ func fetchBlueskyAuthorFeed(handle string, limit int) ([]BlueskyPost, error) {
 	return posts, nil
 }
 
+// blueskySession caches the auth session token.
+var blueskySession struct {
+	AccessJwt string
+	ExpiresAt time.Time
+}
+
+// blueskyCreateSession authenticates with Bluesky and returns an access JWT.
+func blueskyCreateSession(config *Config) (string, error) {
+	if blueskySession.AccessJwt != "" && time.Now().Before(blueskySession.ExpiresAt) {
+		return blueskySession.AccessJwt, nil
+	}
+	if config.BlueskyIdentifier == "" || config.BlueskyAppPassword == "" {
+		return "", fmt.Errorf("Bluesky認証情報が未設定です（設定画面でIdentifierとApp Passwordを入力してください）")
+	}
+	body, _ := json.Marshal(map[string]string{
+		"identifier": config.BlueskyIdentifier,
+		"password":   config.BlueskyAppPassword,
+	})
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Post("https://bsky.social/xrpc/com.atproto.server.createSession", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("bluesky auth failed: %d %s", resp.StatusCode, string(respBody[:min(len(respBody), 200)]))
+	}
+	var session struct {
+		AccessJwt string `json:"accessJwt"`
+	}
+	if err := json.Unmarshal(respBody, &session); err != nil {
+		return "", err
+	}
+	blueskySession.AccessJwt = session.AccessJwt
+	blueskySession.ExpiresAt = time.Now().Add(90 * time.Minute) // JWT typically lasts ~2h
+	return session.AccessJwt, nil
+}
+
+// blueskyAuthAPIGet makes an authenticated GET request to the Bluesky API.
+func blueskyAuthAPIGet(endpoint string, config *Config) ([]byte, error) {
+	jwt, err := blueskyCreateSession(config)
+	if err != nil {
+		return nil, err
+	}
+	client := &http.Client{Timeout: 15 * time.Second}
+	req, err := http.NewRequest("GET", "https://bsky.social/xrpc/"+endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Authorization", "Bearer "+jwt)
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode == 401 {
+		// Token expired, retry once
+		blueskySession.AccessJwt = ""
+		jwt, err = blueskyCreateSession(config)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+jwt)
+		resp2, err := client.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		defer resp2.Body.Close()
+		respBody, _ = io.ReadAll(resp2.Body)
+		if resp2.StatusCode != 200 {
+			return nil, fmt.Errorf("bluesky API %s: status %d", endpoint, resp2.StatusCode)
+		}
+		return respBody, nil
+	}
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("bluesky API %s: status %d: %s", endpoint, resp.StatusCode, string(respBody[:min(len(respBody), 200)]))
+	}
+	return respBody, nil
+}
+
+// blueskySearchAPI is the endpoint that supports unauthenticated searchPosts.
+const blueskySearchAPI = "https://api.bsky.app/xrpc/"
+
+// blueskySearchAPIGet makes an unauthenticated GET request to api.bsky.app.
+func blueskySearchAPIGet(endpoint string) ([]byte, error) {
+	client := &http.Client{Timeout: 15 * time.Second}
+	req, err := http.NewRequest("GET", blueskySearchAPI+endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("bluesky search API %s: status %d: %s", endpoint, resp.StatusCode, string(body[:min(len(body), 200)]))
+	}
+	return body, nil
+}
+
+// searchBlueskyPosts searches Bluesky posts using the public search API (api.bsky.app).
+func searchBlueskyPosts(query string, config *Config) ([]BlueskyPost, error) {
+	posts, err := fetchBlueskySearchPublic(query, 300)
+	if err != nil {
+		return nil, err
+	}
+	if len(posts) == 0 {
+		return nil, fmt.Errorf("Blueskyで「%s」に該当する投稿が見つかりませんでした", query)
+	}
+	return posts, nil
+}
+
+// fetchBlueskySearchPublic searches Bluesky posts via api.bsky.app (no auth required) with pagination.
+func fetchBlueskySearchPublic(query string, maxTotal int) ([]BlueskyPost, error) {
+	if maxTotal <= 0 {
+		maxTotal = 300
+	}
+	perPage := 100 // API max per request
+	maxPages := (maxTotal + perPage - 1) / perPage
+	if maxPages > 5 {
+		maxPages = 5 // cap at 5 pages to avoid excessive API calls
+	}
+
+	var allPosts []BlueskyPost
+	seen := make(map[string]bool)
+	cursor := ""
+
+	for page := 0; page < maxPages; page++ {
+		ep := fmt.Sprintf("app.bsky.feed.searchPosts?q=%s&limit=%d&sort=latest", url.QueryEscape(query), perPage)
+		if cursor != "" {
+			ep += "&cursor=" + url.QueryEscape(cursor)
+		}
+		data, err := blueskySearchAPIGet(ep)
+		if err != nil {
+			if page == 0 {
+				return nil, err
+			}
+			break // return what we have so far
+		}
+
+		var searchResp struct {
+			Cursor string `json:"cursor"`
+			Posts  []struct {
+				URI    string `json:"uri"`
+				CID    string `json:"cid"`
+				Author struct {
+					Handle      string `json:"handle"`
+					DisplayName string `json:"displayName"`
+					Avatar      string `json:"avatar"`
+				} `json:"author"`
+				Record      json.RawMessage `json:"record"`
+				ReplyCount  int             `json:"replyCount"`
+				RepostCount int             `json:"repostCount"`
+				LikeCount   int             `json:"likeCount"`
+				QuoteCount  int             `json:"quoteCount"`
+				Embed       json.RawMessage `json:"embed"`
+			} `json:"posts"`
+		}
+		if err := json.Unmarshal(data, &searchResp); err != nil {
+			break
+		}
+		if len(searchResp.Posts) == 0 {
+			break
+		}
+
+		for _, item := range searchResp.Posts {
+			if seen[item.URI] {
+				continue
+			}
+			seen[item.URI] = true
+
+			p := BlueskyPost{
+				URI:          item.URI,
+				CID:          item.CID,
+				AuthorHandle: item.Author.Handle,
+				AuthorName:   item.Author.DisplayName,
+				AvatarURL:    item.Author.Avatar,
+				ReplyCount:   item.ReplyCount,
+				RepostCount:  item.RepostCount,
+				LikeCount:    item.LikeCount,
+				QuoteCount:   item.QuoteCount,
+				FetchedAt:    time.Now(),
+			}
+			var record struct {
+				Text      string `json:"text"`
+				CreatedAt string `json:"createdAt"`
+				Embed     *struct {
+					Type     string `json:"$type"`
+					External *struct {
+						URI   string `json:"uri"`
+						Title string `json:"title"`
+					} `json:"external"`
+				} `json:"embed"`
+			}
+			if err := json.Unmarshal(item.Record, &record); err == nil {
+				p.Text = record.Text
+				p.CreatedAt = record.CreatedAt
+				if record.Embed != nil && record.Embed.External != nil {
+					p.ExternalURL = record.Embed.External.URI
+					p.ExternalTitle = record.Embed.External.Title
+				}
+			}
+			if len(item.Embed) > 0 {
+				var embed struct {
+					Type   string `json:"$type"`
+					Images []struct {
+						Fullsize string `json:"fullsize"`
+						Thumb    string `json:"thumb"`
+					} `json:"images"`
+					External *struct {
+						URI   string `json:"uri"`
+						Title string `json:"title"`
+					} `json:"external"`
+				}
+				if err := json.Unmarshal(item.Embed, &embed); err == nil {
+					for _, img := range embed.Images {
+						if img.Fullsize != "" {
+							p.ImageURLs = append(p.ImageURLs, img.Fullsize)
+						} else if img.Thumb != "" {
+							p.ImageURLs = append(p.ImageURLs, img.Thumb)
+						}
+					}
+					if embed.External != nil && p.ExternalURL == "" {
+						p.ExternalURL = embed.External.URI
+						p.ExternalTitle = embed.External.Title
+					}
+				}
+			}
+			allPosts = append(allPosts, p)
+		}
+
+		cursor = searchResp.Cursor
+		if cursor == "" {
+			break // no more pages
+		}
+		if len(allPosts) >= maxTotal {
+			break
+		}
+	}
+
+	fmt.Printf("[siki] Bluesky search %q: fetched %d posts across pages\n", query, len(allPosts))
+	return allPosts, nil
+}
+
 // fetchAllBlueskyPosts fetches posts from all handles concurrently (max 5 goroutines).
 func fetchAllBlueskyPosts(handles []string) []BlueskyPost {
 	type result struct {
@@ -9559,25 +10475,1140 @@ func (ws *WebServer) runBlueskyFetch() {
 	}
 }
 
+// --- Bluesky Jetstream real-time monitoring ---
+
+// jetstreamConn is a minimal WebSocket client for Jetstream (no external dependencies).
+type jetstreamConn struct {
+	conn net.Conn
+	br   *bufio.Reader
+}
+
+// jetstreamDial connects to Bluesky Jetstream via WebSocket.
+func jetstreamDial() (*jetstreamConn, error) {
+	host := "jetstream2.us-east.bsky.network"
+	path := "/subscribe?wantedCollections=app.bsky.feed.post"
+
+	tlsConn, err := tls.DialWithDialer(
+		&net.Dialer{Timeout: 15 * time.Second},
+		"tcp", host+":443",
+		&tls.Config{ServerName: host},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("TLS dial: %w", err)
+	}
+
+	// Generate WebSocket key
+	keyBytes := make([]byte, 16)
+	rand.Read(keyBytes)
+	wsKey := base64.StdEncoding.EncodeToString(keyBytes)
+
+	// HTTP upgrade
+	req := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n",
+		path, host, wsKey)
+	if _, err := tlsConn.Write([]byte(req)); err != nil {
+		tlsConn.Close()
+		return nil, fmt.Errorf("write upgrade: %w", err)
+	}
+
+	br := bufio.NewReaderSize(tlsConn, 64*1024)
+
+	statusLine, err := br.ReadString('\n')
+	if err != nil {
+		tlsConn.Close()
+		return nil, fmt.Errorf("read status: %w", err)
+	}
+	if !strings.Contains(statusLine, "101") {
+		tlsConn.Close()
+		return nil, fmt.Errorf("upgrade failed: %s", strings.TrimSpace(statusLine))
+	}
+	// Read remaining headers
+	for {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			tlsConn.Close()
+			return nil, fmt.Errorf("read header: %w", err)
+		}
+		if strings.TrimSpace(line) == "" {
+			break
+		}
+	}
+	return &jetstreamConn{conn: tlsConn, br: br}, nil
+}
+
+// readMessage reads the next WebSocket text/binary message, handling control frames.
+func (jc *jetstreamConn) readMessage() ([]byte, error) {
+	for {
+		opcode, payload, err := jc.readFrame()
+		if err != nil {
+			return nil, err
+		}
+		switch opcode {
+		case 0x1, 0x2: // text, binary
+			return payload, nil
+		case 0x8: // close
+			return nil, fmt.Errorf("connection closed by server")
+		case 0x9: // ping -> pong
+			jc.sendPong(payload)
+		case 0xA: // pong - ignore
+		}
+	}
+}
+
+func (jc *jetstreamConn) readFrame() (opcode byte, payload []byte, err error) {
+	var header [2]byte
+	if _, err = io.ReadFull(jc.br, header[:]); err != nil {
+		return 0, nil, err
+	}
+	opcode = header[0] & 0x0F
+	masked := (header[1] & 0x80) != 0
+	length := uint64(header[1] & 0x7F)
+
+	if length == 126 {
+		var ext [2]byte
+		if _, err = io.ReadFull(jc.br, ext[:]); err != nil {
+			return 0, nil, err
+		}
+		length = uint64(ext[0])<<8 | uint64(ext[1])
+	} else if length == 127 {
+		var ext [8]byte
+		if _, err = io.ReadFull(jc.br, ext[:]); err != nil {
+			return 0, nil, err
+		}
+		length = uint64(ext[0])<<56 | uint64(ext[1])<<48 | uint64(ext[2])<<40 | uint64(ext[3])<<32 |
+			uint64(ext[4])<<24 | uint64(ext[5])<<16 | uint64(ext[6])<<8 | uint64(ext[7])
+	}
+	if length > 16*1024*1024 {
+		return 0, nil, fmt.Errorf("frame too large: %d", length)
+	}
+
+	var maskKey [4]byte
+	if masked {
+		if _, err = io.ReadFull(jc.br, maskKey[:]); err != nil {
+			return 0, nil, err
+		}
+	}
+	payload = make([]byte, length)
+	if _, err = io.ReadFull(jc.br, payload); err != nil {
+		return 0, nil, err
+	}
+	if masked {
+		for i := range payload {
+			payload[i] ^= maskKey[i%4]
+		}
+	}
+	return opcode, payload, nil
+}
+
+func (jc *jetstreamConn) sendPong(data []byte) {
+	frame := []byte{0x8A} // FIN + pong
+	maskKey := make([]byte, 4)
+	rand.Read(maskKey)
+	l := len(data)
+	if l < 126 {
+		frame = append(frame, byte(l)|0x80)
+	} else {
+		frame = append(frame, 126|0x80, byte(l>>8), byte(l))
+	}
+	frame = append(frame, maskKey...)
+	masked := make([]byte, l)
+	for i := range data {
+		masked[i] = data[i] ^ maskKey[i%4]
+	}
+	frame = append(frame, masked...)
+	jc.conn.Write(frame)
+}
+
+func (jc *jetstreamConn) close() {
+	jc.conn.Close()
+}
+
+// matchJetstreamKeywords checks if text contains any keyword.
+// Short keywords (<=3 chars) use word-boundary matching to avoid false positives (e.g. "AI" in "brain").
+func matchJetstreamKeywords(text string, keywords []string) bool {
+	textLower := strings.ToLower(text)
+	for _, kw := range keywords {
+		kwLower := strings.ToLower(kw)
+		if len([]rune(kw)) <= 3 {
+			// Word-boundary match for short keywords
+			re, err := regexp.Compile(`(?i)\b` + regexp.QuoteMeta(kw) + `\b`)
+			if err == nil && re.MatchString(text) {
+				return true
+			}
+		} else {
+			if strings.Contains(textLower, kwLower) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// JetstreamPostMeta holds enriched metadata for a saved Jetstream post.
+type JetstreamPostMeta struct {
+	OGPTitle         string `json:"ogp_title,omitempty"`
+	OGPDesc          string `json:"ogp_desc,omitempty"`
+	OGPImage         string `json:"ogp_image,omitempty"`
+	URL              string `json:"url,omitempty"`
+	Evaluation       string `json:"evaluation,omitempty"`
+	Score            int    `json:"score,omitempty"`
+	AnalyzedAt       string `json:"analyzed_at,omitempty"`
+	Reported         bool   `json:"reported,omitempty"`
+	PostText         string `json:"post_text,omitempty"`
+	DeepEvaluated    bool   `json:"deep_evaluated,omitempty"`
+	DeliveryPriority int    `json:"delivery_priority,omitempty"` // 0-100, higher = more important
+	DeepSummary      string `json:"deep_summary,omitempty"`      // detailed evaluation from deep analysis
+}
+
+func jetstreamMetaPath(t time.Time) string {
+	return filepath.Join(jetstreamPostsDir(), t.Format("2006"), t.Format("0102")+"_meta.json")
+}
+
+func loadJetstreamMeta(t time.Time) map[string]JetstreamPostMeta {
+	data, err := os.ReadFile(jetstreamMetaPath(t))
+	if err != nil {
+		return make(map[string]JetstreamPostMeta)
+	}
+	var m map[string]JetstreamPostMeta
+	if err := json.Unmarshal(data, &m); err != nil {
+		return make(map[string]JetstreamPostMeta)
+	}
+	return m
+}
+
+func saveJetstreamMeta(t time.Time, m map[string]JetstreamPostMeta) error {
+	dir := filepath.Dir(jetstreamMetaPath(t))
+	os.MkdirAll(dir, 0755)
+	data, err := json.Marshal(m)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(jetstreamMetaPath(t), data, 0644)
+}
+
+// fetchOGP extracts Open Graph metadata from a URL via simple HTTP GET + regex.
+func fetchOGP(targetURL string) (title, desc, image string) {
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 3 {
+				return fmt.Errorf("too many redirects")
+			}
+			return nil
+		},
+	}
+	req, err := http.NewRequest("GET", targetURL, nil)
+	if err != nil {
+		return
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; siki/1.0)")
+	resp, err := client.Do(req)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+
+	// Read only first 32KB to find OGP tags
+	head := make([]byte, 32*1024)
+	n, _ := io.ReadFull(resp.Body, head)
+	html := string(head[:n])
+
+	// Extract OGP meta tags
+	ogRe := regexp.MustCompile(`<meta\s+[^>]*property=["']og:([^"']+)["'][^>]*content=["']([^"']*)["']`)
+	ogRe2 := regexp.MustCompile(`<meta\s+[^>]*content=["']([^"']*)["'][^>]*property=["']og:([^"']+)["']`)
+	for _, m := range ogRe.FindAllStringSubmatch(html, -1) {
+		switch m[1] {
+		case "title":
+			title = m[2]
+		case "description":
+			desc = m[2]
+		case "image":
+			image = m[2]
+		}
+	}
+	for _, m := range ogRe2.FindAllStringSubmatch(html, -1) {
+		switch m[2] {
+		case "title":
+			if title == "" {
+				title = m[1]
+			}
+		case "description":
+			if desc == "" {
+				desc = m[1]
+			}
+		case "image":
+			if image == "" {
+				image = m[1]
+			}
+		}
+	}
+	// Fallback to <title> tag
+	if title == "" {
+		titleRe := regexp.MustCompile(`<title[^>]*>([^<]+)</title>`)
+		if m := titleRe.FindStringSubmatch(html); len(m) > 1 {
+			title = strings.TrimSpace(m[1])
+		}
+	}
+	return
+}
+
+// extractURLsFromText extracts HTTP(S) URLs from text.
+func extractURLsFromText(text string) []string {
+	re := regexp.MustCompile(`https?://[^\s<>")\]]+`)
+	return re.FindAllString(text, -1)
+}
+
+// analyzeJetstreamPosts processes unanalyzed Jetstream posts during idle time.
+func (ws *WebServer) analyzeJetstreamPosts() {
+	ws.mu.RLock()
+	enabled := ws.config.BlueskyEnabled
+	keywords := ws.config.JetstreamKeywords
+	config := ws.config
+	ws.mu.RUnlock()
+	if !enabled || len(keywords) == 0 {
+		return
+	}
+
+	now := time.Now()
+	// Process today and yesterday
+	for d := 0; d < 2; d++ {
+		t := now.AddDate(0, 0, -d)
+		ws.analyzeJetstreamDay(t, config)
+	}
+
+	// Deep-evaluate high-score posts for delivery prioritization
+	ws.evaluateDeliveryPriority(config)
+
+	// Send report if interval has passed
+	ws.jetstreamDeepDiveReport()
+}
+
+func (ws *WebServer) analyzeJetstreamDay(t time.Time, config *Config) {
+	filename := filepath.Join(jetstreamPostsDir(), t.Format("2006"), t.Format("0102")+".txt")
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		return
+	}
+
+	meta := loadJetstreamMeta(t)
+	lines := strings.Split(string(data), "\n")
+
+	// Find unanalyzed posts with URLs (limit per cycle)
+	type candidate struct {
+		key  string // did:rkey
+		text string
+		urls []string
+	}
+	var candidates []candidate
+	// Iterate newest first (end of file)
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := lines[i]
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "\t", 5)
+		if len(parts) < 5 {
+			continue
+		}
+		did, rkey, text := parts[1], parts[2], parts[4]
+		key := did + ":" + rkey
+		if _, exists := meta[key]; exists {
+			continue // already analyzed
+		}
+		urls := extractURLsFromText(text)
+		if len(urls) == 0 {
+			// No URL — still record a basic entry so we don't re-process
+			meta[key] = JetstreamPostMeta{AnalyzedAt: time.Now().Format(time.RFC3339)}
+			continue
+		}
+		candidates = append(candidates, candidate{key: key, text: text, urls: urls})
+	}
+
+	if len(candidates) == 0 {
+		saveJetstreamMeta(t, meta)
+		return
+	}
+
+	// Process up to 10 posts per cycle
+	limit := 10
+	if len(candidates) < limit {
+		limit = len(candidates)
+	}
+	candidates = candidates[:limit]
+
+	fmt.Printf("[siki] Jetstream analyze: processing %d posts with URLs (%s)\n", limit, t.Format("01/02"))
+
+	// Concurrent processing (max 5 parallel)
+	sem := make(chan struct{}, 5)
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+
+	for _, c := range candidates {
+		wg.Add(1)
+		go func(cand candidate) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			targetURL := cand.urls[0]
+			ogpTitle, ogpDesc, ogpImage := fetchOGP(targetURL)
+
+			// Evaluate with fast model
+			var evaluation string
+			var score int
+			if ogpTitle != "" || ogpDesc != "" {
+				evalPrompt := fmt.Sprintf(`以下のBlueskyポストとそのリンク先を10点満点で評価してください。
+AI・テクノロジー・プログラミング・科学に関連する有益な情報ほど高得点。
+雑談・広告・無関係な内容は低得点。
+
+ポスト: %s
+リンク先タイトル: %s
+リンク先概要: %s
+
+JSON形式で回答（他の文字不要）:
+{"score": 7, "summary": "日本語1文の要約"}`,
+					truncateStr(cand.text, 500),
+					truncateStr(ogpTitle, 200),
+					truncateStr(ogpDesc, 500))
+				result, err := callFastModel(evalPrompt, config, 200)
+				if err == nil {
+					result = strings.TrimSpace(result)
+					if idx := strings.Index(result, "{"); idx >= 0 {
+						if end := strings.LastIndex(result, "}"); end > idx {
+							var ev struct {
+								Score   int    `json:"score"`
+								Summary string `json:"summary"`
+							}
+							if json.Unmarshal([]byte(result[idx:end+1]), &ev) == nil {
+								score = ev.Score
+								evaluation = ev.Summary
+							}
+						}
+					}
+				}
+			}
+
+			mu.Lock()
+			meta[cand.key] = JetstreamPostMeta{
+				URL:        targetURL,
+				OGPTitle:   ogpTitle,
+				OGPDesc:    ogpDesc,
+				OGPImage:   ogpImage,
+				Evaluation: evaluation,
+				Score:      score,
+				AnalyzedAt: time.Now().Format(time.RFC3339),
+				PostText:   truncateStr(cand.text, 500),
+			}
+			mu.Unlock()
+		}(c)
+	}
+
+	wg.Wait()
+
+	if err := saveJetstreamMeta(t, meta); err != nil {
+		fmt.Printf("[siki] Jetstream analyze: save meta failed: %v\n", err)
+	} else {
+		analyzed := 0
+		for _, m := range meta {
+			if m.URL != "" {
+				analyzed++
+			}
+		}
+		fmt.Printf("[siki] Jetstream analyze: done (%d posts with URLs analyzed total)\n", analyzed)
+	}
+}
+
+// evaluateDeliveryPriority performs deep evaluation of high-score posts
+// to assign delivery priority (0-100) for the next email report.
+// Runs each idle cycle, processing a few unevaluated posts at a time.
+func (ws *WebServer) evaluateDeliveryPriority(config *Config) {
+	now := time.Now()
+
+	type evalCandidate struct {
+		key  string
+		meta JetstreamPostMeta
+		day  time.Time
+	}
+	var candidates []evalCandidate
+
+	for d := 0; d < 2; d++ {
+		t := now.AddDate(0, 0, -d)
+		meta := loadJetstreamMeta(t)
+		for key, m := range meta {
+			if m.Score >= 7 && !m.Reported && !m.DeepEvaluated && m.URL != "" {
+				candidates = append(candidates, evalCandidate{key: key, meta: m, day: t})
+			}
+		}
+	}
+
+	if len(candidates) == 0 {
+		return
+	}
+
+	// Process up to 5 per cycle to avoid overload
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].meta.Score > candidates[j].meta.Score
+	})
+	if len(candidates) > 5 {
+		candidates = candidates[:5]
+	}
+
+	fmt.Printf("[siki] Delivery eval: evaluating %d posts for priority...\n", len(candidates))
+
+	sem := make(chan struct{}, 3)
+	var wg sync.WaitGroup
+
+	for _, c := range candidates {
+		wg.Add(1)
+		go func(cand evalCandidate) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			// Fetch page content
+			_, pageText, _, err := scraplingFetch(cand.meta.URL, 3000, false)
+			if err != nil || len(pageText) < 50 {
+				// Mark as evaluated with low priority
+				meta := loadJetstreamMeta(cand.day)
+				if m, ok := meta[cand.key]; ok {
+					m.DeepEvaluated = true
+					m.DeliveryPriority = cand.meta.Score * 5 // fallback: score * 5
+					meta[cand.key] = m
+					saveJetstreamMeta(cand.day, meta)
+				}
+				return
+			}
+
+			prompt := fmt.Sprintf(`以下の記事を0-100のスケールで配信優先度を評価してください。
+
+## 評価基準
+- 技術的な新規性・独創性 (30点)
+- 実務への影響度・活用可能性 (25点)
+- AI/プログラミング/科学の最先端トピックか (25点)
+- 情報の信頼性・ソースの質 (10点)
+- 話題性・タイムリーさ (10点)
+
+## 低評価にすべきもの
+- 既知の情報の焼き直し → 20以下
+- 宣伝・マーケティング色が強い → 15以下
+- 内容が薄い・表面的 → 25以下
+- 単なるツール紹介で深みがない → 30以下
+
+## Blueskyポスト
+%s
+
+## 記事タイトル: %s
+## URL: %s
+
+## 記事本文
+%s
+
+JSON形式で回答: {"priority": 数値0-100, "summary": "日本語で2-3文の要約", "reason": "優先度の根拠を1文で"}`,
+				truncateStr(cand.meta.PostText, 300),
+				cand.meta.OGPTitle,
+				cand.meta.URL,
+				truncateStr(pageText, 2500))
+
+			resp, err := callFastModel(prompt, config, 500)
+			if err != nil {
+				return
+			}
+
+			// Parse response
+			priority := cand.meta.Score * 5
+			summary := cand.meta.Evaluation
+			jsonStart := strings.Index(resp, "{")
+			jsonEnd := strings.LastIndex(resp, "}")
+			if jsonStart >= 0 && jsonEnd > jsonStart {
+				var parsed struct {
+					Priority int    `json:"priority"`
+					Summary  string `json:"summary"`
+					Reason   string `json:"reason"`
+				}
+				if err := json.Unmarshal([]byte(resp[jsonStart:jsonEnd+1]), &parsed); err == nil {
+					if parsed.Priority > 0 && parsed.Priority <= 100 {
+						priority = parsed.Priority
+					}
+					if parsed.Summary != "" {
+						summary = parsed.Summary
+						if parsed.Reason != "" {
+							summary += " — " + parsed.Reason
+						}
+					}
+				}
+			}
+
+			meta := loadJetstreamMeta(cand.day)
+			if m, ok := meta[cand.key]; ok {
+				m.DeepEvaluated = true
+				m.DeliveryPriority = priority
+				m.DeepSummary = summary
+				meta[cand.key] = m
+				saveJetstreamMeta(cand.day, meta)
+			}
+			fmt.Printf("[siki] Delivery eval: %s → priority %d\n", truncateStr(cand.meta.OGPTitle, 40), priority)
+		}(c)
+	}
+	wg.Wait()
+}
+
+// generateScoreSVG creates an inline SVG bar chart of post scores for email embedding.
+func generateScoreSVG(items []struct {
+	Title string
+	Score int
+	URL   string
+}) string {
+	if len(items) == 0 {
+		return ""
+	}
+	barH := 32
+	gap := 8
+	labelW := 280
+	barMaxW := 300
+	chartH := len(items)*(barH+gap) + 20
+	totalW := labelW + barMaxW + 60
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf(`<svg xmlns="http://www.w3.org/2000/svg" width="%d" height="%d" viewBox="0 0 %d %d">`, totalW, chartH, totalW, chartH))
+	sb.WriteString(`<style>text{font-family:sans-serif;font-size:13px;fill:#333;} .score{font-weight:bold;font-size:14px;}</style>`)
+
+	for i, item := range items {
+		y := i*(barH+gap) + 10
+		// Truncate title
+		title := item.Title
+		if len([]rune(title)) > 30 {
+			title = string([]rune(title)[:28]) + "…"
+		}
+		barW := item.Score * barMaxW / 100
+		if barW < 10 {
+			barW = 10
+		}
+		// Color based on priority score (0-100)
+		color := "#4caf50" // green
+		if item.Score >= 80 {
+			color = "#e53935" // red = top priority
+		} else if item.Score >= 60 {
+			color = "#ff9800" // orange = high
+		}
+		sb.WriteString(fmt.Sprintf(`<text x="0" y="%d" dominant-baseline="middle">%s</text>`, y+barH/2, title))
+		sb.WriteString(fmt.Sprintf(`<rect x="%d" y="%d" width="%d" height="%d" rx="4" fill="%s" opacity="0.85"/>`, labelW, y, barW, barH, color))
+		sb.WriteString(fmt.Sprintf(`<text x="%d" y="%d" dominant-baseline="middle" class="score" fill="white"> %d</text>`, labelW+barW/2-8, y+barH/2, item.Score))
+	}
+	sb.WriteString(`</svg>`)
+	return sb.String()
+}
+
+var (
+	lastJetstreamReportTime time.Time
+	lastJetstreamReportMu   sync.Mutex
+)
+
+// jetstreamDeepDiveReport finds high-score unreported posts, deep-dives their URLs,
+// takes screenshots, generates SVG chart and report, and emails it.
+// Rate-limited to max 3 times per day (every 8 hours).
+func (ws *WebServer) jetstreamDeepDiveReport() {
+	// Rate limit: max 3 reports per day (8-hour interval)
+	lastJetstreamReportMu.Lock()
+	if time.Since(lastJetstreamReportTime) < 8*time.Hour {
+		lastJetstreamReportMu.Unlock()
+		return
+	}
+	lastJetstreamReportMu.Unlock()
+
+	ws.mu.RLock()
+	config := ws.config
+	emailTo := config.EmailTo
+	ws.mu.RUnlock()
+
+	if emailTo == "" {
+		return // no email configured
+	}
+
+	now := time.Now()
+	// Collect deep-evaluated unreported posts from today and yesterday
+	type reportCandidate struct {
+		key  string
+		meta JetstreamPostMeta
+		day  time.Time
+	}
+	var candidates []reportCandidate
+
+	for d := 0; d < 2; d++ {
+		t := now.AddDate(0, 0, -d)
+		meta := loadJetstreamMeta(t)
+		for key, m := range meta {
+			if m.Score >= 7 && !m.Reported && m.URL != "" && m.DeepEvaluated {
+				candidates = append(candidates, reportCandidate{key: key, meta: m, day: t})
+			}
+		}
+	}
+
+	if len(candidates) < 3 {
+		return // wait until enough evaluated posts accumulate
+	}
+
+	// Sort by DeliveryPriority descending (deep evaluation quality), then by Score
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].meta.DeliveryPriority != candidates[j].meta.DeliveryPriority {
+			return candidates[i].meta.DeliveryPriority > candidates[j].meta.DeliveryPriority
+		}
+		return candidates[i].meta.Score > candidates[j].meta.Score
+	})
+	// Filter out low-priority posts (below 40/100)
+	filtered := candidates[:0]
+	for _, c := range candidates {
+		if c.meta.DeliveryPriority >= 40 {
+			filtered = append(filtered, c)
+		}
+	}
+	candidates = filtered
+	if len(candidates) < 3 {
+		return
+	}
+	if len(candidates) > 10 {
+		candidates = candidates[:10]
+	}
+
+	fmt.Printf("[siki] Jetstream report: deep-diving %d high-score posts...\n", len(candidates))
+
+	// Deep-dive each URL with screenshot
+	type deepDiveResult struct {
+		meta       JetstreamPostMeta
+		report     string // LLM-generated deep-dive
+		screenshot []byte // PNG bytes (may be nil)
+	}
+	var results []deepDiveResult
+	sem := make(chan struct{}, 3)
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+
+	for _, c := range candidates {
+		wg.Add(1)
+		go func(cand reportCandidate) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			// Fetch full page content
+			_, pageText, _, err := scraplingFetch(cand.meta.URL, 5000, false)
+			if err != nil || len(pageText) < 100 {
+				return
+			}
+
+			// Take screenshot (non-fatal if it fails)
+			var ssData []byte
+			ssData, err = scraplingScreenshot(cand.meta.URL)
+			if err != nil {
+				fmt.Printf("[siki] Jetstream report: screenshot failed for %s: %v\n", cand.meta.URL, err)
+			}
+
+			// Generate deep-dive report in Japanese
+			reportPrompt := fmt.Sprintf(`以下のBlueskyポストで共有されたリンク先の内容を深掘りして、詳細なレポートを日本語で作成してください。
+
+## Blueskyポスト
+%s
+
+## リンク先情報
+タイトル: %s
+URL: %s
+
+## リンク先本文
+%s
+
+## レポート要件
+- なぜこれが注目に値するか（1-2文）
+- 技術的な要点・新規性（箇条書き3-5項目）
+- 関連する技術動向や背景（1段落）
+- 実務への影響・活用可能性（1段落）
+
+必ず日本語で出力してください。
+HTML形式（<h3>, <p>, <ul><li>, <strong>タグ使用）で出力。見出し・段落を使い読みやすく。`,
+				truncateStr(cand.meta.PostText, 500),
+				cand.meta.OGPTitle,
+				cand.meta.URL,
+				truncateStr(pageText, 4000))
+
+			_, report, err := callSubModel(reportPrompt, config)
+			if err != nil || len(report) < 50 {
+				return
+			}
+
+			mu.Lock()
+			results = append(results, deepDiveResult{
+				meta:       cand.meta,
+				report:     report,
+				screenshot: ssData,
+			})
+			mu.Unlock()
+		}(c)
+	}
+	wg.Wait()
+
+	if len(results) == 0 {
+		fmt.Println("[siki] Jetstream report: no deep-dives succeeded")
+		return
+	}
+
+	// Sort results by DeliveryPriority descending
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].meta.DeliveryPriority > results[j].meta.DeliveryPriority
+	})
+
+	// Generate SVG score chart (show delivery priority)
+	chartItems := make([]struct {
+		Title string
+		Score int
+		URL   string
+	}, len(results))
+	for i, r := range results {
+		chartItems[i].Title = r.meta.OGPTitle
+		chartItems[i].Score = r.meta.DeliveryPriority
+		chartItems[i].URL = r.meta.URL
+	}
+	svgChart := generateScoreSVG(chartItems)
+
+	// Collect inline images for email
+	var images []EmailImage
+
+	// Build email HTML
+	var htmlBuf strings.Builder
+	htmlBuf.WriteString(fmt.Sprintf(`<div style="font-family:'Helvetica Neue',Arial,sans-serif;max-width:700px;margin:0 auto;color:#333;">
+<h1 style="color:#1a73e8;border-bottom:3px solid #1a73e8;padding-bottom:0.5rem;">Bluesky 注目記事レポート</h1>
+<p style="color:#666;font-size:0.95rem;">%s — Jetstream監視で発見した注目記事の深掘りレポート（%d件）</p>
+`, now.Format("2006年01月02日 15:04"), len(results)))
+
+	// Embed SVG chart directly in HTML (inline SVG works in most email clients better than as attachment)
+	if svgChart != "" {
+		htmlBuf.WriteString(`<div style="margin:1rem 0;padding:1rem;background:#f8f9fa;border-radius:8px;">`)
+		htmlBuf.WriteString(`<h2 style="margin:0 0 0.8rem 0;color:#333;font-size:1.1rem;">スコア一覧</h2>`)
+		htmlBuf.WriteString(svgChart)
+		htmlBuf.WriteString(`</div>`)
+	}
+
+	htmlBuf.WriteString(`<hr style="border:none;border-top:2px solid #1a73e8;margin:1.5rem 0;">`)
+
+	for i, r := range results {
+		// Badge color by delivery priority
+		badgeColor := "#4caf50"
+		if r.meta.DeliveryPriority >= 80 {
+			badgeColor = "#e53935"
+		} else if r.meta.DeliveryPriority >= 60 {
+			badgeColor = "#ff9800"
+		}
+
+		htmlBuf.WriteString(fmt.Sprintf(`
+<div style="margin:1.5rem 0;padding:1.2rem;border:1px solid #e0e0e0;border-radius:12px;background:#fafafa;">
+<div style="display:flex;align-items:center;gap:0.5rem;margin-bottom:0.5rem;">
+<span style="background:%s;color:white;padding:2px 10px;border-radius:12px;font-weight:bold;font-size:0.9rem;">優先度 %d</span>
+<h2 style="margin:0;font-size:1.1rem;"><a href="%s" style="color:#1a73e8;text-decoration:none;">%d. %s</a></h2>
+</div>`, badgeColor, r.meta.DeliveryPriority, r.meta.URL, i+1, r.meta.OGPTitle))
+
+		// Screenshot as inline image
+		if len(r.screenshot) > 0 {
+			cid := fmt.Sprintf("screenshot_%d", i)
+			images = append(images, EmailImage{
+				CID:      cid,
+				Data:     r.screenshot,
+				MimeType: "image/png",
+				Filename: fmt.Sprintf("screenshot_%d.png", i+1),
+			})
+			htmlBuf.WriteString(fmt.Sprintf(`<div style="margin:0.8rem 0;"><img src="cid:%s" style="max-width:100%%;border-radius:8px;border:1px solid #ddd;" alt="Screenshot"></div>`, cid))
+		} else if r.meta.OGPImage != "" {
+			// Fallback to OGP image
+			htmlBuf.WriteString(fmt.Sprintf(`<div style="margin:0.8rem 0;"><img src="%s" style="max-width:100%%;border-radius:8px;" alt=""></div>`, r.meta.OGPImage))
+		}
+
+		// Deep summary (from priority evaluation) or original post text
+		if r.meta.DeepSummary != "" {
+			htmlBuf.WriteString(fmt.Sprintf(`<blockquote style="margin:0.5rem 0;padding:0.5rem 1rem;border-left:3px solid #1a73e8;background:#f0f4ff;color:#555;font-size:0.9rem;">%s</blockquote>`, r.meta.DeepSummary))
+		} else if r.meta.PostText != "" {
+			htmlBuf.WriteString(fmt.Sprintf(`<blockquote style="margin:0.5rem 0;padding:0.5rem 1rem;border-left:3px solid #1a73e8;background:#f0f4ff;color:#555;font-size:0.9rem;">%s</blockquote>`, truncateStr(r.meta.PostText, 200)))
+		}
+
+		// Deep-dive report
+		htmlBuf.WriteString(`<div style="margin-top:0.8rem;">`)
+		htmlBuf.WriteString(r.report)
+		htmlBuf.WriteString(`</div>`)
+
+		htmlBuf.WriteString(`</div>`)
+	}
+
+	htmlBuf.WriteString(`<hr style="border:none;border-top:1px solid #ddd;margin-top:2rem;">
+<p style="color:#999;font-size:0.8rem;text-align:center;">このレポートは siki Jetstream Monitor が自動生成しました。</p>
+</div>`)
+
+	subject := fmt.Sprintf("Bluesky注目記事レポート (%d件) - %s", len(results), now.Format("01/02"))
+	if err := sendEmailWithImages(config, subject, htmlBuf.String(), images); err != nil {
+		fmt.Printf("[siki] Jetstream report: email send failed: %v\n", err)
+		return
+	}
+	fmt.Printf("[siki] Jetstream report: sent %d articles (%d screenshots) to %s\n", len(results), len(images), emailTo)
+
+	// Record send time for rate limiting
+	lastJetstreamReportMu.Lock()
+	lastJetstreamReportTime = time.Now()
+	lastJetstreamReportMu.Unlock()
+
+	// Mark as reported
+	for _, c := range candidates {
+		meta := loadJetstreamMeta(c.day)
+		if m, ok := meta[c.key]; ok {
+			m.Reported = true
+			meta[c.key] = m
+			saveJetstreamMeta(c.day, meta)
+		}
+	}
+}
+
+// Jetstream event types
+type JetstreamEvent struct {
+	DID    string           `json:"did"`
+	TimeUS int64            `json:"time_us"`
+	Kind   string           `json:"kind"`
+	Commit *JetstreamCommit `json:"commit,omitempty"`
+}
+
+type JetstreamCommit struct {
+	Rev        string          `json:"rev"`
+	Operation  string          `json:"operation"`
+	Collection string          `json:"collection"`
+	RKey       string          `json:"rkey"`
+	Record     json.RawMessage `json:"record"`
+	CID        string          `json:"cid"`
+}
+
+type JetstreamPostRecord struct {
+	Type      string   `json:"$type"`
+	Text      string   `json:"text"`
+	CreatedAt string   `json:"createdAt"`
+	Langs     []string `json:"langs,omitempty"`
+}
+
+func jetstreamPostsDir() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".siki", "bluesky_posts")
+}
+
+// saveJetstreamPost appends a post to yyyy/mmdd.txt.
+func saveJetstreamPost(did, rkey, text, createdAt string, keywords []string) error {
+	now := time.Now()
+	dir := filepath.Join(jetstreamPostsDir(), now.Format("2006"))
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+	filename := filepath.Join(dir, now.Format("0102")+".txt")
+
+	// Find which keywords matched
+	var matched []string
+	for _, kw := range keywords {
+		kwLower := strings.ToLower(kw)
+		if len([]rune(kw)) <= 3 {
+			re, err := regexp.Compile(`(?i)\b` + regexp.QuoteMeta(kw) + `\b`)
+			if err == nil && re.MatchString(text) {
+				matched = append(matched, kw)
+			}
+		} else {
+			if strings.Contains(strings.ToLower(text), kwLower) {
+				matched = append(matched, kw)
+			}
+		}
+	}
+
+	// Format: timestamp\tDID\trkey\tkeywords\ttext
+	singleLine := strings.ReplaceAll(strings.ReplaceAll(text, "\n", " "), "\t", " ")
+	line := fmt.Sprintf("%s\t%s\t%s\t[%s]\t%s\n",
+		createdAt, did, rkey, strings.Join(matched, ","), singleLine)
+
+	f, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = f.WriteString(line)
+	return err
+}
+
+// searchJetstreamPosts searches saved Jetstream posts by keyword within recent N days.
+func searchJetstreamPosts(query string, days int) (string, int) {
+	if days <= 0 {
+		days = 7
+	}
+	queryLower := strings.ToLower(query)
+	var results []string
+	total := 0
+
+	for d := 0; d < days; d++ {
+		t := time.Now().AddDate(0, 0, -d)
+		filename := filepath.Join(jetstreamPostsDir(), t.Format("2006"), t.Format("0102")+".txt")
+		data, err := os.ReadFile(filename)
+		if err != nil {
+			continue
+		}
+		lines := strings.Split(string(data), "\n")
+		for _, line := range lines {
+			if line == "" {
+				continue
+			}
+			total++
+			if strings.Contains(strings.ToLower(line), queryLower) {
+				results = append(results, line)
+			}
+		}
+	}
+
+	if len(results) == 0 {
+		return fmt.Sprintf("過去%d日間の保存済みポスト(%d件)に「%s」は見つかりませんでした。", days, total, query), 0
+	}
+
+	// Format results
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("# Jetstream監視ログ検索: 「%s」 (%d件ヒット / 過去%d日間 %d件中)\n\n", query, len(results), days, total))
+
+	// Show newest first, max 50
+	limit := 50
+	if len(results) < limit {
+		limit = len(results)
+	}
+	for i := len(results) - 1; i >= len(results)-limit; i-- {
+		parts := strings.SplitN(results[i], "\t", 5)
+		if len(parts) >= 5 {
+			sb.WriteString(fmt.Sprintf("- **%s** `%s` %s: %s\n", parts[0], parts[3], parts[1], parts[4]))
+		} else {
+			sb.WriteString(fmt.Sprintf("- %s\n", results[i]))
+		}
+	}
+	return sb.String(), len(results)
+}
+
+// jetstreamLoop runs the background Jetstream WebSocket consumer.
+func (ws *WebServer) jetstreamLoop() {
+	time.Sleep(10 * time.Second)
+	backoff := 2 * time.Second
+	maxBackoff := 5 * time.Minute
+
+	for {
+		ws.mu.RLock()
+		enabled := ws.config.BlueskyEnabled
+		keywords := ws.config.JetstreamKeywords
+		ws.mu.RUnlock()
+
+		if !enabled || len(keywords) == 0 {
+			time.Sleep(30 * time.Second)
+			continue
+		}
+
+		fmt.Printf("[siki] Jetstream: connecting (keywords: %v)...\n", keywords)
+		err := ws.runJetstream(keywords)
+		if err != nil {
+			fmt.Printf("[siki] Jetstream: disconnected: %v\n", err)
+		}
+
+		fmt.Printf("[siki] Jetstream: reconnecting in %v...\n", backoff)
+		time.Sleep(backoff)
+		backoff *= 2
+		if backoff > maxBackoff {
+			backoff = maxBackoff
+		}
+	}
+}
+
+func (ws *WebServer) runJetstream(keywords []string) error {
+	jc, err := jetstreamDial()
+	if err != nil {
+		return err
+	}
+	defer jc.close()
+
+	fmt.Printf("[siki] Jetstream: connected, monitoring %d keywords\n", len(keywords))
+	var saved, scanned int
+
+	for {
+		// Re-check keywords (may have been updated)
+		ws.mu.RLock()
+		currentKeywords := ws.config.JetstreamKeywords
+		ws.mu.RUnlock()
+		if len(currentKeywords) > 0 {
+			keywords = currentKeywords
+		}
+
+		data, err := jc.readMessage()
+		if err != nil {
+			if saved > 0 || scanned > 0 {
+				fmt.Printf("[siki] Jetstream: total scanned=%d saved=%d before disconnect\n", scanned, saved)
+			}
+			return err
+		}
+
+		var event JetstreamEvent
+		if err := json.Unmarshal(data, &event); err != nil {
+			continue
+		}
+		if event.Kind != "commit" || event.Commit == nil {
+			continue
+		}
+		if event.Commit.Operation != "create" || event.Commit.Collection != "app.bsky.feed.post" {
+			continue
+		}
+
+		var record JetstreamPostRecord
+		if err := json.Unmarshal(event.Commit.Record, &record); err != nil {
+			continue
+		}
+
+		scanned++
+		if !matchJetstreamKeywords(record.Text, keywords) {
+			continue
+		}
+
+		saved++
+		if err := saveJetstreamPost(event.DID, event.Commit.RKey, record.Text, record.CreatedAt, keywords); err != nil {
+			fmt.Printf("[siki] Jetstream: save error: %v\n", err)
+		}
+
+		if saved%10 == 0 {
+			fmt.Printf("[siki] Jetstream: saved %d matching posts (scanned %d)\n", saved, scanned)
+		}
+	}
+}
+
 // filterBlueskyByIntent filters Bluesky posts by topic using LLM (like filterTweetsByIntent).
 func filterBlueskyByIntent(posts []BlueskyPost, intent string, config *Config, sendEvent func(StreamEvent)) []BlueskyPost {
 	if len(posts) == 0 {
 		return nil
 	}
-	// Build batch text
-	var sb strings.Builder
-	for i, p := range posts {
-		name := p.AuthorName
-		if name == "" {
-			name = p.AuthorHandle
-		}
-		sb.WriteString(fmt.Sprintf("%d. [%s] %s: %s\n", i, name, p.AuthorHandle, p.Text))
-		if i >= 99 {
-			break
-		}
+
+	// エンゲージメント順にソートして上位を優先的に処理
+	sorted := make([]BlueskyPost, len(posts))
+	copy(sorted, posts)
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].EngagementScore() > sorted[j].EngagementScore()
+	})
+
+	// バッチ処理: 200件ずつ処理（最大600件）
+	var allFiltered []BlueskyPost
+	batchSize := 200
+	maxPosts := 600
+	if len(sorted) > maxPosts {
+		sorted = sorted[:maxPosts]
 	}
 
-	prompt := fmt.Sprintf(`以下のBluesky投稿リストから「%s」に関連する投稿の番号のみを出力してください。
+	for batchStart := 0; batchStart < len(sorted); batchStart += batchSize {
+		batchEnd := batchStart + batchSize
+		if batchEnd > len(sorted) {
+			batchEnd = len(sorted)
+		}
+		batch := sorted[batchStart:batchEnd]
+
+		var sb strings.Builder
+		for i, p := range batch {
+			name := p.AuthorName
+			if name == "" {
+				name = p.AuthorHandle
+			}
+			sb.WriteString(fmt.Sprintf("%d. [%s] @%s: %s\n", i, name, p.AuthorHandle, p.Text))
+		}
+
+		prompt := fmt.Sprintf(`以下のBluesky投稿リストから「%s」に関連する投稿の番号のみを出力してください。
+技術、プログラミング、AI、機械学習、ソフトウェア開発に関する投稿を幅広く含めてください。
 関連する投稿がない場合は「なし」と出力。番号はカンマ区切り。
 
 投稿リスト:
@@ -9585,27 +11616,28 @@ func filterBlueskyByIntent(posts []BlueskyPost, intent string, config *Config, s
 
 関連番号:`, intent, truncateStr(sb.String(), 6000))
 
-	result, err := callFastModel(prompt, config)
-	if err != nil || strings.TrimSpace(result) == "なし" {
-		return posts // fallback: return all
-	}
+		result, err := callFastModel(prompt, config)
+		if err != nil || strings.TrimSpace(result) == "なし" {
+			continue
+		}
 
-	// Parse indices
-	indices := parseIntList(strings.TrimSpace(result))
-	if len(indices) == 0 {
-		return posts
-	}
-
-	var filtered []BlueskyPost
-	for _, idx := range indices {
-		if idx >= 0 && idx < len(posts) {
-			filtered = append(filtered, posts[idx])
+		indices := parseIntList(strings.TrimSpace(result))
+		for _, idx := range indices {
+			if idx >= 0 && idx < len(batch) {
+				allFiltered = append(allFiltered, batch[idx])
+			}
 		}
 	}
-	if len(filtered) == 0 {
-		return posts
+
+	if len(allFiltered) == 0 {
+		// フォールバック: エンゲージメント上位20件を返す
+		top := 20
+		if len(sorted) < top {
+			top = len(sorted)
+		}
+		return sorted[:top]
 	}
-	return filtered
+	return allFiltered
 }
 
 // parseIntList parses a comma-separated list of integers.
@@ -9621,11 +11653,232 @@ func parseIntList(s string) []int {
 	return result
 }
 
+// BlueskyPostEvaluation holds per-post evaluation results from sub-agent.
+type BlueskyPostEvaluation struct {
+	Post       BlueskyPost
+	Importance int    // 1-10
+	Summary    string // sub-agent generated summary
+	Relevant   bool
+}
+
+// evaluateBlueskyPostsConcurrently evaluates each post individually using sub-agents.
+// Instead of batch filtering, each post is fetched (if URL present) and evaluated for
+// relevance and importance by a sub-agent in parallel.
+func evaluateBlueskyPostsConcurrently(posts []BlueskyPost, intent string, config *Config, sendEvent func(StreamEvent)) []BlueskyPostEvaluation {
+	if len(posts) == 0 {
+		return nil
+	}
+
+	// Sort by engagement, take top candidates
+	sorted := make([]BlueskyPost, len(posts))
+	copy(sorted, posts)
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].EngagementScore() > sorted[j].EngagementScore()
+	})
+	maxPosts := 40
+	if len(sorted) > maxPosts {
+		sorted = sorted[:maxPosts]
+	}
+
+	if sendEvent != nil {
+		sendEvent(StreamEvent{Type: "progress", Content: fmt.Sprintf("上位%d件をサブエージェントで個別評価中...", len(sorted))})
+	}
+
+	// Concurrent evaluation with semaphore (max 8 parallel)
+	sem := make(chan struct{}, 8)
+	var mu sync.Mutex
+	var results []BlueskyPostEvaluation
+	var wg sync.WaitGroup
+	var evaluated int
+
+	for _, p := range sorted {
+		wg.Add(1)
+		go func(post BlueskyPost) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			eval := evaluateSingleBlueskyPost(post, intent, config)
+			mu.Lock()
+			results = append(results, eval)
+			evaluated++
+			count := evaluated
+			mu.Unlock()
+
+			if sendEvent != nil {
+				label := post.AuthorHandle
+				if len(post.Text) > 30 {
+					label = string([]rune(post.Text)[:30]) + "..."
+				} else if post.Text != "" {
+					label = post.Text
+				}
+				sendEvent(StreamEvent{Type: "progress", Content: fmt.Sprintf("ポスト評価中 %d/%d: @%s「%s」→ 重要度%d", count, len(sorted), post.AuthorHandle, strings.ReplaceAll(label, "\n", " "), eval.Importance)})
+			}
+		}(p)
+	}
+
+	wg.Wait()
+
+	// Filter relevant posts and sort by importance
+	var relevant []BlueskyPostEvaluation
+	for _, r := range results {
+		if r.Relevant && r.Importance >= 3 {
+			relevant = append(relevant, r)
+		}
+	}
+	sort.Slice(relevant, func(i, j int) bool {
+		return relevant[i].Importance > relevant[j].Importance
+	})
+
+	if sendEvent != nil {
+		sendEvent(StreamEvent{Type: "progress", Content: fmt.Sprintf("評価完了: %d件中%d件が関連", len(sorted), len(relevant))})
+	}
+
+	// Return top 20
+	if len(relevant) > 20 {
+		relevant = relevant[:20]
+	}
+	return relevant
+}
+
+// evaluateSingleBlueskyPost evaluates a single post: fetches URL content if present,
+// then calls sub-agent to assess relevance, importance and generate summary.
+func evaluateSingleBlueskyPost(post BlueskyPost, intent string, config *Config) BlueskyPostEvaluation {
+	// Fetch URL content if available
+	var urlContent string
+	if post.ExternalURL != "" {
+		text, _, _, err := scraplingFetch(post.ExternalURL, 2000, false)
+		if err == nil && len(text) > 50 {
+			urlContent = truncateStr(text, 2000)
+		}
+	}
+
+	// Build evaluation prompt
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("以下のBluesky投稿を評価してください。テーマ: 「%s」\n\n", intent))
+	name := post.AuthorName
+	if name == "" {
+		name = post.AuthorHandle
+	}
+	sb.WriteString(fmt.Sprintf("著者: %s (@%s)\n", name, post.AuthorHandle))
+	sb.WriteString(fmt.Sprintf("投稿: %s\n", post.Text))
+	sb.WriteString(fmt.Sprintf("エンゲージメント: ❤%d 🔁%d 💬%d\n", post.LikeCount, post.RepostCount, post.ReplyCount))
+	if urlContent != "" {
+		sb.WriteString(fmt.Sprintf("\nリンク先内容:\n%s\n", urlContent))
+	}
+	sb.WriteString(`
+あなたはBluesky投稿の評価エージェントです。この投稿を精査し、以下を判定してください:
+
+1. テーマとの関連性 - 投稿内容がテーマに直接関係するか？単なる雑談や無関係な話題ではないか？
+2. 情報の価値 - 新しい情報・知見・ツール・論文・プロジェクトの紹介か？既知の一般論の繰り返しではないか？
+3. リンク先の内容 - URLがある場合、リンク先の内容は有益か？
+
+以下のJSON形式のみで回答（他の文字は一切不要）:
+{"relevant": true, "importance": 7, "summary": "日本語で要約"}
+
+- relevant: テーマに直接関連するならtrue、無関係・薄い関連ならfalse
+- importance: 重要度1-10。新規性・技術的深さ・実用性・エンゲージメントを総合評価
+- summary: 日本語2-3文。投稿の要点、リンク先の内容があればその要約も含む`)
+
+	_, result, err := callSubModel(sb.String(), config)
+	if err != nil {
+		return BlueskyPostEvaluation{Post: post, Relevant: false}
+	}
+
+	// Extract JSON from response
+	result = strings.TrimSpace(result)
+	jsonStart := strings.Index(result, "{")
+	jsonEnd := strings.LastIndex(result, "}")
+	if jsonStart < 0 || jsonEnd < 0 || jsonEnd <= jsonStart {
+		return BlueskyPostEvaluation{Post: post, Relevant: false}
+	}
+	jsonStr := result[jsonStart : jsonEnd+1]
+
+	var eval struct {
+		Relevant   bool   `json:"relevant"`
+		Importance int    `json:"importance"`
+		Summary    string `json:"summary"`
+	}
+	if err := json.Unmarshal([]byte(jsonStr), &eval); err != nil {
+		return BlueskyPostEvaluation{Post: post, Relevant: false}
+	}
+
+	return BlueskyPostEvaluation{
+		Post:       post,
+		Importance: eval.Importance,
+		Summary:    eval.Summary,
+		Relevant:   eval.Relevant,
+	}
+}
+
+// formatEvaluatedBlueskyPosts renders evaluated Bluesky posts with importance and summaries.
+func formatEvaluatedBlueskyPosts(evals []BlueskyPostEvaluation, title string) string {
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("# %s\n\n", title))
+	for i, e := range evals {
+		p := e.Post
+		sb.WriteString(fmt.Sprintf("### %d. ", i+1))
+		if p.AvatarURL != "" {
+			sb.WriteString(fmt.Sprintf("<img src=\"%s\" width=\"32\" height=\"32\" style=\"border-radius:50%%;vertical-align:middle;margin-right:6px\"> ", p.AvatarURL))
+		}
+		name := p.AuthorName
+		if name == "" {
+			name = p.AuthorHandle
+		}
+		// Importance badge
+		importanceLabel := "⭐"
+		if e.Importance >= 8 {
+			importanceLabel = "🔥"
+		} else if e.Importance >= 6 {
+			importanceLabel = "⭐⭐"
+		}
+		sb.WriteString(fmt.Sprintf("**%s** (@%s) %s 重要度:%d/10\n", name, p.AuthorHandle, importanceLabel, e.Importance))
+		// Summary from sub-agent
+		if e.Summary != "" {
+			sb.WriteString(fmt.Sprintf("\n> %s\n", e.Summary))
+		}
+		sb.WriteString(fmt.Sprintf("\n%s\n", p.Text))
+		for _, imgURL := range p.ImageURLs {
+			sb.WriteString(fmt.Sprintf("\n![image](%s)\n", imgURL))
+		}
+		if p.ExternalURL != "" {
+			linkTitle := p.ExternalTitle
+			if linkTitle == "" {
+				linkTitle = p.ExternalURL
+			}
+			sb.WriteString(fmt.Sprintf("\n🔗 [%s](%s)\n", linkTitle, p.ExternalURL))
+		}
+		if p.ReplyCount > 0 || p.LikeCount > 0 || p.RepostCount > 0 {
+			sb.WriteString(fmt.Sprintf("\n💬%d 🔁%d ❤%d", p.ReplyCount, p.RepostCount, p.LikeCount))
+			if p.QuoteCount > 0 {
+				sb.WriteString(fmt.Sprintf(" 💭%d", p.QuoteCount))
+			}
+		}
+		if p.CreatedAt != "" {
+			sb.WriteString(fmt.Sprintf("\n*%s*", p.CreatedAt))
+		}
+		sb.WriteString(fmt.Sprintf(" [↗](https://bsky.app/profile/%s)\n\n---\n\n", p.AuthorHandle))
+	}
+	return sb.String()
+}
+
 // containsBlueskyKeywords checks if the message is about Bluesky.
 func containsBlueskyKeywords(userMsg string) bool {
 	lower := strings.ToLower(userMsg)
 	keywords := []string{"bluesky", "bsky", "ブルースカイ"}
 	for _, kw := range keywords {
+		if strings.Contains(lower, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+// isBlueskySearchRequest returns true if the message is a Bluesky search request (not just feed).
+func isBlueskySearchRequest(userMsg string) bool {
+	lower := strings.ToLower(userMsg)
+	searchKeywords := []string{"検索", "search", "探して", "調べて", "について", "に関する", "の投稿", "の話題"}
+	for _, kw := range searchKeywords {
 		if strings.Contains(lower, kw) {
 			return true
 		}
@@ -10445,15 +12698,22 @@ func sendEmailWithImages(config *Config, subject, htmlBody string, images []Emai
 		mw := multipart.NewWriter(&buf)
 		fmt.Fprintf(&buf, "Content-Type: multipart/related; boundary=%s\r\n\r\n", mw.Boundary())
 
-		// HTML part
+		// HTML part (base64 encoded for reliable delivery)
 		htmlHeader := make(textproto.MIMEHeader)
 		htmlHeader.Set("Content-Type", "text/html; charset=UTF-8")
-		htmlHeader.Set("Content-Transfer-Encoding", "quoted-printable")
+		htmlHeader.Set("Content-Transfer-Encoding", "base64")
 		htmlPart, err := mw.CreatePart(htmlHeader)
 		if err != nil {
 			return fmt.Errorf("failed to create HTML part: %w", err)
 		}
-		htmlPart.Write([]byte(htmlBody))
+		htmlB64 := base64.StdEncoding.EncodeToString([]byte(htmlBody))
+		for i := 0; i < len(htmlB64); i += 76 {
+			end := i + 76
+			if end > len(htmlB64) {
+				end = len(htmlB64)
+			}
+			htmlPart.Write([]byte(htmlB64[i:end] + "\r\n"))
+		}
 
 		// Image parts
 		for _, img := range images {
@@ -10733,6 +12993,7 @@ func (ws *WebServer) selfImproveLoop() {
 		ws.runSelfImprovement()
 		ws.updateUserProfile()
 		ws.tryPromptImprovement()
+		ws.analyzeJetstreamPosts()
 		ws.runAutonomousThinking()
 		ws.runProactiveExecution()
 		ws.improveMu.Unlock()
@@ -11841,6 +14102,91 @@ func (a *Agent) evolveAbort() (string, error) {
 // ============================================================================
 // Docker GPU Container Management
 // ============================================================================
+
+// Zeroboot sandbox integration
+var (
+	zerobootEndpoint = "https://api.zeroboot.dev"
+	zerobootAPIKey   = "zb_demo_hn2026"
+)
+
+type ZerobootResult struct {
+	ID          string  `json:"id"`
+	Stdout      string  `json:"stdout"`
+	Stderr      string  `json:"stderr"`
+	ExitCode    int     `json:"exit_code"`
+	ForkTimeMs  float64 `json:"fork_time_ms"`
+	ExecTimeMs  float64 `json:"exec_time_ms"`
+	TotalTimeMs float64 `json:"total_time_ms"`
+	Error       string  `json:"error,omitempty"`
+}
+
+func zerobootExec(code, language string, timeoutSec int) (*ZerobootResult, error) {
+	if language == "" {
+		language = "python"
+	}
+	if timeoutSec <= 0 {
+		timeoutSec = 30
+	}
+
+	reqBody, _ := json.Marshal(map[string]interface{}{
+		"code":            code,
+		"language":        language,
+		"timeout_seconds": timeoutSec,
+	})
+
+	req, err := http.NewRequest("POST", zerobootEndpoint+"/v1/exec", bytes.NewReader(reqBody))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+zerobootAPIKey)
+
+	client := &http.Client{Timeout: time.Duration(timeoutSec+10) * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("zeroboot request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("zeroboot error (status %d): %s", resp.StatusCode, string(body))
+	}
+
+	var result ZerobootResult
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("zeroboot parse error: %w", err)
+	}
+	return &result, nil
+}
+
+// zerobootExecWithFiles executes code in zeroboot and extracts base64-encoded file outputs.
+// The code should print files as: __FILE:filename:base64data__
+func zerobootExecWithFiles(code, language string, timeoutSec int) (*ZerobootResult, map[string][]byte, error) {
+	result, err := zerobootExec(code, language, timeoutSec)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	files := make(map[string][]byte)
+	cleanStdout := ""
+	for _, line := range strings.Split(result.Stdout, "\n") {
+		if strings.HasPrefix(line, "__FILE:") && strings.HasSuffix(line, "__") {
+			inner := line[7 : len(line)-2]
+			parts := strings.SplitN(inner, ":", 2)
+			if len(parts) == 2 {
+				data, err := base64.StdEncoding.DecodeString(parts[1])
+				if err == nil {
+					files[parts[0]] = data
+				}
+			}
+		} else {
+			cleanStdout += line + "\n"
+		}
+	}
+	result.Stdout = strings.TrimSpace(cleanStdout)
+	return result, files, nil
+}
 
 var (
 	dockerContainerName = "siki-worker"
@@ -13169,6 +15515,36 @@ async def fetch(req: FetchRequest):
         traceback.print_exc()
         return JSONResponse(status_code=500, content={"error": str(e)})
 
+class ScreenshotRequest(BaseModel):
+    url: str
+    width: int = 1280
+    height: int = 800
+
+@app.post("/screenshot")
+async def screenshot(req: ScreenshotRequest):
+    try:
+        import base64
+        try:
+            from playwright.async_api import async_playwright
+        except ImportError:
+            import subprocess
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "playwright", "--quiet"])
+            subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium"])
+            from playwright.async_api import async_playwright
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page(viewport={"width": req.width, "height": req.height})
+            await page.goto(req.url, timeout=20000, wait_until="networkidle")
+            png_bytes = await page.screenshot(full_page=False)
+            await browser.close()
+            b64 = base64.b64encode(png_bytes).decode("utf-8")
+            return {"image": b64, "width": req.width, "height": req.height}
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
 @app.post("/search")
 async def search(req: SearchRequest):
     try:
@@ -13345,6 +15721,40 @@ func scraplingFetch(targetURL string, maxLength int, stealth bool) (string, stri
 		return "", "", nil, err
 	}
 	return result.Title, result.Text, result.Links, nil
+}
+
+// scraplingScreenshot takes a screenshot of a URL and returns PNG bytes.
+func scraplingScreenshot(targetURL string) ([]byte, error) {
+	if err := ensureScraplingServer(); err != nil {
+		return nil, err
+	}
+
+	reqBody, _ := json.Marshal(map[string]interface{}{
+		"url":    targetURL,
+		"width":  1280,
+		"height": 800,
+	})
+
+	client := &http.Client{Timeout: 60 * time.Second}
+	resp, err := client.Post(scraplingEndpoint+"/screenshot", "application/json", bytes.NewReader(reqBody))
+	if err != nil {
+		return nil, fmt.Errorf("scrapling screenshot failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("scrapling screenshot error (status %d): %s", resp.StatusCode, string(body))
+	}
+
+	var result struct {
+		Image string `json:"image"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+
+	return base64.StdEncoding.DecodeString(result.Image)
 }
 
 // scraplingSearch performs a web search using the Scrapling server.
@@ -15563,6 +17973,27 @@ When modifying yourself:
 	// Inject user profile if available
 	if profile := loadUserProfile(); profile != nil {
 		sb.WriteString("\n\n## ユーザー情報\n")
+		if profile.Name != "" {
+			sb.WriteString(fmt.Sprintf("- 名前: %s\n", profile.Name))
+		}
+		if profile.Company != "" {
+			sb.WriteString(fmt.Sprintf("- 勤務先: %s\n", profile.Company))
+		}
+		if profile.Role != "" {
+			sb.WriteString(fmt.Sprintf("- 役職: %s\n", profile.Role))
+		}
+		if profile.Location != "" {
+			sb.WriteString(fmt.Sprintf("- 所在地: %s\n", profile.Location))
+		}
+		if len(profile.Skills) > 0 {
+			sb.WriteString(fmt.Sprintf("- スキル: %s\n", strings.Join(profile.Skills, ", ")))
+		}
+		if len(profile.Clients) > 0 {
+			sb.WriteString(fmt.Sprintf("- 取引先: %s\n", strings.Join(profile.Clients, ", ")))
+		}
+		if profile.Bio != "" {
+			sb.WriteString(fmt.Sprintf("- 自己紹介: %s\n", profile.Bio))
+		}
 		if len(profile.Interests) > 0 {
 			sb.WriteString(fmt.Sprintf("- 興味: %s\n", strings.Join(profile.Interests, ", ")))
 		}
@@ -15574,6 +18005,35 @@ When modifying yourself:
 		}
 		if len(profile.Preferences) > 0 {
 			sb.WriteString(fmt.Sprintf("- 傾向: %s\n", strings.Join(profile.Preferences, ", ")))
+		}
+
+		// 未入力フィールドを1つだけ自然に聞く指示
+		missing := profileMissingFields(profile)
+		if len(missing) > 0 {
+			// まだ聞いていない & 24時間以上経過 → 1項目だけ質問
+			asked := make(map[string]bool)
+			for _, f := range profile.AskedFields {
+				asked[f] = true
+			}
+			var toAsk string
+			for _, f := range missing {
+				if !asked[f] {
+					toAsk = f
+					break
+				}
+			}
+			if toAsk != "" && time.Since(profile.LastAsked) > 24*time.Hour {
+				fieldLabels := map[string]string{
+					"name": "名前", "occupation": "職業", "age": "年齢",
+					"company": "勤務先", "role": "役職", "location": "所在地",
+				}
+				label := fieldLabels[toAsk]
+				sb.WriteString(fmt.Sprintf("\n\n## プロフィール質問指示\nユーザーの「%s」がまだ不明です。会話の自然な流れの中で、さりげなく聞いてください。押し付けがましくならないように。\n", label))
+				// AskedFieldsに追加して保存
+				profile.AskedFields = append(profile.AskedFields, toAsk)
+				profile.LastAsked = time.Now()
+				saveUserProfile(profile)
+			}
 		}
 	}
 
@@ -15616,6 +18076,18 @@ When modifying yourself:
 		sb.WriteString("UNTESTED状態のプラグインは信頼性が未検証。\n")
 	}
 	pluginMu.RUnlock()
+
+	// Inject installed skills
+	skillsMu.RLock()
+	if len(loadedSkills) > 0 {
+		sb.WriteString("\n\n## Installed Skills\n")
+		sb.WriteString("Use `use_skill` tool to activate a skill when appropriate. Skills provide structured workflows for development tasks.\n\n")
+		for _, s := range loadedSkills {
+			sb.WriteString(fmt.Sprintf("- **%s**: %s\n", s.Name, s.Description))
+		}
+		sb.WriteString("\nスキルはuse_skillツールで起動できます。ブレインストーミング、デバッグ、コードレビューなどの構造化されたワークフローを提供します。\n")
+	}
+	skillsMu.RUnlock()
 
 	// Inject configured providers
 	if len(config.Providers) > 1 {
@@ -16080,6 +18552,10 @@ func (ws *WebServer) handleDigestSettings(w http.ResponseWriter, r *http.Request
 			"twitter_access_token":    ws.config.TwitterAccessToken,
 			"twitter_access_secret":   ws.config.TwitterAccessSecret,
 			"bluesky_enabled":         ws.config.BlueskyEnabled,
+			"bluesky_identifier":      ws.config.BlueskyIdentifier,
+			"jetstream_keywords":      ws.config.JetstreamKeywords,
+			"brave_api_key":           ws.config.BraveAPIKey,
+			"groq_api_key":            ws.config.GroqAPIKey,
 		})
 	case http.MethodPost:
 		var req struct {
@@ -16097,7 +18573,12 @@ func (ws *WebServer) handleDigestSettings(w http.ResponseWriter, r *http.Request
 			TwitterConsumerSecret string `json:"twitter_consumer_secret"`
 			TwitterAccessToken    string `json:"twitter_access_token"`
 			TwitterAccessSecret   string `json:"twitter_access_secret"`
-			BlueskyEnabled        bool   `json:"bluesky_enabled"`
+			BlueskyEnabled        bool     `json:"bluesky_enabled"`
+			BlueskyIdentifier     string   `json:"bluesky_identifier"`
+			BlueskyAppPassword    string   `json:"bluesky_app_password"`
+			JetstreamKeywords     []string `json:"jetstream_keywords"`
+			BraveAPIKey           string   `json:"brave_api_key"`
+			GroqAPIKey            string   `json:"groq_api_key"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
@@ -16125,6 +18606,23 @@ func (ws *WebServer) handleDigestSettings(w http.ResponseWriter, r *http.Request
 		ws.config.TwitterAccessToken = req.TwitterAccessToken
 		ws.config.TwitterAccessSecret = req.TwitterAccessSecret
 		ws.config.BlueskyEnabled = req.BlueskyEnabled
+		if req.BlueskyIdentifier != "" {
+			ws.config.BlueskyIdentifier = req.BlueskyIdentifier
+		}
+		if req.BlueskyAppPassword != "" {
+			ws.config.BlueskyAppPassword = req.BlueskyAppPassword
+		}
+		if req.JetstreamKeywords != nil {
+			ws.config.JetstreamKeywords = req.JetstreamKeywords
+		}
+		if req.BraveAPIKey != "" {
+			ws.config.BraveAPIKey = req.BraveAPIKey
+			os.Setenv("BRAVE_API_KEY", req.BraveAPIKey)
+		}
+		if req.GroqAPIKey != "" {
+			ws.config.GroqAPIKey = req.GroqAPIKey
+			os.Setenv("GROQ_API_KEY", req.GroqAPIKey)
+		}
 		cachedTwitterUserID = ""
 		// Persist to file
 		dc := &DigestConfig{
@@ -16143,6 +18641,11 @@ func (ws *WebServer) handleDigestSettings(w http.ResponseWriter, r *http.Request
 			TwitterAccessToken:    ws.config.TwitterAccessToken,
 			TwitterAccessSecret:   ws.config.TwitterAccessSecret,
 			BlueskyEnabled:        ws.config.BlueskyEnabled,
+			BlueskyIdentifier:     ws.config.BlueskyIdentifier,
+			BlueskyAppPassword:    ws.config.BlueskyAppPassword,
+			JetstreamKeywords:     ws.config.JetstreamKeywords,
+			BraveAPIKey:           ws.config.BraveAPIKey,
+			GroqAPIKey:            ws.config.GroqAPIKey,
 		}
 		ws.mu.Unlock()
 		if err := saveDigestConfig(dc); err != nil {
@@ -16166,6 +18669,154 @@ func (ws *WebServer) handleDigestTest(w http.ResponseWriter, r *http.Request) {
 	go ws.sendDigestEmail()
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "sending"})
+}
+
+func (ws *WebServer) handleJetstreamKeywords(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	switch r.Method {
+	case http.MethodGet:
+		ws.mu.RLock()
+		kw := ws.config.JetstreamKeywords
+		ws.mu.RUnlock()
+		json.NewEncoder(w).Encode(map[string]interface{}{"keywords": kw})
+	case http.MethodPost:
+		var req struct {
+			Keywords []string `json:"keywords"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		// Clean up empty strings
+		var clean []string
+		for _, kw := range req.Keywords {
+			kw = strings.TrimSpace(kw)
+			if kw != "" {
+				clean = append(clean, kw)
+			}
+		}
+		ws.mu.Lock()
+		ws.config.JetstreamKeywords = clean
+		ws.mu.Unlock()
+		// Persist
+		dc := loadDigestConfig()
+		if dc == nil {
+			dc = &DigestConfig{}
+		}
+		dc.JetstreamKeywords = clean
+		saveDigestConfig(dc)
+		json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "keywords": clean})
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (ws *WebServer) handleJetstreamStats(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	// Count saved posts for recent days
+	type DayStat struct {
+		Date  string `json:"date"`
+		Count int    `json:"count"`
+	}
+	var stats []DayStat
+	for d := 0; d < 7; d++ {
+		t := time.Now().AddDate(0, 0, -d)
+		filename := filepath.Join(jetstreamPostsDir(), t.Format("2006"), t.Format("0102")+".txt")
+		count := 0
+		if data, err := os.ReadFile(filename); err == nil {
+			for _, line := range strings.Split(string(data), "\n") {
+				if line != "" {
+					count++
+				}
+			}
+		}
+		stats = append(stats, DayStat{Date: t.Format("2006-01-02"), Count: count})
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{"stats": stats})
+}
+
+func (ws *WebServer) handleJetstreamPosts(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	query := r.URL.Query().Get("q")
+	days := 1
+	if d, err := strconv.Atoi(r.URL.Query().Get("days")); err == nil && d > 0 {
+		days = d
+	}
+	limit := 200
+	if l, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && l > 0 {
+		limit = l
+	}
+
+	type Post struct {
+		Time       string   `json:"time"`
+		DID        string   `json:"did"`
+		RKey       string   `json:"rkey"`
+		Keywords   []string `json:"keywords"`
+		Text       string   `json:"text"`
+		OGPTitle   string   `json:"ogp_title,omitempty"`
+		OGPDesc    string   `json:"ogp_desc,omitempty"`
+		OGPImage   string   `json:"ogp_image,omitempty"`
+		URL        string   `json:"url,omitempty"`
+		Evaluation string   `json:"evaluation,omitempty"`
+		Score      int      `json:"score,omitempty"`
+	}
+
+	queryLower := strings.ToLower(query)
+	var posts []Post
+	for d := 0; d < days; d++ {
+		t := time.Now().AddDate(0, 0, -d)
+		filename := filepath.Join(jetstreamPostsDir(), t.Format("2006"), t.Format("0102")+".txt")
+		data, err := os.ReadFile(filename)
+		if err != nil {
+			continue
+		}
+		meta := loadJetstreamMeta(t)
+		lines := strings.Split(string(data), "\n")
+		// Read in reverse (newest first)
+		for i := len(lines) - 1; i >= 0; i-- {
+			line := lines[i]
+			if line == "" {
+				continue
+			}
+			if query != "" && !strings.Contains(strings.ToLower(line), queryLower) {
+				continue
+			}
+			parts := strings.SplitN(line, "\t", 5)
+			if len(parts) < 5 {
+				continue
+			}
+			kwStr := strings.Trim(parts[3], "[]")
+			var kws []string
+			if kwStr != "" {
+				kws = strings.Split(kwStr, ",")
+			}
+			p := Post{
+				Time:     parts[0],
+				DID:      parts[1],
+				RKey:     parts[2],
+				Keywords: kws,
+				Text:     parts[4],
+			}
+			// Attach metadata if available
+			key := parts[1] + ":" + parts[2]
+			if m, ok := meta[key]; ok {
+				p.OGPTitle = m.OGPTitle
+				p.OGPDesc = m.OGPDesc
+				p.OGPImage = m.OGPImage
+				p.URL = m.URL
+				p.Evaluation = m.Evaluation
+				p.Score = m.Score
+			}
+			posts = append(posts, p)
+			if len(posts) >= limit {
+				break
+			}
+		}
+		if len(posts) >= limit {
+			break
+		}
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{"posts": posts, "count": len(posts)})
 }
 
 func (ws *WebServer) handleThreads(w http.ResponseWriter, r *http.Request) {
@@ -16212,6 +18863,21 @@ func (ws *WebServer) handleThreads(w http.ResponseWriter, r *http.Request) {
 					filtered = []ThreadListItem{}
 				}
 				items = filtered
+			}
+			// Apply limit (default 100) to prevent heavy responses
+			limitStr := r.URL.Query().Get("limit")
+			limit := 100
+			if limitStr != "" {
+				if n, err := strconv.Atoi(limitStr); err == nil && n > 0 {
+					limit = n
+				}
+			}
+			// Sort by updated_at descending (most recent first)
+			sort.Slice(items, func(i, j int) bool {
+				return items[i].UpdatedAt.After(items[j].UpdatedAt)
+			})
+			if len(items) > limit {
+				items = items[:limit]
 			}
 			json.NewEncoder(w).Encode(items)
 		case http.MethodPost:
@@ -16359,6 +19025,28 @@ func (ws *WebServer) handleThreads(w http.ResponseWriter, r *http.Request) {
 			if t.Unread {
 				t.Unread = false
 				saveThreadMeta(t)
+			}
+			// Trim excessive messages to prevent browser freeze
+			{
+				var trimmedMsgs []ThreadMessage
+				thinkingCount := 0
+				for _, m := range t.Messages {
+					if m.EventType == "thinking" {
+						thinkingCount++
+						if thinkingCount > 20 {
+							continue
+						}
+					}
+					// Truncate large content in tool results and tool_call events
+					if m.EventType == "tool_call" || m.Role == "tool" {
+						runes := []rune(m.Content)
+						if len(runes) > 3000 {
+							m.Content = string(runes[:3000]) + "\n...(truncated)"
+						}
+					}
+					trimmedMsgs = append(trimmedMsgs, m)
+				}
+				t.Messages = trimmedMsgs
 			}
 			json.NewEncoder(w).Encode(t)
 		case http.MethodDelete:
@@ -17145,6 +19833,14 @@ func runWeb(config *Config, host string, port int) error {
 	// Load persisted digest settings
 	applyDigestConfig(config)
 
+	// Apply Zeroboot config
+	if config.ZerobootEndpoint != "" {
+		zerobootEndpoint = config.ZerobootEndpoint
+	}
+	if config.ZerobootAPIKey != "" {
+		zerobootAPIKey = config.ZerobootAPIKey
+	}
+
 	ws := NewWebServer(config)
 
 	initStaticDir()
@@ -17169,6 +19865,115 @@ func runWeb(config *Config, host string, port int) error {
 	http.HandleFunc("/api/orchestrator", ws.handleOrchestrator)
 	http.HandleFunc("/api/digest/settings", ws.handleDigestSettings)
 	http.HandleFunc("/api/digest/test", ws.handleDigestTest)
+	http.HandleFunc("/api/profile", ws.handleProfile)
+	http.HandleFunc("/api/jetstream/keywords", ws.handleJetstreamKeywords)
+	http.HandleFunc("/api/jetstream/stats", ws.handleJetstreamStats)
+	http.HandleFunc("/api/jetstream/posts", ws.handleJetstreamPosts)
+	http.HandleFunc("/api/jetstream/analyze", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		go ws.analyzeJetstreamPosts()
+		json.NewEncoder(w).Encode(map[string]string{"status": "started"})
+	})
+
+	// Skills API
+	http.HandleFunc("/api/skills", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		skillsMu.RLock()
+		defer skillsMu.RUnlock()
+		// Return skill list (without full content for lighter response)
+		type skillInfo struct {
+			Name        string   `json:"name"`
+			Description string   `json:"description"`
+			Files       []string `json:"files,omitempty"`
+			Source      string   `json:"source,omitempty"`
+		}
+		var list []skillInfo
+		for _, s := range loadedSkills {
+			list = append(list, skillInfo{
+				Name:        s.Name,
+				Description: s.Description,
+				Files:       s.Files,
+				Source:       s.Source,
+			})
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{"skills": list, "count": len(list)})
+	})
+
+	http.HandleFunc("/api/skills/install", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			http.Error(w, "POST required", 405)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+
+		var req struct {
+			RepoURL string `json:"repo_url"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.RepoURL == "" {
+			json.NewEncoder(w).Encode(map[string]string{"error": "repo_url required"})
+			return
+		}
+
+		// Clone repo to temp dir
+		tmpDir, err := os.MkdirTemp("", "siki-skills-*")
+		if err != nil {
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		defer os.RemoveAll(tmpDir)
+
+		cmd := exec.Command("git", "clone", "--depth", "1", req.RepoURL, tmpDir)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			json.NewEncoder(w).Encode(map[string]string{"error": fmt.Sprintf("git clone failed: %s", string(out))})
+			return
+		}
+
+		// Detect skill directory (look for skills/ subdir)
+		skillSrcDir := filepath.Join(tmpDir, "skills")
+		if _, err := os.Stat(skillSrcDir); err != nil {
+			// Maybe skills are at root level
+			skillSrcDir = tmpDir
+		}
+
+		// Detect source name from repo URL
+		source := filepath.Base(strings.TrimSuffix(req.RepoURL, ".git"))
+
+		count, err := installSkillsFromDir(skillSrcDir, source)
+		if err != nil {
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":    "installed",
+			"count":     count,
+			"source":    source,
+		})
+	})
+
+	http.HandleFunc("/api/skills/delete", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			http.Error(w, "POST required", 405)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		var req struct {
+			Name string `json:"name"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Name == "" {
+			json.NewEncoder(w).Encode(map[string]string{"error": "name required"})
+			return
+		}
+		skillDir := filepath.Join(skillsDir(), req.Name)
+		if err := os.RemoveAll(skillDir); err != nil {
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		skillsMu.Lock()
+		loadedSkills = loadSkills()
+		skillsMu.Unlock()
+		json.NewEncoder(w).Encode(map[string]string{"status": "deleted", "name": req.Name})
+	})
 
 	// Initialize directories
 	if err := initThreadDir(); err != nil {
@@ -17183,6 +19988,12 @@ func runWeb(config *Config, host string, port int) error {
 	if err := loadPlugins(); err != nil {
 		fmt.Printf("Warning: failed to load plugins: %v\n", err)
 	}
+	// Load skills
+	os.MkdirAll(skillsDir(), 0755)
+	skillsMu.Lock()
+	loadedSkills = loadSkills()
+	skillsMu.Unlock()
+	fmt.Printf("[siki] Loaded %d skills\n", len(loadedSkills))
 	if err := initDockerWorkspace(); err != nil {
 		fmt.Printf("Warning: failed to initialize docker workspace: %v\n", err)
 	}
@@ -17291,6 +20102,9 @@ func runWeb(config *Config, host string, port int) error {
 
 	// Start Bluesky feed background loop
 	go ws.blueskyFeedLoop()
+
+	// Start Bluesky Jetstream monitoring loop
+	go ws.jetstreamLoop()
 
 	// Open browser automatically (only for localhost)
 	if host != "0.0.0.0" {

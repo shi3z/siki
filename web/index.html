@@ -1024,6 +1024,8 @@
             border-radius: 12px;
             width: 90%;
             max-width: 500px;
+            max-height: 85vh;
+            overflow-y: auto;
         }
 
         .modal-content h2 {
@@ -1420,6 +1422,8 @@
                 <div class="docker-status-dot" id="docker-status-dot"></div>
                 <span id="docker-status-text">Docker</span>
             </div>
+            <button class="settings-btn" onclick="showJetstreamMonitor()">Monitor</button>
+            <button class="settings-btn" onclick="showProfile()">Profile</button>
             <button class="settings-btn" onclick="showSettings()" data-i18n="settings">Settings</button>
             <button class="settings-btn" onclick="clearChat()" data-i18n="clear">Clear</button>
             <button id="tool-pane-toggle-btn" onclick="toggleToolResultPane()">Tools</button>
@@ -1653,13 +1657,153 @@
                     </label>
                 </div>
                 <div style="font-size: 0.72rem; color: var(--text-secondary); margin-bottom: 0.5rem;">
-                    AI/MLスターターパックからの投稿を定期取得します（認証不要）
+                    AI/MLスターターパックからの投稿を定期取得します。検索機能には認証が必要です。
+                </div>
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.5rem;margin-top:0.3rem;">
+                    <input type="text" id="setting-bluesky-identifier" class="setting-input" placeholder="Handle (例: user.bsky.social)">
+                    <input type="password" id="setting-bluesky-apppassword" class="setting-input" placeholder="App Password">
+                </div>
+                <div style="font-size: 0.65rem; color: var(--text-secondary); margin-top: 0.2rem;">
+                    bsky.app → Settings → App Passwords で生成
+                </div>
+            </div>
+
+            <div class="setting-group">
+                <div class="setting-label">
+                    Jetstream Monitor Keywords
+                    <span id="jetstream-status" style="font-size:0.6rem;margin-left:0.5rem;color:var(--text-secondary)"></span>
+                </div>
+                <textarea id="setting-jetstream-keywords" class="setting-input" rows="3" placeholder="監視キーワード（1行に1つ）&#10;例:&#10;LLM&#10;機械学習&#10;GPT" style="resize:vertical;font-size:0.75rem;"></textarea>
+                <div style="font-size: 0.65rem; color: var(--text-secondary); margin-top: 0.2rem;">
+                    Bluesky全体の投稿をリアルタイム監視し、キーワードに一致する投稿を自動保存します
+                </div>
+            </div>
+
+            <!-- Skill API Keys -->
+            <div class="setting-group" style="margin-top:0.8rem;">
+                <div class="setting-label">Skill API Keys</div>
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.5rem;">
+                    <label style="display:flex;flex-direction:column;font-size:0.75rem;">Brave Search API Key
+                        <input type="password" id="setting-brave-api-key" class="setting-input" placeholder="BRAVE_API_KEY" style="font-size:0.7rem;">
+                    </label>
+                    <label style="display:flex;flex-direction:column;font-size:0.75rem;">Groq API Key (Whisper)
+                        <input type="password" id="setting-groq-api-key" class="setting-input" placeholder="GROQ_API_KEY" style="font-size:0.7rem;">
+                    </label>
+                </div>
+                <div style="font-size: 0.6rem; color: var(--text-secondary); margin-top: 0.2rem;">
+                    brave-search / transcribe スキルで使用。設定するとプロセスの環境変数にセットされます。
+                </div>
+            </div>
+
+            <!-- Skills Section -->
+            <div class="setting-group" style="margin-top:0.8rem;">
+                <div class="setting-label" style="display:flex;align-items:center;justify-content:space-between;">
+                    <span>Skills</span>
+                    <button class="btn-secondary" onclick="installSuperpowers()" style="font-size:0.65rem;padding:2px 8px;">Install superpowers</button>
+                </div>
+                <div id="skills-list" style="font-size:0.75rem;max-height:200px;overflow-y:auto;"></div>
+                <div style="margin-top:0.3rem;display:flex;gap:0.3rem;">
+                    <input type="text" id="skill-repo-url" class="setting-input" placeholder="Git repo URL (e.g. https://github.com/user/skills)" style="flex:1;font-size:0.7rem;">
+                    <button class="btn-secondary" onclick="installSkillsFromRepo()" style="font-size:0.65rem;padding:2px 8px;">Install</button>
                 </div>
             </div>
 
             <div class="modal-actions">
                 <button class="btn-secondary" onclick="hideSettings()" data-i18n="cancel">Cancel</button>
                 <button class="btn-primary" onclick="saveSettings()" data-i18n="save">Save</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Profile Modal -->
+    <div class="modal" id="profile-modal">
+        <div class="modal-content" style="max-width: 700px;">
+            <h2>Profile</h2>
+
+            <h3 style="margin-top:0.5rem;">基本情報</h3>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.5rem;">
+                <label style="display:flex;flex-direction:column;font-size:0.85rem;">名前
+                    <input type="text" id="profile-name" class="setting-input" placeholder="名前">
+                </label>
+                <label style="display:flex;flex-direction:column;font-size:0.85rem;">年齢
+                    <input type="number" id="profile-age" class="setting-input" placeholder="年齢" min="0" max="150">
+                </label>
+            </div>
+            <label style="display:flex;flex-direction:column;font-size:0.85rem;margin-top:0.4rem;">所在地
+                <input type="text" id="profile-location" class="setting-input" placeholder="例: 東京">
+            </label>
+
+            <h3 style="margin-top:1rem;">仕事</h3>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.5rem;">
+                <label style="display:flex;flex-direction:column;font-size:0.85rem;">勤務先
+                    <input type="text" id="profile-company" class="setting-input" placeholder="会社名">
+                </label>
+                <label style="display:flex;flex-direction:column;font-size:0.85rem;">部署
+                    <input type="text" id="profile-department" class="setting-input" placeholder="部署">
+                </label>
+                <label style="display:flex;flex-direction:column;font-size:0.85rem;">役職
+                    <input type="text" id="profile-role" class="setting-input" placeholder="役職">
+                </label>
+                <label style="display:flex;flex-direction:column;font-size:0.85rem;">職業 (AI推定)
+                    <input type="text" id="profile-occupation" class="setting-input" disabled>
+                </label>
+            </div>
+
+            <h3 style="margin-top:1rem;">詳細</h3>
+            <label style="display:flex;flex-direction:column;font-size:0.85rem;">取引先 (カンマ区切り)
+                <input type="text" id="profile-clients" class="setting-input" placeholder="例: A社, B社">
+            </label>
+            <label style="display:flex;flex-direction:column;font-size:0.85rem;margin-top:0.4rem;">スキル (カンマ区切り)
+                <input type="text" id="profile-skills" class="setting-input" placeholder="例: Go, Python, AWS">
+            </label>
+            <label style="display:flex;flex-direction:column;font-size:0.85rem;margin-top:0.4rem;">自己紹介
+                <textarea id="profile-bio" class="setting-input" rows="3" placeholder="自由記述"></textarea>
+            </label>
+
+            <h3 style="margin-top:1rem;">AI分析結果 <span style="font-size:0.75rem;color:var(--text-secondary);">(読取専用)</span></h3>
+            <div style="font-size:0.85rem;">
+                <div style="margin-bottom:0.3rem;"><strong>技術レベル:</strong> <span id="profile-ai-techlevel">-</span></div>
+                <div style="margin-bottom:0.3rem;"><strong>興味:</strong> <span id="profile-ai-interests" style="display:flex;flex-wrap:wrap;gap:0.3rem;"></span></div>
+                <div style="margin-bottom:0.3rem;"><strong>傾向:</strong> <span id="profile-ai-preferences" style="display:flex;flex-wrap:wrap;gap:0.3rem;"></span></div>
+                <div style="margin-bottom:0.3rem;"><strong>よく使うツール:</strong> <span id="profile-ai-tools" style="display:flex;flex-wrap:wrap;gap:0.3rem;"></span></div>
+                <div><strong>最終更新:</strong> <span id="profile-ai-updated">-</span></div>
+            </div>
+
+            <div class="modal-actions">
+                <button class="btn-secondary" onclick="hideProfile()">Cancel</button>
+                <button class="btn-primary" onclick="saveProfile()">Save</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Jetstream Monitor Modal -->
+    <div class="modal" id="jetstream-modal">
+        <div class="modal-content" style="max-width: 900px; max-height: 90vh; display: flex; flex-direction: column;">
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.5rem;">
+                <h2 style="margin:0;">Bluesky Monitor</h2>
+                <span id="jm-stats" style="font-size:0.75rem;color:var(--text-secondary);"></span>
+            </div>
+
+            <div style="display:flex;gap:0.5rem;margin-bottom:0.5rem;">
+                <input type="text" id="jm-search" class="setting-input" placeholder="検索キーワード..." style="flex:1;" onkeydown="if(event.key==='Enter')searchJetstream()">
+                <select id="jm-days" class="setting-input" style="width:auto;">
+                    <option value="1">今日</option>
+                    <option value="3">3日間</option>
+                    <option value="7" selected>7日間</option>
+                    <option value="30">30日間</option>
+                </select>
+                <button class="btn-primary" onclick="searchJetstream()" style="white-space:nowrap;">検索</button>
+                <button class="btn-secondary" onclick="loadJetstreamRecent()" style="white-space:nowrap;">最新</button>
+            </div>
+
+            <div id="jm-keywords" style="display:flex;flex-wrap:wrap;gap:0.3rem;margin-bottom:0.5rem;"></div>
+
+            <div id="jm-results" style="flex:1;overflow-y:auto;border:1px solid var(--border);border-radius:8px;padding:0.5rem;font-size:0.8rem;min-height:300px;">
+                <div style="color:var(--text-secondary);text-align:center;padding:2rem;">「最新」で保存済みポストを表示、またはキーワードで検索</div>
+            </div>
+
+            <div class="modal-actions" style="margin-top:0.5rem;">
+                <button class="btn-secondary" onclick="hideJetstreamMonitor()">閉じる</button>
             </div>
         </div>
     </div>
@@ -2113,7 +2257,7 @@
         const statusDot = document.getElementById('status-dot');
         const statusText = document.getElementById('status-text');
 
-        let conversationId = localStorage.getItem('siki-current-thread') || Date.now().toString();
+        let conversationId = Date.now().toString();
         let threads = [];
 
         // Auto-resize textarea
@@ -2720,7 +2864,7 @@
             if (threadId === conversationId) return;
 
             conversationId = threadId;
-            localStorage.setItem('siki-current-thread', threadId);
+            // localStorage removed to avoid loading stale heavy threads
             chatContainer.innerHTML = '';
             // Mark as read in local state
             const t = threads.find(th => th.id === threadId);
@@ -3333,14 +3477,310 @@
                     document.getElementById(elemId).value = digestData[key] || '';
                 }
                 document.getElementById('setting-bluesky-enabled').checked = digestData.bluesky_enabled || false;
+                document.getElementById('setting-bluesky-identifier').value = digestData.bluesky_identifier || '';
+                // Jetstream keywords
+                const jkw = digestData.jetstream_keywords || [];
+                document.getElementById('setting-jetstream-keywords').value = jkw.join('\n');
+                // Load jetstream stats
+                try {
+                    const statsResp = await fetch('/api/jetstream/stats');
+                    const statsData = await statsResp.json();
+                    const total = (statsData.stats || []).reduce((s, d) => s + d.count, 0);
+                    document.getElementById('jetstream-status').textContent = total > 0 ? `(${total}件保存済み / 直近7日)` : '';
+                } catch(e) {}
+                // Skill API keys - show placeholder if set
+                document.getElementById('setting-brave-api-key').value = '';
+                document.getElementById('setting-brave-api-key').placeholder = digestData.brave_api_key ? '••••••••（設定済み）' : 'BRAVE_API_KEY';
+                document.getElementById('setting-groq-api-key').value = '';
+                document.getElementById('setting-groq-api-key').placeholder = digestData.groq_api_key ? '••••••••（設定済み）' : 'GROQ_API_KEY';
+                // Don't pre-fill password for security
             } catch (e) {
                 console.error('Failed to load digest settings:', e);
             }
+            // Load skills
+            loadSkillsList();
             document.getElementById('settings-modal').classList.add('show');
         }
 
         function hideSettings() {
             document.getElementById('settings-modal').classList.remove('show');
+        }
+
+        async function loadSkillsList() {
+            try {
+                const resp = await fetch('/api/skills');
+                const data = await resp.json();
+                const el = document.getElementById('skills-list');
+                if (!data.skills || data.skills.length === 0) {
+                    el.innerHTML = '<div style="color:var(--text-secondary);padding:0.3rem;">No skills installed</div>';
+                    return;
+                }
+                el.innerHTML = data.skills.map(s => `
+                    <div style="display:flex;justify-content:space-between;align-items:center;padding:3px 0;border-bottom:1px solid var(--border);">
+                        <div>
+                            <strong>${s.name}</strong>
+                            ${s.source ? '<span style="font-size:0.6rem;background:var(--accent);color:white;padding:1px 4px;border-radius:3px;margin-left:4px;">' + s.source + '</span>' : ''}
+                            <div style="font-size:0.65rem;color:var(--text-secondary);max-width:400px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${s.description}</div>
+                        </div>
+                        <button onclick="deleteSkill('${s.name}')" style="font-size:0.6rem;padding:1px 6px;cursor:pointer;background:none;border:1px solid var(--border);border-radius:3px;color:var(--text-secondary);">x</button>
+                    </div>
+                `).join('');
+            } catch (e) {
+                console.error('Failed to load skills:', e);
+            }
+        }
+
+        async function installSuperpowers() {
+            await installSkillsFromURL('https://github.com/obra/superpowers');
+        }
+
+        async function installSkillsFromRepo() {
+            const url = document.getElementById('skill-repo-url').value.trim();
+            if (!url) return;
+            await installSkillsFromURL(url);
+            document.getElementById('skill-repo-url').value = '';
+        }
+
+        async function installSkillsFromURL(url) {
+            try {
+                const resp = await fetch('/api/skills/install', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({repo_url: url})
+                });
+                const data = await resp.json();
+                if (data.error) {
+                    alert('Install failed: ' + data.error);
+                } else {
+                    alert(`Installed ${data.count} skills from ${data.source}`);
+                    loadSkillsList();
+                }
+            } catch (e) {
+                alert('Install failed: ' + e.message);
+            }
+        }
+
+        async function deleteSkill(name) {
+            if (!confirm(`Delete skill "${name}"?`)) return;
+            try {
+                const resp = await fetch('/api/skills/delete', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({name})
+                });
+                const data = await resp.json();
+                if (data.error) alert('Error: ' + data.error);
+                loadSkillsList();
+            } catch (e) {
+                alert('Error: ' + e.message);
+            }
+        }
+
+        // ---- Profile Modal ----
+        // ============================================
+        // Jetstream Monitor
+        // ============================================
+        async function showJetstreamMonitor() {
+            document.getElementById('jetstream-modal').classList.add('show');
+            // Load stats
+            try {
+                const [statsResp, kwResp] = await Promise.all([
+                    fetch('/api/jetstream/stats'),
+                    fetch('/api/jetstream/keywords')
+                ]);
+                const statsData = await statsResp.json();
+                const kwData = await kwResp.json();
+                const stats = statsData.stats || [];
+                const total = stats.reduce((s, d) => s + d.count, 0);
+                const todayCount = stats.length > 0 ? stats[0].count : 0;
+                document.getElementById('jm-stats').textContent = `今日: ${todayCount}件 / 7日間: ${total}件`;
+                // Show keyword chips
+                const kwContainer = document.getElementById('jm-keywords');
+                kwContainer.innerHTML = '';
+                const keywords = kwData.keywords || [];
+                if (keywords.length === 0) {
+                    kwContainer.innerHTML = '<span style="color:var(--text-secondary);font-size:0.75rem;">キーワード未設定 → Settings で設定</span>';
+                } else {
+                    keywords.forEach(kw => {
+                        const chip = document.createElement('span');
+                        chip.style.cssText = 'background:var(--accent);color:white;padding:0.15rem 0.5rem;border-radius:12px;font-size:0.7rem;cursor:pointer;';
+                        chip.textContent = kw;
+                        chip.onclick = () => { document.getElementById('jm-search').value = kw; searchJetstream(); };
+                        kwContainer.appendChild(chip);
+                    });
+                }
+            } catch(e) {
+                console.error('Failed to load jetstream stats:', e);
+            }
+            // Auto-load recent
+            loadJetstreamRecent();
+        }
+
+        function hideJetstreamMonitor() {
+            document.getElementById('jetstream-modal').classList.remove('show');
+        }
+
+        async function loadJetstreamRecent() {
+            const days = document.getElementById('jm-days').value;
+            const container = document.getElementById('jm-results');
+            container.innerHTML = '<div style="text-align:center;padding:1rem;color:var(--text-secondary);">読み込み中...</div>';
+            try {
+                const resp = await fetch(`/api/jetstream/posts?days=${days}&limit=200`);
+                const data = await resp.json();
+                renderJetstreamPosts(data.posts || [], data.count, '最新の保存済みポスト');
+            } catch(e) {
+                container.innerHTML = '<div style="color:red;padding:1rem;">読み込み失敗</div>';
+            }
+        }
+
+        async function searchJetstream() {
+            const query = document.getElementById('jm-search').value.trim();
+            if (!query) { loadJetstreamRecent(); return; }
+            const days = document.getElementById('jm-days').value;
+            const container = document.getElementById('jm-results');
+            container.innerHTML = '<div style="text-align:center;padding:1rem;color:var(--text-secondary);">検索中...</div>';
+            try {
+                const resp = await fetch(`/api/jetstream/posts?q=${encodeURIComponent(query)}&days=${days}&limit=200`);
+                const data = await resp.json();
+                renderJetstreamPosts(data.posts || [], data.count, `「${query}」の検索結果`);
+            } catch(e) {
+                container.innerHTML = '<div style="color:red;padding:1rem;">検索失敗</div>';
+            }
+        }
+
+        function renderJetstreamPosts(posts, count, title) {
+            const container = document.getElementById('jm-results');
+            if (!posts || posts.length === 0) {
+                container.innerHTML = '<div style="text-align:center;padding:2rem;color:var(--text-secondary);">ポストが見つかりません</div>';
+                return;
+            }
+            let html = `<div style="font-size:0.7rem;color:var(--text-secondary);margin-bottom:0.5rem;">${title} (${count}件)</div>`;
+            posts.forEach(p => {
+                const time = p.time ? new Date(p.time).toLocaleString('ja-JP', {month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit'}) : '';
+                const kwBadges = (p.keywords || []).map(k =>
+                    `<span style="background:var(--accent);color:white;padding:0 0.3rem;border-radius:8px;font-size:0.6rem;margin-left:0.3rem;">${escapeHTML(k)}</span>`
+                ).join('');
+                const did = p.did || '';
+                const bskyUrl = `https://bsky.app/profile/${did}/post/${p.rkey || ''}`;
+                // Score badge
+                let scoreBadge = '';
+                if (p.score > 0) {
+                    const color = p.score >= 7 ? '#e74c3c' : p.score >= 4 ? '#f39c12' : '#95a5a6';
+                    scoreBadge = `<span style="background:${color};color:white;padding:0 0.3rem;border-radius:8px;font-size:0.6rem;font-weight:bold;">${p.score}/10</span>`;
+                }
+                // OGP card
+                let ogpCard = '';
+                if (p.ogp_title || p.ogp_image) {
+                    const linkUrl = p.url || '';
+                    ogpCard = `<a href="${escapeHTML(linkUrl)}" target="_blank" style="display:flex;gap:0.5rem;border:1px solid var(--border);border-radius:8px;padding:0.4rem;margin-top:0.3rem;text-decoration:none;color:inherit;background:var(--bg-secondary,#f8f9fa);">`;
+                    if (p.ogp_image) {
+                        ogpCard += `<img src="${escapeHTML(p.ogp_image)}" style="width:80px;height:60px;object-fit:cover;border-radius:6px;flex-shrink:0;" onerror="this.style.display='none'">`;
+                    }
+                    ogpCard += `<div style="overflow:hidden;min-width:0;">`;
+                    if (p.ogp_title) {
+                        ogpCard += `<div style="font-size:0.75rem;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${escapeHTML(p.ogp_title)}</div>`;
+                    }
+                    if (p.ogp_desc) {
+                        ogpCard += `<div style="font-size:0.65rem;color:var(--text-secondary);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;">${escapeHTML(p.ogp_desc)}</div>`;
+                    }
+                    ogpCard += `</div></a>`;
+                }
+                // Evaluation
+                let evalLine = '';
+                if (p.evaluation) {
+                    evalLine = `<div style="font-size:0.7rem;color:var(--accent);margin-top:0.2rem;">💡 ${escapeHTML(p.evaluation)}</div>`;
+                }
+                html += `<div style="border-bottom:1px solid var(--border);padding:0.5rem 0;">
+                    <div style="display:flex;align-items:center;gap:0.3rem;margin-bottom:0.2rem;">
+                        <span style="font-size:0.65rem;color:var(--text-secondary);">${time}</span>
+                        ${scoreBadge}${kwBadges}
+                        <a href="${bskyUrl}" target="_blank" style="margin-left:auto;font-size:0.6rem;color:var(--accent);text-decoration:none;">↗ bsky</a>
+                    </div>
+                    <div style="font-size:0.8rem;line-height:1.4;word-break:break-word;">${escapeHTML(p.text || '')}</div>
+                    ${ogpCard}${evalLine}
+                </div>`;
+            });
+            container.innerHTML = html;
+        }
+
+        function escapeHTML(str) {
+            const div = document.createElement('div');
+            div.textContent = str;
+            return div.innerHTML;
+        }
+
+        async function showProfile() {
+            try {
+                const resp = await fetch('/api/profile');
+                const p = await resp.json();
+                document.getElementById('profile-name').value = p.name || '';
+                document.getElementById('profile-age').value = p.age || '';
+                document.getElementById('profile-location').value = p.location || '';
+                document.getElementById('profile-company').value = p.company || '';
+                document.getElementById('profile-department').value = p.department || '';
+                document.getElementById('profile-role').value = p.role || '';
+                document.getElementById('profile-occupation').value = p.occupation || '';
+                document.getElementById('profile-clients').value = (p.clients || []).join(', ');
+                document.getElementById('profile-skills').value = (p.skills || []).join(', ');
+                document.getElementById('profile-bio').value = p.bio || '';
+                // AI分析結果
+                document.getElementById('profile-ai-techlevel').textContent = p.tech_level || '-';
+                renderChips('profile-ai-interests', p.interests || []);
+                renderChips('profile-ai-preferences', p.preferences || []);
+                renderChips('profile-ai-tools', p.frequent_tools || []);
+                document.getElementById('profile-ai-updated').textContent = p.last_updated ? new Date(p.last_updated).toLocaleString() : '-';
+            } catch (e) {
+                console.error('Failed to load profile:', e);
+            }
+            document.getElementById('profile-modal').classList.add('show');
+        }
+
+        function renderChips(elemId, items) {
+            const el = document.getElementById(elemId);
+            el.innerHTML = '';
+            if (!items || items.length === 0) { el.textContent = '-'; return; }
+            items.forEach(item => {
+                const chip = document.createElement('span');
+                chip.textContent = item;
+                chip.style.cssText = 'background:var(--bg-tertiary,#333);padding:0.15rem 0.5rem;border-radius:9999px;font-size:0.75rem;white-space:nowrap;';
+                el.appendChild(chip);
+            });
+        }
+
+        function hideProfile() {
+            document.getElementById('profile-modal').classList.remove('show');
+        }
+
+        async function saveProfile() {
+            const parseList = v => v.split(',').map(s => s.trim()).filter(Boolean);
+            const body = {
+                name: document.getElementById('profile-name').value.trim(),
+                age: parseInt(document.getElementById('profile-age').value) || 0,
+                location: document.getElementById('profile-location').value.trim(),
+                company: document.getElementById('profile-company').value.trim(),
+                department: document.getElementById('profile-department').value.trim(),
+                role: document.getElementById('profile-role').value.trim(),
+                clients: parseList(document.getElementById('profile-clients').value),
+                skills: parseList(document.getElementById('profile-skills').value),
+                bio: document.getElementById('profile-bio').value.trim(),
+            };
+            try {
+                await fetch('/api/profile', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body)
+                });
+                const btn = document.querySelector('#profile-modal .btn-primary');
+                if (btn) {
+                    const orig = btn.textContent;
+                    btn.textContent = 'Saved!';
+                    btn.style.background = '#28a745';
+                    setTimeout(() => { btn.textContent = orig; btn.style.background = ''; }, 1500);
+                }
+                setTimeout(() => hideProfile(), 800);
+            } catch (e) {
+                alert('Failed to save profile: ' + e.message);
+            }
         }
 
         function showImageModal(src) {
@@ -3440,7 +3880,12 @@
                         twitter_consumer_secret: document.getElementById('setting-twitter-consumer-secret').value || '',
                         twitter_access_token: document.getElementById('setting-twitter-access-token').value || '',
                         twitter_access_secret: document.getElementById('setting-twitter-access-secret').value || '',
-                        bluesky_enabled: document.getElementById('setting-bluesky-enabled').checked
+                        bluesky_enabled: document.getElementById('setting-bluesky-enabled').checked,
+                        bluesky_identifier: document.getElementById('setting-bluesky-identifier').value || '',
+                        bluesky_app_password: document.getElementById('setting-bluesky-apppassword').value || '',
+                        jetstream_keywords: document.getElementById('setting-jetstream-keywords').value.split('\n').map(s => s.trim()).filter(s => s),
+                        brave_api_key: document.getElementById('setting-brave-api-key').value || '',
+                        groq_api_key: document.getElementById('setting-groq-api-key').value || ''
                     })
                 });
 
@@ -3490,20 +3935,11 @@
         async function initThreads() {
             await loadThreadList();
             if (threads.length > 0) {
-                // Try to restore the last viewed thread
-                const savedId = localStorage.getItem('siki-current-thread');
-                const savedThread = savedId && threads.find(t => t.id === savedId);
-                if (savedThread) {
-                    // Force reload by temporarily clearing conversationId
-                    conversationId = '';
-                    await switchThread(savedThread.id);
-                } else {
-                    // Fallback: switch to most recent thread with messages
-                    const sorted = [...threads].sort((a,b) => new Date(b.updated_at) - new Date(a.updated_at));
-                    const target = sorted.find(t => t.message_count > 0) || sorted[0];
-                    conversationId = '';
-                    await switchThread(target.id);
-                }
+                // Always open the most recent thread with messages
+                const sorted = [...threads].sort((a,b) => new Date(b.updated_at) - new Date(a.updated_at));
+                const target = sorted.find(t => t.message_count > 0) || sorted[0];
+                conversationId = '';
+                await switchThread(target.id);
             }
         }
         initThreads();
